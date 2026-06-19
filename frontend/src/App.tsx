@@ -1,0 +1,1620 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import { getRuns, getRun, getArtifact } from "./api";
+import type { RunSummary, RunDetail } from "./api";
+import "./App.css";
+
+// ── Pipeline definitions ───────────────────────────────────────────────────────
+
+interface PipelineStep {
+  id: string;
+  label: string;
+  sub: string;
+  agent: keyof typeof AGENTS;
+  artifact: string;
+}
+
+const PIPELINE_STEPS: PipelineStep[] = [
+  { id: "requirements", label: "Requirements",        sub: "Normalizing the raw input into clean, structured requirements",    agent: "gpt",        artifact: "clean_requirements.md" },
+  { id: "spec",         label: "MVP Spec",           sub: "Analyzing your idea and writing a detailed product spec",          agent: "gpt",        artifact: "mvp_spec.md" },
+  { id: "architecture", label: "Architecture",        sub: "Writing the architecture contract (ARCHITECTURE.md)",              agent: "gpt",        artifact: "ARCHITECTURE.md" },
+  { id: "build_prompt", label: "Build Prompt",        sub: "Writing precise Claude Code instructions to build the app",        agent: "gpt",        artifact: "claude_build_prompt.md" },
+  { id: "consistency",  label: "Requirements Check",  sub: "Verifying planning artifacts match the original requirements",      agent: "smoke",      artifact: "requirements_consistency_check.txt" },
+  { id: "built",        label: "Build MVP",           sub: "Building the full application from scratch",                       agent: "claude",     artifact: "claude_build_output.txt" },
+  { id: "smoke",        label: "Smoke Checks",        sub: "Running install, build, server start and architecture checks",     agent: "smoke",      artifact: "smoke_test_log.txt" },
+  { id: "deepseek",     label: "Attack Review",       sub: "Red-teaming the app for bugs, security gaps and failures",         agent: "deepseek",   artifact: "deepseek_attack_report.md" },
+  { id: "judge",        label: "Issue Judgment",      sub: "Classifying every finding as CRITICAL / MAJOR / MINOR / NOISE",   agent: "gpt",        artifact: "judged_issue_report.md" },
+  { id: "fix",          label: "Apply Fixes",         sub: "Patching CRITICAL and MAJOR issues found in the attack report",    agent: "claude",     artifact: "claude_fix_prompt_1.md" },
+  { id: "governance",   label: "Governance Review",   sub: "AppSec, Legal/Privacy and Infrastructure three-reviewer panel",    agent: "governance", artifact: "governance_meta_judgment.md" },
+  { id: "done",         label: "Final Report",        sub: "Writing the handoff summary and final status",                     agent: "gpt",        artifact: "final_mvp_report.md" },
+];
+
+// Sprint-mode-only steps — spliced in right after "Build Prompt" whenever sprint mode
+// (--sprint-plan / --sprint-plan-only) is active for a run. Hidden otherwise.
+const SPRINT_ONLY_STEPS: PipelineStep[] = [
+  { id: "sprint_plan",                  label: "Sprint Plan",                  sub: "GPT-4o sprint architect — assessing complexity and decomposing into sprints", agent: "architect", artifact: "sprint_plan.md" },
+  { id: "selected_sprint_scope",        label: "Selected Sprint Scope",        sub: "Writing the detailed scope doc for the selected sprint",                       agent: "gpt", artifact: "selected_sprint_scope.md" },
+  { id: "selected_sprint_build_prompt", label: "Selected Sprint Build Prompt", sub: "Writing the Claude Code build prompt for the selected sprint only",            agent: "gpt", artifact: "selected_sprint_build_prompt.txt" },
+];
+
+// Builds the actual step list for a run: base steps, with the sprint-only steps spliced
+// in after "Build Prompt" when sprint mode is active, and the build step's label/sub
+// swapped to reflect "selected sprint only" build scope.
+function getStepsForRun(sprintModeActive: boolean, selectedSprintNum: number): PipelineStep[] {
+  const base = sprintModeActive
+    ? (() => {
+        const idx = PIPELINE_STEPS.findIndex(s => s.id === "build_prompt");
+        return [...PIPELINE_STEPS.slice(0, idx + 1), ...SPRINT_ONLY_STEPS, ...PIPELINE_STEPS.slice(idx + 1)];
+      })()
+    : PIPELINE_STEPS;
+  if (!sprintModeActive) return base;
+  return base.map(s => {
+    if (s.id === "built")
+      return { ...s, label: "Build Selected Sprint", sub: `Building only Sprint ${selectedSprintNum} with Claude Code — future sprints are planned but not built` };
+    // Sprint mode presents architecture as the advanced architect role (same demo
+    // clarity treatment as the dedicated "Sprint Plan" step) rather than the routine
+    // GPT-4o mini "Architecture" step used in non-sprint runs.
+    if (s.id === "architecture")
+      return { ...s, label: "Sprint Architecture", sub: "GPT-4o — writing the architecture contract that the sprint plan builds on", agent: "architect" as const };
+    return s;
+  });
+}
+
+const AGENTS = {
+  gpt:        { label: "OpenAI GPT-4o mini", short: "GPT-4o mini",  color: "#10a37f", light: "#f0fdf9" },
+  // Senior architect / sprint planner role — same OpenAI model family, presented with
+  // its full model name (not "mini") since sprint decomposition is the advanced-reasoning
+  // step, distinct from the routine PM/requirements-writing "gpt" (mini) role above.
+  architect:  { label: "OpenAI GPT-4o",      short: "GPT-4o",       color: "#10a37f", light: "#f0fdf9" },
+  claude:     { label: "Anthropic Claude",   short: "Claude Code",   color: "#D97741", light: "#fff7ed" },
+  deepseek:   { label: "DeepSeek Chat",      short: "DeepSeek",      color: "#4361EE", light: "#eef1fd" },
+  smoke:      { label: "System Checks",      short: "Smoke Checks",  color: "#D97706", light: "#fffbeb" },
+  governance: { label: "Governance Panel",   short: "Governance",    color: "#7c3aed", light: "#f5f3ff" },
+} as const;
+
+const STEP_MAP: Record<string, string> = {
+  spec:          "spec",
+  sprint_plan:   "sprint_plan",
+  build_prompt:  "build_prompt",
+  blocked:       "consistency",
+  consistency:   "consistency",
+  building:      "built",   built:       "built",
+  smoke_1:       "smoke",   smoke_2:     "smoke",     smoke_3:   "smoke",
+  deepseek_1:    "deepseek", deepseek_2: "deepseek",  deepseek_3: "deepseek",
+  judge_1:       "judge",   judge_2:     "judge",     judge_3:   "judge",
+  fix_1:         "fix",     fix_2:       "fix",       fix_3:     "fix",
+  governance:    "governance",
+  gov_fix_1:     "governance", gov_fix_2: "governance",
+  report:        "done",    done:        "done",
+};
+
+const TERMINAL = new Set([
+  "done", "approved", "max_iterations_reached",
+  "blocked_consistency_violation", "plan_only_done", "sprint_plan_only_done",
+]);
+
+// Clean display names for sprint-mode artifacts (requirement: artifact sidebar should
+// show readable labels, not raw filenames, for sprint planning outputs).
+const ARTIFACT_LABELS: Record<string, string> = {
+  "sprint_plan.md":                    "Sprint Plan",
+  "sprint_plan.json":                  "Sprint Plan JSON",
+  "selected_sprint_scope.md":          "Selected Sprint Scope",
+  "selected_sprint_build_prompt.txt":  "Selected Sprint Build Prompt",
+};
+
+function artifactDisplayName(filename: string): string {
+  if (ARTIFACT_LABELS[filename]) return ARTIFACT_LABELS[filename];
+  let m = filename.match(/^sprint_(\d+)_scope\.md$/);
+  if (m) return `Sprint ${m[1]} Scope`;
+  m = filename.match(/^sprint_(\d+)_build_prompt\.txt$/);
+  if (m) return `Sprint ${m[1]} Build Prompt`;
+  return filename;
+}
+
+const ARTIFACT_ORDER = [
+  "raw_input.md",
+  "mvp_scope.md",
+  "clean_requirements.md",
+  "mvp_spec.md",
+  "ARCHITECTURE.md",
+  "smoke_checks.md",
+  "build_prompt.txt",
+  "sprint_plan.md",
+  "sprint_plan.json",
+  "selected_sprint_scope.md",
+  "selected_sprint_build_prompt.txt",
+  "sprint_1_scope.md",
+  "sprint_1_build_prompt.txt",
+  "requirements_consistency_check.txt",
+  "claude_build_prompt.md",
+  "claude_build_output.txt",
+  "smoke_test_log.txt",
+  "architecture_check.txt",
+  "deepseek_attack_report.md",
+  "judged_issue_report.md",
+  "claude_fix_prompt_1.md",   "claude_fix_output_1.txt",
+  "smoke_test_log_2.txt",
+  "deepseek_attack_report_2.md", "judged_issue_report_2.md",
+  "claude_fix_prompt_2.md",   "claude_fix_output_2.txt",
+  "smoke_test_log_3.txt",
+  "deepseek_attack_report_3.md", "judged_issue_report_3.md",
+  "claude_fix_prompt_3.md",   "claude_fix_output_3.txt",
+  "governance_appsec_report.md",
+  "governance_legal_privacy_report.md",
+  "governance_infra_report.md",
+  "governance_meta_judgment.md",
+  "governance_fix_prompt.md",
+  "claude_fix_output_gov_1.txt",
+  "governance_smoke_log.txt",
+  "governance_appsec_report_2.md",
+  "governance_legal_privacy_report_2.md",
+  "governance_infra_report_2.md",
+  "governance_meta_judgment_2.md",
+  "governance_fix_prompt_2.md",
+  "claude_fix_output_gov_2.txt",
+  "governance_smoke_log_2.txt",
+  "final_mvp_report.md",
+  "run_state.json",
+];
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+function fmtTime(s: number): string {
+  const m = Math.floor(s / 60);
+  return m > 0 ? `${m}m ${(s % 60).toString().padStart(2, "0")}s` : `${s}s`;
+}
+
+function sortArtifacts(files: string[]): string[] {
+  return [...files].sort((a, b) => {
+    const ai = ARTIFACT_ORDER.indexOf(a), bi = ARTIFACT_ORDER.indexOf(b);
+    if (ai === -1 && bi === -1) return a.localeCompare(b);
+    if (ai === -1) return 1; if (bi === -1) return -1;
+    return ai - bi;
+  });
+}
+
+type StepStatus = "pending" | "running" | "done" | "skipped";
+
+function stepStatus(step: PipelineStep, artifacts: string[], currentStep: string, runStatus: string): StepStatus {
+  const hasArtifact = artifacts.some(a => a === step.artifact || a.startsWith(step.artifact.replace(/\.[^.]+$/, "")));
+  if (hasArtifact) return "done";
+  // Terminal but this step never produced its artifact — it genuinely didn't run
+  // (e.g. everything after "Requirements Check" in a sprint-plan-only / plan-only run,
+  // or everything after a consistency-violation block). Show that honestly instead of
+  // the old behavior of marking every step "Finished" once the run reached a terminal
+  // status.
+  if (TERMINAL.has(runStatus)) return "skipped";
+  if (STEP_MAP[currentStep] === step.id) return "running";
+  return "pending";
+}
+
+function stepElapsed(stepId: string, timings: Record<string, number> = {}): number | null {
+  if (timings[stepId] !== undefined) return timings[stepId];
+  if (stepId === "done" && timings["report"] !== undefined) return timings["report"];
+  const keys = Object.keys(timings).filter(k => k.startsWith(stepId + "_")).sort();
+  return keys.length ? timings[keys[keys.length - 1]] : null;
+}
+
+// ── Run timeline (loop / cycle history) ─────────────────────────────────────────
+// Built entirely from step_timings (cycle-suffixed keys already written by the pipeline)
+// plus current_step for a best-effort "in progress" entry — no pipeline changes needed.
+// This turns "the same cards bouncing back and forth" into an explicit ordered history
+// of every loop iteration: "Smoke Check — Cycle 1", "DeepSeek Review — Cycle 1", ...,
+// "Governance Review — Round 1", "Governance Fix — Round 1", ...
+
+interface TimelineEvent {
+  key: string;
+  label: string;
+  done: boolean;
+  elapsedS: number | null;
+}
+
+const QUALITY_LOOP_LABELS: Record<string, string> = {
+  smoke: "Smoke Check", deepseek: "DeepSeek Review", judge: "GPT Judge", fix: "Claude Fix",
+};
+
+function buildTimeline(run: RunDetail | null): TimelineEvent[] {
+  if (!run) return [];
+  const timings = run.step_timings ?? {};
+  const events: TimelineEvent[] = [];
+  const currentStep = run.current_step ?? "";
+
+  // Quality loop: smoke_N / deepseek_N / judge_N / fix_N → "X — Cycle N"
+  for (const prefix of ["smoke", "deepseek", "judge", "fix"]) {
+    for (const key of Object.keys(timings)) {
+      const m = key.match(new RegExp(`^${prefix}_(\\d+)$`));
+      if (!m) continue;
+      events.push({
+        key,
+        label: `${QUALITY_LOOP_LABELS[prefix]} — Cycle ${m[1]}`,
+        done: true,
+        elapsedS: timings[key],
+      });
+    }
+  }
+  if (currentStep && !timings[currentStep]) {
+    const m = currentStep.match(/^(smoke|deepseek|judge|fix)_(\d+)$/);
+    if (m) events.push({ key: currentStep, label: `${QUALITY_LOOP_LABELS[m[1]]} — Cycle ${m[2]}`, done: false, elapsedS: null });
+  }
+
+  // Governance loop: gov_appsec_N (review round marker) / gov_fix_N / gov_smoke_N
+  // gov_legal_N / gov_infra_N / gov_meta_N are the same round as gov_appsec_N — skip dupes.
+  for (const key of Object.keys(timings)) {
+    let m = key.match(/^gov_appsec_(\d+)$/);
+    if (m) { events.push({ key, label: `Governance Review — Round ${m[1]}`, done: true, elapsedS: timings[key] }); continue; }
+    m = key.match(/^gov_fix_(\d+)$/);
+    if (m) { events.push({ key, label: `Governance Fix — Round ${m[1]}`, done: true, elapsedS: timings[key] }); continue; }
+    m = key.match(/^gov_smoke_(\d+)$/);
+    if (m) { events.push({ key, label: `Governance Smoke Check — Round ${m[1]}`, done: true, elapsedS: timings[key] }); continue; }
+  }
+  if (currentStep) {
+    let m = currentStep.match(/^gov_(appsec|legal|infra|meta)_(\d+)$/);
+    if (m && !timings[`gov_appsec_${m[2]}`]) events.push({ key: currentStep, label: `Governance Review — Round ${m[2]}`, done: false, elapsedS: null });
+    m = currentStep.match(/^gov_fix_(\d+)$/);
+    if (m && !timings[currentStep]) events.push({ key: currentStep, label: `Governance Fix — Round ${m[1]}`, done: false, elapsedS: null });
+  }
+
+  // Order by cycle/round number first (so cycles interleave correctly: smoke1, deepseek1,
+  // judge1, fix1, smoke2, ...), falling back to insertion order within the same number.
+  const order = ["smoke", "deepseek", "judge", "fix", "gov_appsec", "gov_fix", "gov_smoke"];
+  events.sort((a, b) => {
+    const na = parseInt(a.key.match(/(\d+)$/)?.[1] ?? "0", 10);
+    const nb = parseInt(b.key.match(/(\d+)$/)?.[1] ?? "0", 10);
+    if (na !== nb) return na - nb;
+    const pa = order.findIndex(p => a.key.startsWith(p));
+    const pb = order.findIndex(p => b.key.startsWith(p));
+    return pa - pb;
+  });
+  return events;
+}
+
+// ── Brand logos (SVG) ──────────────────────────────────────────────────────────
+
+function GPTLogo({ size }: { size: number }) {
+  // OpenAI bloom logo
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="white">
+      <path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.985 5.985 0 0 0-3.998 2.9 6.046 6.046 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073zM13.26 22.43a4.476 4.476 0 0 1-2.876-1.04l.141-.081 4.779-2.758a.795.795 0 0 0 .392-.681v-6.737l2.02 1.168a.071.071 0 0 1 .038.052v5.583a4.504 4.504 0 0 1-4.494 4.494zM3.6 18.304a4.47 4.47 0 0 1-.535-3.014l.142.085 4.783 2.759a.771.771 0 0 0 .78 0l5.843-3.369v2.332a.08.08 0 0 1-.033.062L9.74 19.95a4.5 4.5 0 0 1-6.14-1.646zM2.34 7.896a4.485 4.485 0 0 1 2.366-1.973V11.6a.766.766 0 0 0 .388.677l5.815 3.355-2.02 1.168a.076.076 0 0 1-.071 0l-4.83-2.786A4.504 4.504 0 0 1 2.34 7.872zm16.597 3.855l-5.843-3.369 2.02-1.168a.076.076 0 0 1 .071 0l4.83 2.791a4.494 4.494 0 0 1-.676 8.105v-5.678a.79.79 0 0 0-.402-.681zm2.01-3.023l-.141-.085-4.774-2.782a.776.776 0 0 0-.785 0L9.409 9.23V6.897a.066.066 0 0 1 .028-.061l4.83-2.787a4.5 4.5 0 0 1 6.68 4.66zm-12.64 4.135l-2.02-1.164a.08.08 0 0 1-.038-.057V6.075a4.5 4.5 0 0 1 7.375-3.453l-.142.08L8.704 5.46a.795.795 0 0 0-.393.681zm1.097-2.365l2.602-1.5 2.607 1.5v2.999l-2.597 1.5-2.607-1.5z"/>
+    </svg>
+  );
+}
+
+function ClaudeLogo({ size }: { size: number }) {
+  // Anthropic-style mark (simplified arc)
+  return (
+    <svg width={size} height={size} viewBox="0 0 100 100" fill="none">
+      <path d="M50 10C27.9 10 10 27.9 10 50s17.9 40 40 40 40-17.9 40-40S72.1 10 50 10zm0 8c17.7 0 32 14.3 32 32 0 6.8-2.1 13.1-5.7 18.3L26.7 23.7C31.9 20.1 38.2 18 50 18zm0 64c-17.7 0-32-14.3-32-32 0-6.8 2.1-13.1 5.7-18.3l49.6 49.6C68.1 85.9 59.8 82 50 82z" fill="white" opacity="0.9"/>
+    </svg>
+  );
+}
+
+function DeepSeekLogo({ size }: { size: number }) {
+  // Abstract D / wave mark
+  return (
+    <svg width={size} height={size} viewBox="0 0 100 100" fill="white">
+      <path d="M20 20 h30 a30 30 0 0 1 0 60 h-30 z" opacity="0.15"/>
+      <path d="M22 22 h28 a28 28 0 0 1 0 56 h-28 z" fill="none" stroke="white" strokeWidth="5" opacity="0.9"/>
+      <circle cx="60" cy="38" r="7" fill="white"/>
+      <path d="M30 55 Q45 42 62 55 Q78 68 92 55" fill="none" stroke="white" strokeWidth="4.5" strokeLinecap="round" opacity="0.8"/>
+    </svg>
+  );
+}
+
+function SmokeLogo({ size }: { size: number }) {
+  // Terminal prompt icon
+  return (
+    <svg width={size} height={size} viewBox="0 0 100 100" fill="none" stroke="white" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="10" y="18" width="80" height="64" rx="10" strokeWidth="5" fill="none"/>
+      <polyline points="24,42 38,50 24,58" strokeWidth="6"/>
+      <line x1="44" y1="62" x2="76" y2="62" strokeWidth="5"/>
+    </svg>
+  );
+}
+
+function GovernanceLogo({ size }: { size: number }) {
+  // Shield with checkmark — represents AppSec / Legal / Infra panel
+  return (
+    <svg width={size} height={size} viewBox="0 0 100 100" fill="none">
+      <path d="M50 8 L86 23 L86 52 C86 71 69 87 50 94 C31 87 14 71 14 52 L14 23 Z"
+            stroke="white" strokeWidth="5" fill="none" opacity="0.9"/>
+      <polyline points="34,51 44,62 67,38" stroke="white" strokeWidth="6.5"
+                strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  );
+}
+
+function AgentIcon({ agent, size = 44, dimmed = false }: { agent: string; size?: number; dimmed?: boolean }) {
+  const style = { opacity: dimmed ? 0.45 : 1 } as React.CSSProperties;
+  const s = size;
+  if (agent === "gpt" || agent === "architect") return <div style={style}><GPTLogo size={s} /></div>;
+  if (agent === "claude")     return <div style={style}><ClaudeLogo size={s} /></div>;
+  if (agent === "deepseek")   return <div style={style}><DeepSeekLogo size={s} /></div>;
+  if (agent === "governance") return <div style={style}><GovernanceLogo size={s} /></div>;
+  return <div style={style}><SmokeLogo size={s} /></div>;
+}
+
+// ── Small icons ────────────────────────────────────────────────────────────────
+
+function IconBack() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+      <polyline points="15,18 9,12 15,6"/>
+    </svg>
+  );
+}
+function IconHistory() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+      <polyline points="1,4 1,10 7,10"/><path d="M3.51 15a9 9 0 1 0 .49-4.95"/>
+    </svg>
+  );
+}
+function IconPipeline() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M12 2v3M12 19v3M4.22 4.22l2.12 2.12M17.66 17.66l2.12 2.12M2 12h3M19 12h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12"/>
+    </svg>
+  );
+}
+function IconPen() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+    </svg>
+  );
+}
+function IconFile() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+      <polyline points="14,2 14,8 20,8"/>
+    </svg>
+  );
+}
+function IconIdea() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2a7 7 0 0 1 7 7c0 2.6-1.4 4.9-3.5 6.2V17a1 1 0 0 1-1 1h-5a1 1 0 0 1-1-1v-1.8A7 7 0 0 1 12 2z"/>
+      <line x1="9" y1="21" x2="15" y2="21"/>
+      <line x1="10" y1="18" x2="14" y2="18"/>
+    </svg>
+  );
+}
+function IconJira() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 32 32" fill="currentColor">
+      <path d="M15.86 0C11.7 0 8.3 3.37 8.3 7.53v1.3H3.1A3.1 3.1 0 0 0 0 11.93v15.41C0 29.83 2.17 32 4.84 32h15.3a3.1 3.1 0 0 0 3.1-3.1v-1.3h5.22A4.54 4.54 0 0 0 32 23.06V7.53A7.53 7.53 0 0 0 24.47 0zm0 3.08a4.45 4.45 0 0 1 4.45 4.45v1.3h-8.9V7.53a4.45 4.45 0 0 1 4.45-4.45zm7.53 21.54H8.3V11.93c0-.01.01-.02.02-.02h14.93c.01 0 .02.01.02.02zm5.51-1.56a1.46 1.46 0 0 1-1.46 1.46h-1.97V11.93a3.1 3.1 0 0 0-3.1-3.1H11.4V7.53a4.45 4.45 0 0 1 8.9 0v.7h1.3a4.45 4.45 0 0 1 4.45 4.45v12.38z"/>
+    </svg>
+  );
+}
+
+// ── Status badge ───────────────────────────────────────────────────────────────
+
+const STATUS_COLORS: Record<string, { bg: string; text: string; border: string }> = {
+  done:                   { bg: "#f0fdf4", text: "#15803d", border: "#bbf7d0" },
+  approved:               { bg: "#f0fdf4", text: "#15803d", border: "#bbf7d0" },
+  queued:                 { bg: "#f8fafc", text: "#64748b", border: "#e2e8f0" },
+  max_iterations_reached: { bg: "#fef2f2", text: "#dc2626", border: "#fecaca" },
+};
+const DEFAULT_SC = { bg: "#eff6ff", text: "#2563eb", border: "#bfdbfe" };
+
+function StatusBadge({ status }: { status: string }) {
+  const c = STATUS_COLORS[status] ?? DEFAULT_SC;
+  const isRunning = !TERMINAL.has(status) && status !== "queued";
+  return (
+    <span className="status-badge" style={{ background: c.bg, color: c.text, border: `1px solid ${c.border}` }}>
+      {isRunning && <span className="status-dot" style={{ background: c.text }} />}
+      {status.replace(/_/g, " ")}
+    </span>
+  );
+}
+
+// ── Big step card ──────────────────────────────────────────────────────────────
+
+function StepCard({ step, index, total, status, elapsed, cycle }: {
+  step: PipelineStep;
+  index: number;
+  total: number;
+  status: StepStatus;
+  elapsed: number | null;
+  cycle: number;
+}) {
+  const a = AGENTS[step.agent];
+  const showCycle = cycle > 1 && ["smoke", "deepseek", "judge", "fix"].includes(step.id);
+
+  const circleStyle: React.CSSProperties =
+    status === "done"    ? { background: "linear-gradient(135deg, #22c55e, #15803d)" }
+    : status === "pending" || status === "skipped" ? { background: "#d1d5db" }
+    : { background: `linear-gradient(145deg, ${a.color}, ${a.color}cc)` };
+
+  return (
+    <div
+      className={`step-card step-card-${status}`}
+      style={{ "--agent-color": a.color, "--agent-light": a.light } as React.CSSProperties}
+    >
+      {/* Counter */}
+      <div className="sc-counter">
+        <span className="sc-idx">{index + 1}</span>
+        <span className="sc-of">/ {total}</span>
+        {showCycle && <span className="sc-cycle">cycle {cycle}</span>}
+      </div>
+
+      {/* Logo */}
+      <div className="sc-logo-area">
+        {status === "running" && (
+          <>
+            <div className="sc-ring sc-ring-1" />
+            <div className="sc-ring sc-ring-2" />
+          </>
+        )}
+        <div className="sc-logo-circle" style={circleStyle}>
+          {status === "done" ? (
+            <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.8" strokeLinecap="round">
+              <polyline points="4,12 9,17 20,6"/>
+            </svg>
+          ) : status === "skipped" ? (
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" strokeWidth="2.5" strokeLinecap="round">
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          ) : (
+            <AgentIcon agent={step.agent} size={44} dimmed={status === "pending"} />
+          )}
+        </div>
+      </div>
+
+      {/* Info */}
+      <div className="sc-info">
+        <div className="sc-agent" style={{ color: status === "pending" || status === "skipped" ? "#9ca3af" : a.color }}>
+          {a.label}
+        </div>
+        <div className="sc-name">{step.label}</div>
+        <div className="sc-sep" />
+        <div className="sc-desc">{step.sub}</div>
+
+        <div className={`sc-badge sc-badge-${status}`}>
+          {status === "running" && (
+            <><span className="sc-badge-dot" style={{ background: a.color }} />Running…</>
+          )}
+          {status === "done" && elapsed !== null && `Finished in ${fmtTime(elapsed)}`}
+          {status === "done" && elapsed === null && "Finished"}
+          {status === "pending" && "Waiting to run"}
+          {status === "skipped" && "Not being run"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Terminal colorizer ─────────────────────────────────────────────────────────
+
+function lineStyle(line: string): { color: string; bold: boolean } {
+  const t = line.trim();
+
+  // Blank / separator lines — invisible
+  if (!t || t.startsWith("=") || t.startsWith("-")) return { color: "#1e2d3d", bold: false };
+
+  // Pipeline section headers
+  if (t.startsWith("▶"))  return { color: "#e2e8f0", bold: true };
+  if (t.startsWith("🚀") || t.startsWith("🎉") || t.startsWith("📁") || t.startsWith("⏱"))
+                           return { color: "#e2e8f0", bold: false };
+
+  // Success / done
+  if (t.startsWith("✓") || t.startsWith("✅") || /\b(PASS|passed|approved|complete|success)\b/i.test(t))
+                           return { color: "#4ade80", bold: t.startsWith("✓") || t.startsWith("✅") };
+
+  // Errors
+  if (t.startsWith("✗") || t.startsWith("❌") || /\b(FAIL|ERROR|error:|Traceback|exception)\b/i.test(t))
+                           return { color: "#f87171", bold: false };
+
+  // Heartbeat — dimmed
+  if (t.startsWith("⋯"))  return { color: "#475569", bold: false };
+
+  // Claude Code file operations — cyan (the most interesting lines)
+  if (/\b(Creating|Writing|Updating|Editing|Reading|Deleting)\b/.test(t) && /\.(py|ts|tsx|js|jsx|json|md|sh|css|html|sql)/.test(t))
+                           return { color: "#67e8f9", bold: false };
+
+  // Claude Code tool calls (⏺ ● ◆ symbols it uses)
+  if (t.startsWith("⏺") || t.startsWith("●") || t.startsWith("◆"))
+                           return { color: "#fb923c", bold: false };
+
+  // Shell commands being run
+  if (/\b(Running|Executing|npm |pip |python |bash |curl )\b/.test(t))
+                           return { color: "#fbbf24", bold: false };
+
+  // Architecture / smoke / consistency check results
+  if (t.startsWith("[PASS]")) return { color: "#4ade80", bold: false };
+  if (t.startsWith("[FAIL]")) return { color: "#f87171", bold: false };
+  if (t.startsWith("[WARN]")) return { color: "#fbbf24", bold: false };
+
+  // Issue judgment / governance classification labels
+  if (/\bCRITICAL\b/.test(t))  return { color: "#f87171", bold: true };
+  if (/\bMAJOR\b/.test(t))     return { color: "#fb923c", bold: false };
+  if (/\bMINOR\b/.test(t))     return { color: "#fbbf24", bold: false };
+  if (/\bNOISE\b/.test(t))     return { color: "#64748b", bold: false };
+
+  // Governance panel headings
+  if (/\b(AppSec|Legal|Privacy|Infra|Governance)\b/.test(t) && /^#{1,3} /.test(t))
+                               return { color: "#c4b5fd", bold: true };
+
+  // Sprint plan rendering — make "Architecture Sprint Plan" readable, not random text
+  if (t === "Architecture Sprint Plan")            return { color: "#fbbf24", bold: true };
+  if (/^Complexity:/.test(t))                      return { color: "#c4b5fd", bold: true };
+  if (/^Recommended sprint count:/.test(t))         return { color: "#c4b5fd", bold: true };
+  if (/^Reason:/.test(t))                           return { color: "#a5b4fc", bold: false };
+  if (/^Sprint \d+ of \d+:/.test(t))                return { color: "#67e8f9", bold: true };
+  if (/^Goal:/.test(t))                             return { color: "#e2e8f0", bold: false };
+  if (/^(Why first|Why now):/.test(t))              return { color: "#94a3b8", bold: false };
+  if (/^Output:/.test(t))                           return { color: "#94a3b8", bold: false };
+  if (/^Build now: yes/.test(t))                    return { color: "#4ade80", bold: true };
+  if (/^Build now: no/.test(t))                     return { color: "#64748b", bold: false };
+  if (/^Selected Sprint:/.test(t))                  return { color: "#fbbf24", bold: true };
+  if (t === "Claude Code will build only this sprint.") return { color: "#fbbf24", bold: true };
+
+  // File paths mentioned standalone
+  if (/^[./].*\.(py|ts|tsx|js|jsx|json|md|css|html|sql)$/.test(t))
+                           return { color: "#7dd3fc", bold: false };
+
+  // DeepSeek / attack report headings
+  if (/^#{1,3} /.test(t)) return { color: "#c4b5fd", bold: true };
+  if (/^VERDICT:/.test(t)) return { color: "#f9a8d4", bold: true };
+
+  // Default readable text
+  return { color: "#94a3b8", bold: false };
+}
+
+// ── Live terminal ──────────────────────────────────────────────────────────────
+
+// Sprint mode display-only transform: the backend log line still says "GPT-mini —
+// writing ARCHITECTURE.md" (architecture generation itself is unchanged), but in sprint
+// mode the dashboard presents that step as the advanced "Sprint Architecture" role for
+// demo clarity — same treatment as the StepCard label swap in getStepsForRun.
+function transformLogLine(line: string, sprintMode: boolean): string {
+  if (!sprintMode) return line;
+  return line.replace(/GPT-mini\s*—\s*writing ARCHITECTURE\.md/, "GPT-4o — writing Sprint Architecture");
+}
+
+function TerminalView({ runId, sprintMode }: { runId: string; sprintMode: boolean }) {
+  const [log, setLog] = useState("");
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const bodyRef   = useRef<HTMLDivElement>(null);
+  const pinned    = useRef(true); // true = follow tail
+
+  useEffect(() => {
+    const poll = () =>
+      getArtifact(runId, "pipeline.log")
+        .then(a => setLog(a.content))
+        .catch(() => {});
+    poll();
+    const i = setInterval(poll, 1500);
+    return () => clearInterval(i);
+  }, [runId]);
+
+  // Detect manual scroll-up → unpin; scroll to bottom → repin
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  // Auto-scroll when pinned
+  useEffect(() => {
+    if (pinned.current) bottomRef.current?.scrollIntoView();
+  }, [log]);
+
+  const lines = log.split("\n");
+
+  return (
+    <div className="terminal-view">
+      <div className="terminal-header">
+        <span className="tdot tdot-red" />
+        <span className="tdot tdot-yellow" />
+        <span className="tdot tdot-green" />
+        <span className="terminal-title">pipeline.log — live</span>
+        <span className="terminal-cursor" />
+      </div>
+      <div className="terminal-body" ref={bodyRef}>
+        {log ? lines.map((line, i) => {
+          const displayLine = transformLogLine(line, sprintMode);
+          const s = lineStyle(displayLine);
+          return (
+            <div key={i} className="tline" style={{ color: s.color, fontWeight: s.bold ? 700 : 400 }}>
+              {displayLine || " "}
+            </div>
+          );
+        }) : (
+          <div className="tline" style={{ color: "#2d3748" }}>Waiting for pipeline to start...</div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+    </div>
+  );
+}
+
+// ── Status banner ──────────────────────────────────────────────────────────────
+
+function NowBanner({ run, elapsed, sprintModeActive, selectedSprintNum }: {
+  run: RunDetail | null; elapsed: number; sprintModeActive: boolean; selectedSprintNum: number;
+}) {
+  const isTerminal = TERMINAL.has(run?.status ?? "");
+  const currentStepId = STEP_MAP[run?.current_step ?? ""];
+  const currentStep  = [...PIPELINE_STEPS, ...SPRINT_ONLY_STEPS].find(s => s.id === currentStepId);
+  const a = currentStep ? AGENTS[currentStep.agent] : null;
+
+  if (!run || run.status === "queued") return (
+    <div className="now-banner now-banner-queued">
+      <div className="nb-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round">
+          <circle cx="12" cy="12" r="10"/><polyline points="12,6 12,12 16,14"/>
+        </svg>
+      </div>
+      <div className="nb-content">
+        <div className="nb-label">Starting up</div>
+        <div className="nb-title">Pipeline initializing your run</div>
+      </div>
+      <div className="nb-timer">{fmtTime(elapsed)}</div>
+    </div>
+  );
+
+  if (isTerminal) {
+    // Exact wording per run mode — never a generic "all done" message that would
+    // overstate what actually ran (e.g. claiming a build happened in a plan-only run).
+    let title = "All steps finished successfully";
+    let sub = "";
+    if (run.status === "max_iterations_reached") {
+      title = "Max fix cycles reached — review output";
+    } else if (run.status === "blocked_consistency_violation") {
+      title = "Blocked: requirements consistency violation";
+    } else if (run.status === "plan_only_done") {
+      title = "Plan Complete";
+      sub = "Requirements, spec, architecture and build prompt were generated. No build was run.";
+    } else if (run.status === "sprint_plan_only_done") {
+      title = "Sprint Planning Complete";
+      sub = "Claude Code, DeepSeek, and Governance were not run.";
+    } else if (sprintModeActive) {
+      title = "Sprint Build Complete";
+      sub = `Sprint ${selectedSprintNum} was built. Future sprints are planned but not built.`;
+    }
+    return (
+      <div className="now-banner now-banner-done">
+        <div className="nb-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.8" strokeLinecap="round">
+            <polyline points="4,12 9,17 20,6"/>
+          </svg>
+        </div>
+        <div className="nb-content">
+          <div className="nb-label">Complete</div>
+          <div className="nb-title">{title}</div>
+          {sub && <div className="nb-sub">{sub}</div>}
+        </div>
+        {run.pipeline_elapsed_s != null && (
+          <div className="nb-timer">{fmtTime(run.pipeline_elapsed_s)}</div>
+        )}
+      </div>
+    );
+  }
+
+  if (!currentStep || !a) return (
+    <div className="now-banner now-banner-queued">
+      <div className="nb-content"><div className="nb-title">Preparing</div></div>
+      <div className="nb-timer">{fmtTime(elapsed)}</div>
+    </div>
+  );
+
+  return (
+    <div className="now-banner now-banner-running" style={{ background: a.color } as React.CSSProperties}>
+      <div className="nb-agent-logo">
+        <AgentIcon agent={currentStep.agent} size={22} />
+      </div>
+      <div className="nb-content">
+        <div className="nb-label">Now running</div>
+        <div className="nb-title">{currentStep.label}</div>
+        <div className="nb-sub">{currentStep.sub}</div>
+      </div>
+      <div className="nb-timer">{fmtTime(elapsed)}</div>
+    </div>
+  );
+}
+
+// ── Sprint mode banner ───────────────────────────────────────────────────────────
+// Parsed from sprint_plan.json once it appears in the artifacts list (deterministic,
+// already normalized server-side by apply_selected_sprint) — robust for both
+// dashboard-triggered runs (which also carry run.sprint_plan/selected_sprint) and
+// CLI-triggered runs (which don't).
+
+interface SprintEntry {
+  number: number;
+  title: string;
+  goal?: string;
+  user_visible_result?: string;
+  dependencies?: number[];
+  independently_demoable?: boolean;
+  build_now?: boolean;
+}
+
+interface SprintInfo {
+  product_name?: string;
+  complexity_level?: string;
+  recommended_sprint_count?: number;
+  reason_for_sprint_count?: string;
+  total_sprints?: number;
+  selected_sprint?: number;
+  sprints?: SprintEntry[];
+}
+
+// Two distinct banners depending on what the run is actually doing:
+//  - planOnly: a sprint-plan-only run — the architect produced a plan, but nothing is
+//    being built. "Sprint Planning Mode."
+//  - otherwise: a run that is actually building one selected sprint with Claude Code.
+//    "Sprint Mode Enabled."
+function SprintModeBanner({ info, fallbackSelected, planOnly }: {
+  info: SprintInfo | null; fallbackSelected: number; planOnly: boolean;
+}) {
+  const total = info?.total_sprints ?? info?.sprints?.length;
+  const selected = info?.selected_sprint ?? fallbackSelected;
+
+  if (planOnly) {
+    return (
+      <div className="sprint-mode-banner sprint-mode-banner-planning">
+        <span className="sprint-mode-pill sprint-mode-pill-planning">Sprint Planning Mode</span>
+        <span className="sprint-mode-line">
+          {total ? `Architect generated ${total} sprint${total === 1 ? "" : "s"}` : "Architect is generating the sprint plan"}
+        </span>
+        <span className="sprint-mode-line">No sprint is being built in this run</span>
+        <span className="sprint-mode-line sprint-mode-future">Claude Code not run</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="sprint-mode-banner">
+      <span className="sprint-mode-pill">Sprint Mode Enabled</span>
+      <span className="sprint-mode-line">Building Sprint {selected}{total ? ` of ${total}` : ""}</span>
+      <span className="sprint-mode-line sprint-mode-future">Future sprints planned but not built</span>
+    </div>
+  );
+}
+
+// ── Sprint cards (Stage 2 entry point) ──────────────────────────────────────────
+// Renders the generated sprint plan as actionable cards once sprint_plan.json exists,
+// so the user sees the architect's actual plan before picking a sprint to build —
+// rather than guessing a sprint number before the plan exists.
+
+function SprintCards({ sprints, selected, onRun, launching, canRun, builtSprints }: {
+  sprints: SprintEntry[];
+  selected: number;
+  onRun: (n: number) => void;
+  launching: number | null;
+  canRun: boolean;
+  // Sprint numbers this dashboard has direct evidence (claude_build_output.txt) were
+  // actually built — not just selected. Used to gate dependency locks: a sprint with
+  // unmet dependencies is locked, not just discouraged, so a demo can't accidentally
+  // "build" Sprint 3 before Sprint 1/2 actually exist.
+  builtSprints: number[];
+}) {
+  if (!sprints.length) return null;
+  const ordered = [...sprints].sort((a, b) => a.number - b.number);
+
+  return (
+    <div className="sprint-cards">
+      <div className="sprint-cards-title">Generated Sprint Plan — choose a sprint to build next</div>
+      <div className="sprint-cards-order">
+        Recommended build order: {ordered.map(s => `Sprint ${s.number}`).join(" → ")}
+      </div>
+      <div className="sprint-cards-list">
+        {ordered.map(s => {
+          const deps = s.dependencies ?? [];
+          const missingDeps = deps.filter(d => !builtSprints.includes(d));
+          const locked = missingDeps.length > 0;
+          const lockLabel = locked
+            ? `Locked until Sprint${missingDeps.length > 1 ? "s" : ""} ${missingDeps.join(" and ")} ${missingDeps.length > 1 ? "are" : "is"} complete`
+            : deps.length === 0 && s.build_now
+            ? "Ready to run · Recommended first"
+            : "Ready to run";
+          return (
+            <div key={s.number} className={`sprint-card ${s.number === selected ? "sprint-card-selected" : ""}`}>
+              <div className="sc2-top">
+                <span className="sc2-number">Sprint {s.number}</span>
+                {s.build_now && <span className="sc2-tag sc2-tag-buildnow">Recommended first</span>}
+                {s.independently_demoable && <span className="sc2-tag sc2-tag-demo">Independently demoable</span>}
+              </div>
+              <div className="sc2-title">{s.title}</div>
+              {s.goal && <div className="sc2-goal">{s.goal}</div>}
+              {s.user_visible_result && (
+                <div className="sc2-output"><span>Output:</span> {s.user_visible_result}</div>
+              )}
+              {!!deps.length && (
+                <div className="sc2-deps">Depends on: {deps.map(d => `Sprint ${d}`).join(", ")}</div>
+              )}
+              <div className={`sc2-status ${locked ? "sc2-status-locked" : "sc2-status-ready"}`}>{lockLabel}</div>
+              <button
+                className="sc2-run-btn"
+                disabled={!canRun || launching !== null || locked}
+                onClick={() => onRun(s.number)}
+                title={
+                  locked ? lockLabel :
+                  canRun ? undefined :
+                  "Original input not available for this run — start a new run to use this action"
+                }
+              >
+                {launching === s.number ? "Starting…" : locked ? "Locked" : canRun ? `Run Sprint ${s.number}` : `Run Sprint ${s.number} (next step)`}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── Sprint completion report ────────────────────────────────────────────────────
+// Surfaces the build outcome explicitly instead of leaving it buried in the artifact
+// tabs: either "no sprint was built" (sprint-plan-only, or a build that never produced
+// proof it ran) or a real completion summary built from sprint_plan.json + the
+// recommended next sprint's dependency chain.
+function SprintCompletionReport({ sprintModeActive, sprintPlanOnlyActive, built, selectedSprintNum, sprintInfo }: {
+  sprintModeActive: boolean;
+  sprintPlanOnlyActive: boolean;
+  built: boolean;
+  selectedSprintNum: number;
+  sprintInfo: SprintInfo | null;
+}) {
+  if (!sprintModeActive) return null;
+
+  const sprints = sprintInfo?.sprints ?? [];
+  const current = sprints.find(s => s.number === selectedSprintNum);
+  const next = sprints.find(s => s.dependencies?.includes(selectedSprintNum)) ??
+    sprints.find(s => s.number === selectedSprintNum + 1);
+
+  if (!built) {
+    return (
+      <div className="sprint-completion-report sprint-completion-report-empty">
+        <div className="sprint-completion-title">Sprint Completion Report</div>
+        <div className="sprint-completion-line">No sprint was built in this run.</div>
+        <div className="sprint-completion-line sprint-completion-muted">
+          {sprintPlanOnlyActive
+            ? "This was a sprint-plan-only run — Claude Code was not invoked."
+            : "No build artifact (claude_build_output.txt) was produced, so no sprint build can be confirmed."}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="sprint-completion-report sprint-completion-report-built">
+      <div className="sprint-completion-title">Sprint Completion Report</div>
+      <div className="sprint-completion-line sprint-completion-headline">
+        Sprint {selectedSprintNum} Complete{current?.title ? `: ${current.title}` : ""}
+      </div>
+      {current?.user_visible_result && (
+        <div className="sprint-completion-line"><span>Output:</span> {current.user_visible_result}</div>
+      )}
+      <div className="sprint-completion-line sprint-completion-muted">
+        Intentionally not built: everything in later sprints of this plan.
+      </div>
+      {next ? (
+        <div className="sprint-completion-line">
+          <span>Recommended next step:</span> Sprint {next.number}{next.title ? `: ${next.title}` : ""}
+        </div>
+      ) : (
+        <div className="sprint-completion-line sprint-completion-muted">This was the last sprint in the plan.</div>
+      )}
+    </div>
+  );
+}
+
+// ── Run timeline panel ──────────────────────────────────────────────────────────
+
+function RunTimeline({ events }: { events: TimelineEvent[] }) {
+  if (!events.length) return null;
+  return (
+    <div className="run-timeline">
+      <div className="run-timeline-title">Run Timeline</div>
+      <div className="run-timeline-list">
+        {events.map(e => (
+          <div key={e.key} className={`rt-event rt-event-${e.done ? "done" : "running"}`}>
+            <span className="rt-dot" />
+            <span className="rt-label">{e.label}</span>
+            {e.elapsedS !== null && <span className="rt-time">{fmtTime(e.elapsedS)}</span>}
+            {e.elapsedS === null && !e.done && <span className="rt-time rt-time-live">running…</span>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Six-section pipeline overview ───────────────────────────────────────────────
+// The flat 12-15 card stepper (StepCard/steps-carousel above) is accurate but reads
+// as one long undifferentiated list. This groups the same underlying step evidence
+// into the six stages a person actually thinks in: Product Planning, Sprint Roadmap,
+// Sprint Build, Review & Fix, Governance, Report & Deploy. It does not replace the
+// step-level data — it's a second view over the same `statuses`/artifacts truth.
+
+type SectionStatus = "done" | "active" | "not_running" | "upcoming";
+
+interface SectionSubstep {
+  label: string;
+  status: StepStatus | "disabled"; // "disabled": structurally not part of this run mode
+}
+
+interface SectionDef {
+  id: string;
+  title: string;
+  blurb: string;
+  status: SectionStatus;
+  substeps: SectionSubstep[];
+}
+
+function rollupStatus(substeps: SectionSubstep[], applicable: boolean): SectionStatus {
+  if (!applicable) return "not_running";
+  const active = substeps.filter(s => s.status !== "disabled");
+  if (!active.length) return "not_running";
+  if (active.every(s => s.status === "skipped")) return "not_running";
+  if (active.some(s => s.status === "running")) return "active";
+  if (active.some(s => s.status === "pending")) return "upcoming";
+  // No substep left pending or running: every remaining one is either "done" or
+  // (deliberately, permanently) "skipped" — the section has run as far as it ever will.
+  return "done";
+}
+
+function buildSections(opts: {
+  statusById: Record<string, StepStatus>;
+  runArtifacts: string[];
+  isTerminal: boolean;
+  sprintModeActive: boolean;
+  reviewFixApplicable: boolean; // false for plan-only / sprint-plan-only runs
+  sprintInfo: SprintInfo | null;
+  selectedSprintNum: number;
+}): SectionDef[] {
+  const { statusById, runArtifacts, isTerminal, sprintModeActive, reviewFixApplicable, sprintInfo, selectedSprintNum } = opts;
+  const get = (id: string): StepStatus => statusById[id] ?? "pending";
+  const hasRawInput = runArtifacts.includes("raw_input.md");
+
+  // Per-artifact substep status, for stages whose substeps map to individual files
+  // rather than one coarse pipeline step (e.g. each governance reviewer's own report).
+  const byArtifact = (name: string, applicable: boolean): StepStatus => {
+    if (!applicable) return "skipped";
+    if (runArtifacts.includes(name)) return "done";
+    return isTerminal ? "skipped" : "pending";
+  };
+
+  // 1. Product Planning
+  const planningSubsteps: SectionSubstep[] = [
+    { label: "Raw Input",                                            status: hasRawInput ? "done" : "pending" },
+    { label: "Clean Requirements",                                   status: get("requirements") },
+    { label: "MVP Spec",                                             status: get("spec") },
+    { label: sprintModeActive ? "Sprint Architecture" : "Architecture", status: get("architecture") },
+    { label: "Architecture Contract Check",                          status: get("consistency") },
+  ];
+
+  // 2. Sprint Roadmap — structurally not part of non-sprint runs
+  const roadmapSubsteps: SectionSubstep[] = [
+    { label: "Sprint Plan",                  status: sprintModeActive ? get("sprint_plan") : "disabled" },
+    { label: "Recommended Build Order",      status: sprintModeActive ? get("sprint_plan") : "disabled" },
+    { label: "Sprint Dependencies",          status: sprintModeActive ? get("sprint_plan") : "disabled" },
+    { label: "Selected Sprint Scope",        status: sprintModeActive ? get("selected_sprint_scope") : "disabled" },
+    { label: "Selected Sprint Build Prompt", status: sprintModeActive ? get("selected_sprint_build_prompt") : "disabled" },
+  ];
+
+  // 3. Sprint Build — "Generated MVP Folder" has no tracked artifact of its own
+  // (mvp/ is a directory, not a file in run_state.json's artifacts list), so it mirrors
+  // the evidence we do have: claude_build_output.txt is only written from inside that
+  // folder once Claude Code has run.
+  const buildSubsteps: SectionSubstep[] = [
+    { label: sprintModeActive ? "Build Selected Sprint" : "Build MVP", status: get("built") },
+    { label: "Generated MVP Folder",                                   status: get("built") },
+    { label: "Smoke Checks",                                           status: get("smoke") },
+  ];
+
+  // 4. Review & Fix — not run at all in plan-only / sprint-plan-only modes
+  const reviewSubsteps: SectionSubstep[] = [
+    { label: "DeepSeek Attack Review",  status: reviewFixApplicable ? get("deepseek") : "disabled" },
+    { label: "GPT Issue Judgment",      status: reviewFixApplicable ? get("judge") : "disabled" },
+    { label: "Claude Fix Loop",         status: reviewFixApplicable ? get("fix") : "disabled" },
+    { label: "Re-run Smoke Checks",     status: reviewFixApplicable ? get("smoke") : "disabled" },
+  ];
+
+  // 5. Governance — each reviewer's report is its own artifact, checked directly so a
+  // partially-run governance panel never reads as fully "done" or fully "not run".
+  const governanceSubsteps: SectionSubstep[] = [
+    { label: "AppSec Review",           status: byArtifact("governance_appsec_report.md", reviewFixApplicable) },
+    { label: "Legal/Privacy Review",    status: byArtifact("governance_legal_privacy_report.md", reviewFixApplicable) },
+    { label: "Infrastructure Review",   status: byArtifact("governance_infra_report.md", reviewFixApplicable) },
+    { label: "Governance Meta-Judge",   status: byArtifact("governance_meta_judgment.md", reviewFixApplicable) },
+    { label: "Governance Fix Loop",     status: reviewFixApplicable
+        ? (runArtifacts.includes("governance_fix_prompt.md") ? "done" : (isTerminal ? "skipped" : "pending"))
+        : "disabled" },
+  ];
+
+  // 6. Report & Deploy — Deploy to AWS is a permanently disabled placeholder; it is
+  // never wired to any real evidence and must never read as "done" or "active".
+  const nextSprint = sprintInfo?.sprints?.find(s => s.dependencies?.includes(selectedSprintNum)) ??
+    sprintInfo?.sprints?.find(s => s.number === selectedSprintNum + 1);
+  const nextSprintStatus: StepStatus | "disabled" = !sprintModeActive
+    ? "disabled"
+    : nextSprint
+    ? "done"
+    : isTerminal
+    ? "skipped" // this was the last sprint in the plan — settled, not a thing left to do
+    : "pending";
+  const reportSubsteps: SectionSubstep[] = [
+    { label: sprintModeActive ? "Sprint Completion Report" : "Final Report", status: get("done") },
+    { label: "Next Recommended Sprint", status: nextSprintStatus },
+    { label: "Deploy to AWS — Coming later", status: "disabled" },
+  ];
+
+  return [
+    { id: "planning",   title: "Product Planning", blurb: "Turning the raw idea into a structured, agreed-upon spec.",        status: rollupStatus(planningSubsteps, true),              substeps: planningSubsteps },
+    { id: "roadmap",    title: "Sprint Roadmap",   blurb: "Decomposing the spec into an ordered, dependency-aware sprint plan.", status: rollupStatus(roadmapSubsteps, sprintModeActive),  substeps: roadmapSubsteps },
+    { id: "build",      title: "Sprint Build",     blurb: "Generating the actual application code with Claude Code.",        status: rollupStatus(buildSubsteps, true),                 substeps: buildSubsteps },
+    { id: "review",     title: "Review & Fix",     blurb: "Red-teaming the build and patching what breaks.",                  status: rollupStatus(reviewSubsteps, reviewFixApplicable), substeps: reviewSubsteps },
+    { id: "governance", title: "Governance",       blurb: "AppSec, legal/privacy and infrastructure sign-off.",               status: rollupStatus(governanceSubsteps, reviewFixApplicable), substeps: governanceSubsteps },
+    { id: "report",     title: "Report & Deploy",  blurb: "Summarizing what shipped and what's recommended next.",            status: rollupStatus(reportSubsteps, true),                substeps: reportSubsteps },
+  ];
+}
+
+const SECTION_STATUS_LABEL: Record<SectionStatus, string> = {
+  done: "Complete",
+  active: "In progress",
+  not_running: "Not being run",
+  upcoming: "Planned",
+};
+
+function SectionCard({ section }: { section: SectionDef }) {
+  return (
+    <details className={`pipeline-section pipeline-section-${section.status}`} open={section.status === "active"}>
+      <summary className="ps-top">
+        <span className="ps-title">{section.title}</span>
+        <span className={`ps-status ps-status-${section.status}`}>{SECTION_STATUS_LABEL[section.status]}</span>
+      </summary>
+      <div className="ps-blurb">{section.blurb}</div>
+      <div className="ps-substeps">
+        {section.substeps.map(s => {
+          const selfExplanatory = s.label.includes("—");
+          const suffix =
+            !selfExplanatory && (s.status === "skipped" || s.status === "disabled") ? " — not being run" : "";
+          return (
+            <div key={s.label} className={`ps-substep ps-substep-${s.status}`}>
+              <span className="ps-substep-dot" />
+              <span className="ps-substep-label">{s.label}{suffix}</span>
+            </div>
+          );
+        })}
+      </div>
+    </details>
+  );
+}
+
+function PipelineSectionOverview({ sections }: { sections: SectionDef[] }) {
+  return (
+    <div className="pipeline-sections">
+      {sections.map(s => <SectionCard key={s.id} section={s} />)}
+    </div>
+  );
+}
+
+// ── Pipeline view (main redesign) ──────────────────────────────────────────────
+
+function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () => void; onNewRun: (id: string) => void }) {
+  const [run, setRun] = useState<RunDetail | null>(null);
+  const [selectedArtifact, setSelectedArtifact] = useState<string | null>(null);
+  const [content, setContent] = useState<string>("");
+  const [contentLoading, setContentLoading] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [activeStep, setActiveStep] = useState(0);
+  const [sprintInfo, setSprintInfo] = useState<SprintInfo | null>(null);
+  const [originalInput, setOriginalInput] = useState<string | null>(null);
+  const [launchingSprint, setLaunchingSprint] = useState<number | null>(null);
+  const carouselRef = useRef<HTMLDivElement>(null);
+  const prevStep = useRef<string | null>(null);
+  const prevStatus = useRef<string | null>(null);
+
+  // Sprint-mode detection: works for both dashboard-triggered runs (run.sprint_plan /
+  // run.sprint_plan_only set by backend) and CLI-triggered runs (no such fields — fall
+  // back to current_step / artifact presence).
+  const sprintModeActive = !!(run?.sprint_plan || run?.sprint_plan_only) ||
+    run?.current_step === "sprint_plan" ||
+    (run?.artifacts ?? []).some(a => a === "sprint_plan.json" || a === "sprint_plan.md" || a === "selected_sprint_scope.md");
+  // Sprint-plan-only ("Stage 1") vs an actual selected-sprint build ("Stage 2") — these get
+  // different banner copy and different step semantics ("Not being run" vs in-progress).
+  const sprintPlanOnlyActive = !!run?.sprint_plan_only || run?.status === "sprint_plan_only_done";
+  const selectedSprintNum = sprintInfo?.selected_sprint ?? run?.selected_sprint ?? 1;
+  const steps = getStepsForRun(sprintModeActive, selectedSprintNum);
+
+  // Original raw input, fetched once it exists, so "Run Sprint N" can launch a fresh run
+  // against the same input without the user re-typing anything. Jira-sourced runs store a
+  // placeholder in raw_input.md (not the real ticket text) — detect that and disable the
+  // action rather than silently rerunning garbage input.
+  useEffect(() => {
+    if (originalInput !== null) return;
+    if (!(run?.artifacts ?? []).includes("raw_input.md")) return;
+    getArtifact(runId, "raw_input.md").then(a => setOriginalInput(a.content)).catch(() => {});
+  }, [run?.artifacts, runId, originalInput]);
+  const canRunSprint = !!originalInput && !originalInput.startsWith("[Jira ticket:");
+
+  const runSprint = useCallback(async (n: number) => {
+    if (!originalInput) return;
+    setLaunchingSprint(n);
+    try {
+      const r = await fetch("http://127.0.0.1:5001/api/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ raw_input: originalInput, sprint_plan: true, selected_sprint: n, no_deepseek: true }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      onNewRun(data.run_id);
+    } catch {
+      // Minimal error handling — surfaced via the button reverting; the new run, if any,
+      // simply won't navigate. Keeping this lightweight per scope ("don't overbuild").
+    } finally {
+      setLaunchingSprint(null);
+    }
+  }, [originalInput, onNewRun]);
+
+  const scrollToStep = useCallback((idx: number) => {
+    setActiveStep(idx);
+    const el = carouselRef.current;
+    if (el) el.scrollTo({ left: idx * el.offsetWidth, behavior: "smooth" });
+  }, []);
+
+  // Sync active dot when user manually scrolls
+  const handleScroll = useCallback(() => {
+    const el = carouselRef.current;
+    if (!el) return;
+    const idx = Math.round(el.scrollLeft / el.offsetWidth);
+    setActiveStep(idx);
+  }, []);
+
+  useEffect(() => {
+    const el = carouselRef.current;
+    el?.addEventListener("scroll", handleScroll, { passive: true });
+    return () => el?.removeEventListener("scroll", handleScroll);
+  }, [handleScroll]);
+
+  // Auto-advance carousel whenever the active step changes
+  useEffect(() => {
+    if (!run) return;
+    const runningId = STEP_MAP[run.current_step ?? ""];
+    if (runningId && runningId !== prevStep.current) {
+      const idx = steps.findIndex(s => s.id === runningId);
+      if (idx >= 0) scrollToStep(idx);
+      prevStep.current = runningId;
+    }
+  }, [run?.current_step, scrollToStep, steps]);
+
+  // Fetch sprint_plan.json once it appears, to power the sprint-mode banner (complexity,
+  // recommended sprint count, selected sprint, total sprints). Small + deterministic, so a
+  // single one-shot fetch (not polled) is enough.
+  useEffect(() => {
+    if (sprintInfo) return;
+    const hasPlan = (run?.artifacts ?? []).includes("sprint_plan.json");
+    if (!hasPlan) return;
+    getArtifact(runId, "sprint_plan.json")
+      .then(a => { try { setSprintInfo(JSON.parse(a.content)); } catch { /* ignore parse errors */ } })
+      .catch(() => {});
+  }, [run?.artifacts, runId, sprintInfo]);
+
+  // Poll run + detect terminal transition
+  useEffect(() => {
+    const poll = () =>
+      getRun(runId).then(r => {
+        setRun(r);
+        const sorted = sortArtifacts(r.artifacts ?? []).filter(a => a !== "run_state.json");
+        // On transition to terminal: auto-open final report
+        if (TERMINAL.has(r.status) && prevStatus.current && !TERMINAL.has(prevStatus.current)) {
+          const final = sorted.find(a => a === "final_mvp_report.md") ?? sorted[sorted.length - 1] ?? null;
+          setSelectedArtifact(final);
+        }
+        prevStatus.current = r.status;
+      }).catch(() => {});
+    poll();
+    const i = setInterval(poll, 2000);
+    return () => clearInterval(i);
+  }, [runId]);
+
+  // Load artifact
+  useEffect(() => {
+    if (!selectedArtifact) return;
+    setContentLoading(true);
+    getArtifact(runId, selectedArtifact)
+      .then(a => setContent(a.content))
+      .catch(() => setContent("(error loading content)"))
+      .finally(() => setContentLoading(false));
+  }, [runId, selectedArtifact]);
+
+  // Live timer
+  useEffect(() => {
+    const i = setInterval(() => setElapsed(e => e + 1), 1000);
+    return () => clearInterval(i);
+  }, []);
+
+  const isTerminal = TERMINAL.has(run?.status ?? "");
+  const timings = run?.step_timings ?? {};
+  const sorted = sortArtifacts(run?.artifacts ?? []).filter(a => a !== "run_state.json");
+  const fixCycle = run?.fix_iteration ?? 0;
+  const timeline = buildTimeline(run);
+
+  const statuses = steps.map(step =>
+    stepStatus(step, run?.artifacts ?? [], run?.current_step ?? "", run?.status ?? "")
+  );
+  // Sprint numbers this run has direct evidence were actually built (claude_build_output.txt
+  // exists, i.e. the "Build Selected Sprint" step is genuinely "done") — only the currently
+  // selected sprint can ever be in this set for a single run, but it's what gates dependency
+  // locks on the sprint cards below.
+  const builtStepIdx = steps.findIndex(s => s.id === "built");
+  const builtSprints = builtStepIdx >= 0 && statuses[builtStepIdx] === "done" ? [selectedSprintNum] : [];
+
+  // Six-section overview: same underlying step/artifact evidence as the detailed
+  // carousel below, grouped into the stages a person actually thinks in.
+  const planOnlyActive = !!run?.plan_only || run?.status === "plan_only_done";
+  const reviewFixApplicable = !planOnlyActive && !sprintPlanOnlyActive;
+  const statusById: Record<string, StepStatus> = {};
+  steps.forEach((step, i) => { statusById[step.id] = statuses[i]; });
+  const sections = buildSections({
+    statusById,
+    runArtifacts: run?.artifacts ?? [],
+    isTerminal,
+    sprintModeActive,
+    reviewFixApplicable,
+    sprintInfo,
+    selectedSprintNum,
+  });
+
+  return (
+    <div className="pipeline-view">
+      <div className="pipeline-body">
+        {/* ── LEFT: Six-section pipeline overview ─────────────────────────────── */}
+        <div className="steps-panel">
+          <div className="steps-panel-header">
+            <button className="topbar-back" onClick={onBack}><IconBack /> MVP Pipeline</button>
+          </div>
+          {sprintModeActive && <SprintModeBanner info={sprintInfo} fallbackSelected={selectedSprintNum} planOnly={sprintPlanOnlyActive} />}
+
+          <div className="steps-panel-scroll">
+            <PipelineSectionOverview sections={sections} />
+
+            {/* Run timeline — explicit history of loop cycles/rounds. */}
+            <RunTimeline events={timeline} />
+
+            {/* Detailed step-by-step view — the original flat stepper, preserved as an
+                advanced disclosure rather than the main visual story. */}
+            <details className="detailed-steps">
+              <summary>Show detailed step view ({steps.length} steps)</summary>
+              <div className="steps-carousel" ref={carouselRef}>
+                {steps.map((step, i) => (
+                  <StepCard
+                    key={step.id}
+                    step={step}
+                    index={i}
+                    total={steps.length}
+                    status={statuses[i]}
+                    elapsed={stepElapsed(step.id, timings)}
+                    cycle={fixCycle}
+                  />
+                ))}
+              </div>
+              <div className="carousel-nav">
+                <button
+                  className="carousel-arrow"
+                  onClick={() => scrollToStep(Math.max(0, activeStep - 1))}
+                  disabled={activeStep === 0}
+                >←</button>
+                <div className="carousel-dots">
+                  {steps.map((_, i) => (
+                    <button
+                      key={i}
+                      className={`cdot cdot-${statuses[i]} ${i === activeStep ? "cdot-active" : ""}`}
+                      onClick={() => scrollToStep(i)}
+                      title={steps[i].label}
+                    />
+                  ))}
+                </div>
+                <button
+                  className="carousel-arrow"
+                  onClick={() => scrollToStep(Math.min(steps.length - 1, activeStep + 1))}
+                  disabled={activeStep === steps.length - 1}
+                >→</button>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        {/* ── RIGHT: Status banner + Terminal (running) or Artifacts (done) ──── */}
+        <div className="right-panel">
+          <NowBanner run={run} elapsed={elapsed} sprintModeActive={sprintModeActive} selectedSprintNum={selectedSprintNum} />
+
+          {isTerminal ? (
+            /* ── Artifact browser (run complete) ───────────────────────────── */
+            <div className="artifact-panel">
+              {sprintModeActive && sprintInfo?.sprints?.length ? (
+                <SprintCards
+                  sprints={sprintInfo.sprints}
+                  selected={selectedSprintNum}
+                  onRun={runSprint}
+                  launching={launchingSprint}
+                  canRun={canRunSprint}
+                  builtSprints={builtSprints}
+                />
+              ) : null}
+              <SprintCompletionReport
+                sprintModeActive={sprintModeActive}
+                sprintPlanOnlyActive={sprintPlanOnlyActive}
+                built={builtStepIdx >= 0 && statuses[builtStepIdx] === "done"}
+                selectedSprintNum={selectedSprintNum}
+                sprintInfo={sprintInfo}
+              />
+              {sorted.length > 0 && (
+                <div className="artifact-tabs">
+                  {sorted.map(name => (
+                    <button
+                      key={name}
+                      className={`artifact-tab ${selectedArtifact === name ? "active" : ""}`}
+                      onClick={() => setSelectedArtifact(name)}
+                    >{artifactDisplayName(name)}</button>
+                  ))}
+                </div>
+              )}
+              <div className="artifact-body">
+                {selectedArtifact ? (
+                  <>
+                    <div className="artifact-filename">
+                      {artifactDisplayName(selectedArtifact)}
+                      {artifactDisplayName(selectedArtifact) !== selectedArtifact && (
+                        <span className="artifact-filename-raw"> · {selectedArtifact}</span>
+                      )}
+                    </div>
+                    <div className={`artifact-content ${contentLoading ? "loading" : ""}`}>
+                      {contentLoading
+                        ? <div className="artifact-shimmer" />
+                        : <pre key={selectedArtifact}>{content}</pre>
+                      }
+                    </div>
+                  </>
+                ) : (
+                  <div className="artifact-empty">Files will appear here as steps complete</div>
+                )}
+              </div>
+            </div>
+          ) : (
+            /* ── Live terminal (run in progress) ───────────────────────────── */
+            <TerminalView runId={runId} sprintMode={sprintModeActive} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Home view ──────────────────────────────────────────────────────────────────
+
+type EntryMode = "idea" | "paste" | "file" | "jira";
+
+const ENTRY_CARDS = [
+  { mode: "idea"  as EntryMode, icon: <IconIdea />, title: "I Have an Idea", sub: "Tell us what you want to build in a sentence — we'll generate the full requirements", color: "#f59e0b", colorBg: "#fffbeb", hint: "Just a few words is enough" },
+  { mode: "paste" as EntryMode, icon: <IconPen />,  title: "Write Requirements", sub: "Paste detailed requirements you've already written and let the pipeline build it", color: "#6366f1", colorBg: "#eef2ff", hint: "Plain text or Markdown" },
+  { mode: "file"  as EntryMode, icon: <IconFile />, title: "Load File",         sub: "Import an existing spec or requirements doc from a .md or .txt file", color: "#0284c7", colorBg: "#e0f2fe", hint: ".md or .txt" },
+  { mode: "jira"  as EntryMode, icon: <IconJira />, title: "Jira Ticket",       sub: "Pull a ticket directly from your Jira workspace by key", color: "#0052cc", colorBg: "#e8f0fb", hint: "e.g. MDP-1" },
+];
+
+function HomeView({ onSelect, onRuns }: { onSelect: (m: EntryMode) => void; onRuns: () => void }) {
+  return (
+    <div className="home-view">
+      <div className="home-hero">
+        <div className="home-wordmark">
+          <div className="home-logo"><IconPipeline /></div>
+          <span className="home-title">MVP Pipeline</span>
+        </div>
+        <p className="home-sub">Turn ideas into working applications, automatically.</p>
+      </div>
+      <div className="entry-cards">
+        {ENTRY_CARDS.map((card, i) => (
+          <button
+            key={card.mode}
+            className="entry-card"
+            style={{ "--card-color": card.color, "--card-bg": card.colorBg, animationDelay: `${i * 70 + 150}ms` } as React.CSSProperties}
+            onClick={() => onSelect(card.mode)}
+          >
+            <div className="card-top-bar" />
+            <div className="card-inner">
+              <div className="card-icon-wrap">{card.icon}</div>
+              <div className="card-text">
+                <div className="card-title">{card.title}</div>
+                <div className="card-sub">{card.sub}</div>
+              </div>
+            </div>
+            <div className="card-footer">
+              <span>{card.hint}</span>
+              <span className="card-arrow">→</span>
+            </div>
+          </button>
+        ))}
+      </div>
+      <div className="home-footer">
+        <button className="runs-link" onClick={onRuns}><IconHistory /> View past runs</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Input view ─────────────────────────────────────────────────────────────────
+
+type RunMode = "full" | "plan_only" | "sprint_plan_only";
+
+function InputView({ mode, onBack, onCreated }: { mode: EntryMode; onBack: () => void; onCreated: (id: string) => void }) {
+  const [text, setText] = useState("");
+  const [jiraKey, setJiraKey] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [runMode, setRunMode] = useState<RunMode>("full");
+  const [selectedSprintInput, setSelectedSprintInput] = useState(1);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const card = ENTRY_CARDS.find(c => c.mode === mode)!;
+
+  const submit = async () => {
+    setLoading(true); setError(null);
+    try {
+      const base =
+        mode === "jira" ? { jira_key: jiraKey.trim().toUpperCase() } :
+        mode === "idea" ? { raw_input: text.trim(), mode: "idea" } :
+                          { raw_input: text.trim() };
+      // Plan-only / sprint-plan-only let the dashboard exercise the pipeline's cheap,
+      // no-Claude-Code / no-DeepSeek paths (same as the CLI's --plan-only /
+      // --sprint-plan --sprint-plan-only flags) for quick testing.
+      const extra: Record<string, unknown> =
+        runMode === "plan_only" ? { plan_only: true } :
+        runMode === "sprint_plan_only" ? { sprint_plan: true, sprint_plan_only: true, selected_sprint: selectedSprintInput } :
+        {};
+      const payload = { ...base, ...extra };
+      const r = await fetch("http://127.0.0.1:5001/api/runs", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      onCreated(data.run_id);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    } finally { setLoading(false); }
+  };
+
+  const canSubmit = mode === "jira" ? jiraKey.trim().length > 0 : text.trim().length > 0;
+
+  return (
+    <div className="input-view">
+      <button className="back-btn" onClick={onBack}><IconBack /> Back</button>
+      <div className="input-card" style={{ "--card-color": card.color, "--card-bg": card.colorBg } as React.CSSProperties}>
+        <div className="input-card-header">
+          <div className="input-header-icon">{card.icon}</div>
+          <span className="input-title">{card.title}</span>
+        </div>
+        <div className="input-card-body">
+          {mode === "idea" && (
+            <div className="jira-input-wrap">
+              <input className="jira-input" type="text" value={text} onChange={e => setText(e.target.value)}
+                placeholder="e.g. A mood tracker app where users pick from 5 emotions"
+                disabled={loading} autoFocus
+                onKeyDown={e => e.key === "Enter" && canSubmit && submit()} />
+              <p className="input-hint">One sentence is enough. The pipeline will interview your idea and generate full requirements, spec, and architecture before building.</p>
+            </div>
+          )}
+          {mode === "paste" && (
+            <textarea className="input-textarea" value={text} onChange={e => setText(e.target.value)}
+              placeholder={"Paste your requirements. Example:\n\nBuild a Kanban board where users can create boards, add lists, and move cards between them. React frontend, Flask backend, PostgreSQL."}
+              rows={10} disabled={loading} autoFocus />
+          )}
+          {mode === "file" && (
+            <div className="file-drop" onClick={() => fileRef.current?.click()}>
+              {text ? (
+                <div>
+                  <div className="file-ok">✓ File loaded ({text.length.toLocaleString()} chars)</div>
+                  <pre className="file-sample">{text.slice(0, 280)}{text.length > 280 ? "…" : ""}</pre>
+                </div>
+              ) : (
+                <div className="file-prompt"><IconFile /><span>Click to choose a .md or .txt file</span></div>
+              )}
+              <input ref={fileRef} type="file" accept=".md,.txt" style={{ display: "none" }}
+                onChange={e => { const f = e.target.files?.[0]; if (!f) return; const r = new FileReader(); r.onload = ev => setText(ev.target?.result as string); r.readAsText(f); }} />
+            </div>
+          )}
+          {mode === "jira" && (
+            <div className="jira-input-wrap">
+              <input className="jira-input" type="text" value={jiraKey} onChange={e => setJiraKey(e.target.value)}
+                placeholder="MDP-1" disabled={loading} autoFocus onKeyDown={e => e.key === "Enter" && canSubmit && submit()} />
+              <p className="input-hint">The pipeline will fetch this ticket from your Jira workspace and use it as the MVP input.</p>
+            </div>
+          )}
+          <div className="run-mode-row">
+            <div className="run-mode-label">Run mode</div>
+            <div className="run-mode-options">
+              <button type="button" className={`run-mode-opt ${runMode === "full" ? "active" : ""}`} onClick={() => setRunMode("full")} disabled={loading}>Full pipeline</button>
+              <button type="button" className={`run-mode-opt ${runMode === "plan_only" ? "active" : ""}`} onClick={() => setRunMode("plan_only")} disabled={loading}>Plan only</button>
+              <button type="button" className={`run-mode-opt ${runMode === "sprint_plan_only" ? "active" : ""}`} onClick={() => setRunMode("sprint_plan_only")} disabled={loading}>Sprint plan only</button>
+            </div>
+            <p className="run-mode-hint">
+              {runMode === "full" && "Runs the complete pipeline, including the Claude Code build, smoke checks, review and governance."}
+              {runMode === "plan_only" && "Generates requirements, spec, architecture and build prompt only — no Claude Code build, no DeepSeek."}
+              {runMode === "sprint_plan_only" && "The architect reads your requirements and decides the full sprint plan — how many sprints, and what each one covers. No Claude Code build, no DeepSeek. Sprint selection happens after the plan is generated, on the results screen."}
+            </p>
+            {runMode === "sprint_plan_only" && (
+              <details className="run-mode-advanced">
+                <summary>Advanced: default sprint (optional)</summary>
+                <div className="run-mode-sprint-pick">
+                  <label htmlFor="selected-sprint-input">Default selected sprint</label>
+                  <input
+                    id="selected-sprint-input" type="number" min={1} max={12}
+                    value={selectedSprintInput}
+                    onChange={e => setSelectedSprintInput(Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)))}
+                    disabled={loading}
+                  />
+                </div>
+                <p className="run-mode-hint">
+                  The architect decides the full sprint plan. This number only affects which sprint's scope doc is pre-generated — you'll pick a sprint to build from the plan itself afterward.
+                </p>
+              </details>
+            )}
+          </div>
+          {error && <p className="input-error">{error}</p>}
+          <button className="submit-btn" onClick={submit} disabled={loading || !canSubmit}>
+            {loading ? "Starting pipeline…" : "Start Pipeline →"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Runs view ──────────────────────────────────────────────────────────────────
+
+function RunsView({ onSelect, onBack }: { onSelect: (id: string) => void; onBack: () => void }) {
+  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    getRuns().then(r => { setRuns(r); setLoading(false); }).catch(() => setLoading(false));
+    const i = setInterval(() => getRuns().then(setRuns).catch(() => {}), 5000);
+    return () => clearInterval(i);
+  }, []);
+  return (
+    <div className="runs-view">
+      <button className="back-btn" onClick={onBack}><IconBack /> Back</button>
+      <div className="runs-header"><h2 className="runs-title">Past Runs</h2></div>
+      {loading && <div className="runs-loading">Loading…</div>}
+      {!loading && runs.length === 0 && <div className="runs-empty">No runs yet.</div>}
+      <div className="runs-list">
+        {[...runs].reverse().map(r => (
+          <div key={r.run_id} className="run-card" onClick={() => onSelect(r.run_id)}>
+            <div className="run-card-top">
+              <span className="run-card-id">{r.run_id}</span>
+              <StatusBadge status={r.status} />
+            </div>
+            <div className="run-card-meta">
+              {r.created && <span>{new Date(r.created).toLocaleString()}</span>}
+              {r.current_step && <span>Step: {r.current_step.replace(/_/g, " ")}</span>}
+              {r.fix_iteration > 0 && <span>Fix cycles: {r.fix_iteration}</span>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── App root ───────────────────────────────────────────────────────────────────
+
+type View = { type: "home" } | { type: "input"; mode: EntryMode } | { type: "pipeline"; runId: string } | { type: "runs" };
+
+export default function App() {
+  const [view, setView] = useState<View>({ type: "home" });
+  return (
+    <div className="app">
+      {view.type === "home"     && <HomeView onSelect={mode => setView({ type: "input", mode })} onRuns={() => setView({ type: "runs" })} />}
+      {view.type === "input"    && <InputView mode={view.mode} onBack={() => setView({ type: "home" })} onCreated={id => setView({ type: "pipeline", runId: id })} />}
+      {view.type === "pipeline" && <PipelineView runId={view.runId} onBack={() => setView({ type: "runs" })} onNewRun={id => setView({ type: "pipeline", runId: id })} />}
+      {view.type === "runs"     && <RunsView onSelect={id => setView({ type: "pipeline", runId: id })} onBack={() => setView({ type: "home" })} />}
+    </div>
+  );
+}

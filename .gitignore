@@ -1,0 +1,26 @@
+# secrets
+.env
+*.pem
+*.key
+
+# python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# generated runs / outputs
+runs/
+*.log
+
+# mac
+.DS_Store
+
+# old local pipeline experiments with hardcoded keys
+pipeline_productivity.py
+pipeline_v2.py

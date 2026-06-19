@@ -1,0 +1,13 @@
+# MVP Pipeline — Python dependencies
+# This covers the pipeline tooling itself (pipeline_mvp_builder.py, config.py,
+# jira.py, backend/app.py). It does NOT cover dependencies of MVPs that the
+# pipeline builds — those get their own requirements.txt inside runs/run_NNN/mvp/.
+#
+# Install with:
+#   pip install -r requirements.txt
+
+openai>=1.0
+requests>=2.31
+python-dotenv>=1.0
+flask>=3.0
+flask-cors>=4.0
