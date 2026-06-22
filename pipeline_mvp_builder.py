@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -2825,6 +2826,890 @@ def pipeline_existing_app_upgrade(
     return run_id
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Multi-Sprint Continuation Mode
+# ═════════════════════════════════════════════════════════════════════════════
+# A third entry point alongside the normal "idea -> new MVP" pipeline and the
+# Existing App Upgrade pipeline. Given a previous run folder + a requested next
+# sprint number, this mode LOADS (never regenerates) that run's preserved sprint
+# plan, copies that run's app baseline into a brand-new run folder (never
+# mutating the source run), builds ONLY the requested next sprint on top of it,
+# checks regression against everything previously completed, and writes a
+# continuation completion report. Works for both normal sprint-mode runs
+# (sprint_plan.json + mvp/) and Existing App Upgrade runs (feature_sprint_plan.json).
+
+class ContinuationError(RuntimeError):
+    """Raised when a --continue-run source run is missing required artifacts, or
+    when no buildable app baseline can be found for it."""
+
+
+def detect_continuation_source(source_run_path: Path) -> dict:
+    """
+    Deterministic — inspects a previous run folder and classifies it as normal
+    sprint mode or Existing App Upgrade mode, without regenerating or modifying
+    anything in it. No GPT call. Raises ContinuationError if no sprint plan can
+    be found at all (the explicit hard-failure case the operator asked for).
+    """
+    source_run_path = Path(source_run_path).resolve()
+    if not source_run_path.exists():
+        raise ContinuationError(f"--continue-run path does not exist: {source_run_path}")
+
+    state = _safe_read_json(source_run_path / "run_state.json")
+
+    has_sprint_plan = (source_run_path / "sprint_plan.json").exists()
+    has_feature_sprint_plan = (source_run_path / "feature_sprint_plan.json").exists()
+    has_mvp_dir = (source_run_path / "mvp").is_dir()
+
+    check_names = (
+        "sprint_plan.json", "feature_sprint_plan.json", "mvp",
+        "selected_sprint_scope.md", "selected_feature_sprint_scope.md",
+        "final_mvp_report.md", "feature_completion_report.md", "regression_check.md",
+    )
+    found = [n for n in check_names if (source_run_path / n).exists()]
+    missing = [n for n in check_names if n not in found]
+
+    if has_feature_sprint_plan:
+        detected_mode = "existing_app_upgrade"
+        sprint_plan_filename = "feature_sprint_plan.json"
+        plan_json = _safe_read_json(source_run_path / sprint_plan_filename)
+        previous_selected_sprint = (
+            state.get("selected_feature_sprint")
+            or plan_json.get("selected_feature_sprint")
+        )
+        existing_app_path = state.get("existing_app_path")
+        app_path = Path(existing_app_path) if existing_app_path else None
+    elif has_sprint_plan:
+        detected_mode = "normal_sprint"
+        sprint_plan_filename = "sprint_plan.json"
+        plan_json = _safe_read_json(source_run_path / sprint_plan_filename)
+        previous_selected_sprint = state.get("selected_sprint") or plan_json.get("selected_sprint")
+        app_path = (source_run_path / "mvp") if has_mvp_dir else None
+    else:
+        raise ContinuationError(
+            "Cannot continue because no sprint plan was found in the source run "
+            f"({source_run_path}). Expected sprint_plan.json (normal mode) or "
+            "feature_sprint_plan.json (Existing App Upgrade mode)."
+        )
+
+    return {
+        "source_run": str(source_run_path),
+        "detected_mode": detected_mode,
+        "sprint_plan_filename": sprint_plan_filename,
+        "previous_selected_sprint": previous_selected_sprint,
+        "app_path": app_path,
+        "state": state,
+        "artifacts_found": found,
+        "artifacts_missing": missing,
+    }
+
+
+def load_preserved_sprint_plan(source_info: dict) -> dict:
+    """Loads the source run's sprint plan EXACTLY as written — no GPT call, no
+    regeneration. Raises ContinuationError if the file is missing or empty."""
+    plan_path = Path(source_info["source_run"]) / source_info["sprint_plan_filename"]
+    if not plan_path.exists():
+        raise ContinuationError(
+            "Cannot continue because no sprint plan was found in the source run "
+            f"({source_info['source_run']})."
+        )
+    plan_json = _safe_read_json(plan_path)
+    if not plan_json.get("sprints"):
+        raise ContinuationError(
+            f"Cannot continue — {plan_path} exists but has no 'sprints' list to preserve."
+        )
+    return plan_json
+
+
+# ── Mode-aware sprint-entry accessors ───────────────────────────────────────────
+# Normal-mode sprint entries are keyed "number" with fields like
+# files_modules_touched/smoke_checks; Existing-App-Upgrade entries are keyed
+# "sprint_number" with fields like likely_files_created/must_not_modify. These
+# small accessors let the rest of continuation mode treat both shapes uniformly
+# without duplicating logic per mode.
+
+def _sprint_key(detected_mode: str) -> str:
+    return "sprint_number" if detected_mode == "existing_app_upgrade" else "number"
+
+
+def _sprint_number(entry: dict, detected_mode: str) -> int:
+    return entry.get(_sprint_key(detected_mode))
+
+
+def _sprint_features(entry: dict, detected_mode: str) -> list:
+    if detected_mode == "existing_app_upgrade":
+        return entry.get("features") or []
+    return entry.get("files_modules_touched") or []
+
+
+def _sprint_files_created(entry: dict, detected_mode: str) -> list:
+    if detected_mode == "existing_app_upgrade":
+        return entry.get("likely_files_created") or []
+    return entry.get("files_modules_touched") or []
+
+
+def _sprint_files_modified(entry: dict, detected_mode: str) -> list:
+    if detected_mode == "existing_app_upgrade":
+        return entry.get("likely_files_modified") or []
+    return []
+
+
+def _sprint_must_not_modify(entry: dict, detected_mode: str) -> list:
+    if detected_mode == "existing_app_upgrade":
+        return entry.get("must_not_modify") or []
+    return []
+
+
+def _sprint_completion_criteria(entry: dict, detected_mode: str) -> list:
+    if detected_mode == "existing_app_upgrade":
+        return entry.get("completion_criteria") or []
+    return entry.get("smoke_checks") or []
+
+
+def _all_sprints(plan_json: dict, detected_mode: str) -> list:
+    key = _sprint_key(detected_mode)
+    return sorted(plan_json.get("sprints", []), key=lambda s: s.get(key, 0))
+
+
+def select_continuation_sprint(plan_json: dict, detected_mode: str, selected_sprint_number: int) -> dict:
+    """Deterministic, mode-aware lookup. Reuses the existing select_sprint /
+    select_feature_sprint logic rather than reimplementing it."""
+    if detected_mode == "existing_app_upgrade":
+        return select_feature_sprint(plan_json, selected_sprint_number)
+    return select_sprint(plan_json, selected_sprint_number)
+
+
+def copy_baseline_app_for_continuation(source_info: dict, new_run_dir: Path) -> Path:
+    """
+    Copies the app baseline into the NEW run folder so the source run is NEVER
+    mutated. Normal mode: copies source_run/mvp -> new_run/mvp. Existing App
+    Upgrade mode: copies the original existing-app folder (recorded in the
+    source run's state) -> new_run/app. Deterministic, no GPT call. Raises
+    ContinuationError if no app folder exists to copy.
+    """
+    new_run_dir = Path(new_run_dir)
+    app_path = source_info.get("app_path")
+    if not app_path or not Path(app_path).exists():
+        raise ContinuationError(
+            "Cannot continue — no buildable app folder was found for the source run "
+            f"({source_info['source_run']}). Expected mvp/ (normal mode) or the recorded "
+            "existing-app path (Existing App Upgrade mode)."
+        )
+    app_path = Path(app_path)
+    dest = new_run_dir / ("mvp" if source_info["detected_mode"] == "normal_sprint" else "app")
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(app_path, dest, ignore=shutil.ignore_patterns(*_SCAN_IGNORE_DIRS))
+    return dest
+
+
+def write_preserved_sprint_plan_artifacts(plan_json: dict, detected_mode: str, run_dir) -> str:
+    """Copies the previous sprint plan EXACTLY (preserved_sprint_plan.json) and
+    renders it for humans (preserved_sprint_plan.md), clearly labeled as not
+    regenerated. No GPT call."""
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "preserved_sprint_plan.json").write_text(json.dumps(plan_json, indent=2), encoding="utf-8")
+    body = (
+        render_feature_sprint_plan_markdown(plan_json)
+        if detected_mode == "existing_app_upgrade"
+        else render_sprint_plan_markdown(plan_json)
+    )
+    banner = (
+        "> **Preserved from previous run. Not regenerated.**\n"
+        "> This plan was loaded exactly as written by the source run and reused as-is "
+        "for this continuation sprint.\n\n"
+    )
+    content = banner + body
+    (run_dir / "preserved_sprint_plan.md").write_text(content, encoding="utf-8")
+    return content
+
+
+def write_continuation_source_artifact(
+    source_info: dict, requested_sprint: int, app_path: Path, run_dir,
+) -> str:
+    """Deterministic — continuation_source.md. No GPT call."""
+    lines = ["# Continuation Source", ""]
+    lines.append(f"**Source run:** `{source_info['source_run']}`")
+    lines.append(f"**Detected mode:** {source_info['detected_mode']}")
+    lines.append(f"**Previous selected sprint:** {source_info.get('previous_selected_sprint') or '(unknown)'}")
+    lines.append(f"**Requested next sprint:** {requested_sprint}")
+    lines.append(f"**App baseline used (copied, not mutated):** `{app_path}`")
+    lines.append(f"**Sprint plan file preserved:** `{source_info['sprint_plan_filename']}`")
+    lines.append("")
+    lines.append("## Important Previous Artifacts Found")
+    for f in source_info["artifacts_found"] or ["(none)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Important Previous Artifacts Missing")
+    for f in source_info["artifacts_missing"] or ["(none)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Safety Notes")
+    lines.append("- The source run folder above was NOT modified by this continuation.")
+    lines.append("- The sprint plan was loaded exactly as-is and was not regenerated.")
+    content = "\n".join(lines) + "\n"
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "continuation_source.md").write_text(content, encoding="utf-8")
+    return content
+
+
+def write_current_app_inventory(scan: dict, run_dir) -> str:
+    """Deterministic — renders the scan dict for a CONTINUATION run's COPIED app
+    baseline into current_app_inventory.md. Same scanner as Existing App Upgrade
+    mode (scan_existing_app), different filename so it never collides with that
+    mode's existing_app_inventory.md. No GPT call."""
+    lines = ["# Current App Inventory", "", f"**Root:** `{scan['root']}`", ""]
+    lines.append(f"**Detected tech stack:** {', '.join(scan['tech_stack'])}")
+    lines.append(f"**Package manager:** {scan['package_manager'] or 'Not detected'}")
+    lines.append(f"**Frontend framework:** {scan['frontend_framework'] or 'None detected'}")
+    lines.append(f"**Backend framework:** {scan['backend_framework'] or 'None detected'}")
+    lines.append(f"**Database:** {scan['database'] or 'None detected'}")
+    lines.append(f"**Auth:** {scan['auth'] or 'None detected'}")
+    lines.append("")
+    lines.append(f"**Total files scanned:** {scan['file_count']}")
+    lines.append("")
+    lines.append("## Folder Structure (top level)")
+    for d in scan["top_level_dirs"] or ["(no subfolders)"]:
+        lines.append(f"- {d}/")
+    lines.append("")
+    lines.append("## App Entry Points")
+    for f in scan["entry_points"] or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Components (if detectable)")
+    for f in scan["components"] or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## API Files (if detectable)")
+    for f in scan["api_files"] or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Test / Build Scripts")
+    if scan["scripts"]:
+        for k, v in scan["scripts"].items():
+            lines.append(f"- `{k}`: `{v}`")
+    else:
+        lines.append("(none detected — no package.json scripts found)")
+    lines.append("")
+    content = "\n".join(lines) + "\n"
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "current_app_inventory.md").write_text(content, encoding="utf-8")
+    return content
+
+
+def scan_current_app_for_continuation(app_path: Path, run_dir) -> tuple[dict, str]:
+    """Reuses the deterministic scan_existing_app() scanner against the COPIED
+    app baseline for this continuation run. No GPT call."""
+    scan = scan_existing_app(app_path)
+    inventory_md = write_current_app_inventory(scan, run_dir)
+    return scan, inventory_md
+
+
+CONTINUATION_GAP_ANALYSIS_SYSTEM = """You are a staff engineer performing a change-impact analysis \
+before building the NEXT sprint of a multi-sprint product that is already partway built. You are \
+given the preserved sprint plan, what the most recently completed sprint was, what the next sprint is \
+supposed to add, and the current app inventory.
+
+Write in this exact format:
+
+# Continuation Gap Analysis
+
+## What Previous Sprint(s) Completed
+Bullet list, grounded in the preserved sprint plan and current app inventory.
+
+## What The Next Sprint Must Add
+Bullet list of the next sprint's goal/features.
+
+## Dependencies That Must Already Exist
+Bullet list of things the next sprint assumes are already built. Flag anything that looks missing \
+from the current app inventory.
+
+## Files / Areas Likely Impacted
+Bullet list of specific files/folders likely to be touched by the next sprint.
+
+## Risks
+Bullet list of concrete risks to existing functionality.
+
+## Protected Prior-Sprint Functionality
+Bullet list of specific previous-sprint behavior/files that must keep working unchanged.
+
+Be specific and grounded in the actual inputs — do not write generic boilerplate. Never describe this \
+as a new product being built from scratch; it already has completed sprints.
+"""
+
+
+def generate_continuation_gap_analysis(
+    preserved_plan_md: str,
+    previous_sprint: dict | None,
+    next_sprint: dict,
+    current_app_inventory_md: str,
+    detected_mode: str,
+    run_dir,
+) -> str:
+    prev_label = (
+        f"Sprint {_sprint_number(previous_sprint, detected_mode)}: {previous_sprint.get('title', '')}"
+        if previous_sprint else "(none on record — Sprint 0 / initial baseline only)"
+    )
+    next_num = _sprint_number(next_sprint, detected_mode)
+    gap = gpt([
+        {"role": "system", "content": CONTINUATION_GAP_ANALYSIS_SYSTEM},
+        {"role": "user", "content": (
+            f"## PRESERVED SPRINT PLAN\n{preserved_plan_md}\n\n"
+            f"## MOST RECENTLY COMPLETED SPRINT\n{prev_label}\n\n"
+            f"## NEXT SPRINT TO BUILD\nSprint {next_num}: {next_sprint.get('title', '')}\n"
+            f"Goal: {next_sprint.get('goal', '')}\n\n"
+            f"## CURRENT APP INVENTORY\n{current_app_inventory_md}\n\n"
+            "Write the continuation gap analysis."
+        )},
+    ])
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "continuation_gap_analysis.md").write_text(gap, encoding="utf-8")
+    return gap
+
+
+def render_continuation_sprint_scope_markdown(
+    next_sprint: dict, previous_sprint: dict | None, detected_mode: str, plan_json: dict,
+) -> str:
+    """Deterministic — selected_continuation_sprint_scope.md. No GPT call."""
+    total = plan_json.get("total_sprints", len(plan_json.get("sprints", [])))
+    n = _sprint_number(next_sprint, detected_mode)
+    lines = [
+        f"# Selected Continuation Sprint Scope — Sprint {n} of {total}",
+        "",
+        f"## Title\n{next_sprint.get('title', '')}",
+        "",
+        f"## Goal\n{next_sprint.get('goal', '')}",
+        "",
+        "## Features / Scope",
+    ]
+    for f in _sprint_features(next_sprint, detected_mode) or ["(not specified)"]:
+        lines.append(f"- {f}")
+    lines += ["", "## Previous Sprint Work That Must Be Preserved"]
+    if previous_sprint:
+        pn = _sprint_number(previous_sprint, detected_mode)
+        lines.append(f"- Sprint {pn}: {previous_sprint.get('title', '')} — already built; do not rebuild or remove.")
+    else:
+        lines.append("- Sprint 0 / initial baseline — already built; do not rebuild or remove.")
+    lines += ["", "## Likely Files To Create"]
+    for f in _sprint_files_created(next_sprint, detected_mode) or ["(use judgment within the preserved plan)"]:
+        lines.append(f"- {f}")
+    lines += ["", "## Likely Files To Modify"]
+    for f in _sprint_files_modified(next_sprint, detected_mode) or ["(none specified)"]:
+        lines.append(f"- {f}")
+    lines += ["", "## Protected Files / Areas (must not modify)"]
+    for f in _sprint_must_not_modify(next_sprint, detected_mode) or [
+        "(none specified — still apply general preservation rules)"
+    ]:
+        lines.append(f"- {f}")
+    lines += ["", "## Completion Criteria"]
+    for c in _sprint_completion_criteria(next_sprint, detected_mode) or ["(not specified)"]:
+        lines.append(f"- {c}")
+    lines += [
+        "", "## Regression Expectations",
+        "- All functionality completed in previous sprints must continue to work unchanged.",
+        "- Protected files/areas above must not be modified — verified by continuation_regression_check.md.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def generate_continuation_sprint_build_prompt(
+    detected_mode: str,
+    plan_json: dict,
+    next_sprint: dict,
+    previous_sprint: dict | None,
+    current_app_scan: dict,
+    run_dir,
+) -> str:
+    """
+    Deterministic template — NO GPT call. The strict prompt Claude Code receives
+    to build ONLY the next sprint on top of an already-partially-built product.
+    Mirrors generate_selected_feature_sprint_build_prompt's structure but adds
+    explicit multi-sprint continuation language (do not rebuild previous sprints,
+    do not regenerate from scratch, keep the app runnable).
+
+    Writes selected_continuation_sprint_scope.md and
+    selected_continuation_sprint_build_prompt.txt into run_dir.
+    """
+    key = _sprint_key(detected_mode)
+    total = plan_json.get("total_sprints", len(plan_json.get("sprints", [])))
+    num = next_sprint.get(key)
+    title = next_sprint.get("title") or f"Sprint {num}"
+    all_sprints = _all_sprints(plan_json, detected_mode)
+    earlier_sprints = [s for s in all_sprints if s.get(key, 0) < num]
+    future_sprints = [s for s in all_sprints if s.get(key, 0) > num]
+
+    may_create = _sprint_files_created(next_sprint, detected_mode)
+    may_modify = _sprint_files_modified(next_sprint, detected_mode)
+    must_not_modify = _sprint_must_not_modify(next_sprint, detected_mode)
+    completion = _sprint_completion_criteria(next_sprint, detected_mode)
+
+    parts = [
+        "## CONTEXT: MULTI-SPRINT CONTINUATION",
+        "You are continuing an EXISTING multi-sprint product. Previous sprints have already been "
+        "built and are working. Do not rebuild Sprint 1 or any other previously completed sprint. "
+        "Do not regenerate the app from scratch.",
+        "",
+        f"## CURRENT TECH STACK\n{', '.join(current_app_scan.get('tech_stack') or ['Unknown'])}",
+        "",
+        "## PREVIOUSLY COMPLETED SPRINT(S) — assume already built",
+    ]
+    if earlier_sprints:
+        for s in earlier_sprints:
+            parts.append(f"- Sprint {s.get(key)}: {s.get('title', '')} — already built; "
+                          "do not rebuild it, but you may use/extend it.")
+    else:
+        parts.append("- Sprint 0 / initial baseline — already exists; do not rebuild it.")
+
+    parts += [
+        "",
+        f"## BUILD ONLY THIS SPRINT — Sprint {num} of {total}: {title}",
+        f"Goal: {next_sprint.get('goal', '')}",
+        "",
+        "Scope to build in this sprint:",
+    ]
+    for f in (_sprint_features(next_sprint, detected_mode) or ["(see goal above)"]):
+        parts.append(f"- {f}")
+
+    parts += ["", "## MAY CREATE"]
+    for f in may_create or ["(use judgment, but prefer new files over editing existing ones)"]:
+        parts.append(f"- {f}")
+    parts += ["", "## MAY MODIFY"]
+    for f in may_modify or ["(none — prefer creating new files instead)"]:
+        parts.append(f"- {f}")
+    parts += ["", "## MUST PRESERVE PREVIOUS SPRINT BEHAVIOR"]
+    parts.append("- Everything listed under PREVIOUSLY COMPLETED SPRINT(S) above must keep working "
+                  "exactly as it does now.")
+    for f in must_not_modify:
+        parts.append(f"- {f}")
+    parts += [
+        "", "## MUST NOT DELETE EXISTING WORKING FEATURES",
+        "Any file or feature not explicitly listed under MAY MODIFY above.",
+    ]
+
+    if future_sprints:
+        parts += ["", "## FUTURE SPRINTS — REFERENCE ONLY, DO NOT BUILD"]
+        for s in future_sprints:
+            parts.append(f"- Sprint {s.get(key)}: {s.get('title', '')} — {s.get('goal', '')} "
+                          f"(NOT in scope now. Do not implement Sprint {s.get(key)}.)")
+
+    parts += ["", "## COMPLETION CRITERIA"]
+    for c in completion or ["(not specified)"]:
+        parts.append(f"- {c}")
+
+    parts += [
+        "",
+        "## REGRESSION CHECKLIST (must hold true after this sprint)",
+        "- The app still builds/runs after this sprint.",
+        "- All functionality from previous sprints still works exactly as before.",
+        "- You did not rewrite unrelated files.",
+        "- You did not implement any future sprint listed above.",
+        "- The app remains runnable end-to-end after this sprint.",
+        "",
+        "## HARD RULES",
+        f"- Build ONLY Sprint {num}: {title}. Nothing more, nothing less.",
+        "- Do not rebuild Sprint 1 or any other previously completed sprint.",
+        "- Do not regenerate the app from scratch.",
+        "- Preserve all functionality completed in previous sprints.",
+        "- Do not implement future sprints.",
+        "- Do not rewrite unrelated files.",
+        "- Keep the app runnable after this sprint.",
+        "- Use the preserved sprint plan above exactly — do not redesign or reorder it.",
+        "",
+        "## AFTER YOU FINISH",
+        "Print a clear summary of every file you created and every file you modified, and confirm "
+        "you did not touch anything outside this sprint's scope.",
+    ]
+
+    prompt_text = "\n".join(parts)
+
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    scope_md = render_continuation_sprint_scope_markdown(next_sprint, previous_sprint, detected_mode, plan_json)
+    (run_dir / "selected_continuation_sprint_scope.md").write_text(scope_md, encoding="utf-8")
+    (run_dir / "selected_continuation_sprint_build_prompt.txt").write_text(prompt_text, encoding="utf-8")
+    return prompt_text
+
+
+def snapshot_app_for_continuation(app_path: Path, run_dir) -> dict:
+    """Hashes every file in the COPIED app baseline BEFORE the continuation build,
+    so run_continuation_regression_check can detect ANY unexpected change to
+    previously-built functionality — not just an explicit must_not_modify list,
+    which normal-mode sprint plans don't have. Writes continuation_baseline_hashes.json."""
+    app_path = Path(app_path)
+    hashes = {}
+    for f in app_path.rglob("*"):
+        if f.is_file() and not any(part in _SCAN_IGNORE_DIRS for part in f.parts):
+            try:
+                hashes[str(f.relative_to(app_path))] = _hash_file(f)
+            except Exception:
+                pass
+    record = {"hashes": hashes}
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "continuation_baseline_hashes.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return record
+
+
+def run_continuation_regression_check(
+    app_path: Path,
+    run_dir,
+    next_sprint: dict,
+    detected_mode: str,
+    smoke_log: str = "",
+) -> tuple[str, str]:
+    """
+    Compares full-app file hashes from BEFORE the continuation build to AFTER.
+    A pre-existing file is allowed to change only if this sprint explicitly
+    declared it under likely_files_modified/must_not_modify context (i.e. the
+    sprint plan said this sprint would touch it). PASS if nothing outside the
+    declared scope changed/disappeared and expected new files exist; FAIL if a
+    previously-completed-sprint file changed unexpectedly; UNKNOWN if there was
+    no baseline to compare against. Writes continuation_regression_check.md.
+    """
+    run_dir = Path(run_dir)
+    app_path = Path(app_path)
+    baseline_path = run_dir / "continuation_baseline_hashes.json"
+    must_not_modify = _sprint_must_not_modify(next_sprint, detected_mode)
+    allowed_modified = set(_sprint_files_modified(next_sprint, detected_mode))
+
+    def _is_allowed(rel: str) -> bool:
+        return rel in allowed_modified or any(
+            rel.startswith(a.rstrip("/") + "/") for a in allowed_modified
+        )
+
+    if not baseline_path.exists():
+        status = "UNKNOWN"
+        changed, unexpected_missing, baseline_hashes = [], [], {}
+    else:
+        baseline = _safe_read_json(baseline_path)
+        baseline_hashes = baseline.get("hashes", {})
+        changed, missing = [], []
+        for rel, old_hash in baseline_hashes.items():
+            p = app_path / rel
+            if not p.exists():
+                missing.append(rel)
+                continue
+            try:
+                new_hash = _hash_file(p)
+            except Exception:
+                missing.append(rel)
+                continue
+            if new_hash != old_hash and not _is_allowed(rel):
+                changed.append(rel)
+        unexpected_missing = [m for m in missing if not _is_allowed(m)]
+        status = "UNKNOWN" if not baseline_hashes else ("FAIL" if (changed or unexpected_missing) else "PASS")
+
+    expected_new = [f for f in _sprint_files_created(next_sprint, detected_mode) if not any(ch in f for ch in "*?[")]
+    confirmed_new = [f for f in expected_new if (app_path / f).exists()]
+    missing_new = [f for f in expected_new if f not in confirmed_new]
+
+    lines = ["# Continuation Regression Check", "", f"**Status:** {status}", ""]
+    lines.append("## Files Tracked From Previous Baseline")
+    lines.append(f"{len(baseline_hashes)} file(s) hashed before this sprint's build.")
+    lines.append("")
+    lines.append("## Unexpectedly Changed Files (outside this sprint's declared scope)")
+    for f in changed or ["(none)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Unexpectedly Missing Files")
+    for f in unexpected_missing or ["(none)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Expected New Files For This Sprint")
+    lines.append(f"Confirmed present: {len(confirmed_new)}/{len(expected_new)}")
+    for f in missing_new:
+        lines.append(f"- MISSING expected new file: {f}")
+    lines.append("")
+    if must_not_modify:
+        lines.append("## Explicitly Protected Files / Areas For This Sprint")
+        for f in must_not_modify:
+            lines.append(f"- {f}")
+        lines.append("")
+    if smoke_log:
+        lines.append("## Smoke / Runtime Check Results")
+        lines.append("```")
+        lines.append(smoke_log[:2000])
+        lines.append("```")
+        lines.append("")
+    if status == "UNKNOWN":
+        lines.append("## Note")
+        lines.append(
+            "No file-hash baseline was available to compare against. Regression confidence for "
+            "this continuation sprint is limited to the expected-new-file and smoke checks above."
+        )
+    content = "\n".join(lines) + "\n"
+    (run_dir / "continuation_regression_check.md").write_text(content, encoding="utf-8")
+    return status, content
+
+
+CONTINUATION_COMPLETION_REPORT_SYSTEM = """You are writing the handoff summary for ONE sprint that \
+was just built as a CONTINUATION of an existing multi-sprint product. Be practical, honest, specific. \
+Never describe this as a new product or as "Sprint 1" — state clearly which sprint number this was \
+and that it builds on previously completed sprints.
+
+Write in this exact format:
+
+# Continuation Completion Report
+
+## Source Run
+Which previous run this continued from, and what mode it was.
+
+## Sprint Built
+Number and title of the sprint just built.
+
+## What Previous Functionality Was Preserved
+Bullet list, grounded in the regression check.
+
+## What New Functionality Was Added
+Bullet list of what this sprint actually added.
+
+## Files Created / Modified / Deleted
+Summarize from the build output and regression check.
+
+## Regression Result
+State the PASS/FAIL/UNKNOWN result and what it means.
+
+## Smoke Check Result
+State the result if available, or "Not run."
+
+## Next Recommended Sprint
+Name the next sprint from the preserved plan and why it comes next, or state this was the last \
+planned sprint.
+
+## Risks / TODOs
+Bullet list. Be honest — include anything regression flagged.
+"""
+
+
+def generate_continuation_completion_report(
+    source_info: dict,
+    plan_json: dict,
+    detected_mode: str,
+    next_sprint: dict,
+    build_output: str,
+    regression_status: str,
+    regression_report: str,
+    smoke_log: str,
+    run_dir,
+) -> str:
+    key = _sprint_key(detected_mode)
+    all_sprints = _all_sprints(plan_json, detected_mode)
+    n = next_sprint.get(key)
+    upcoming = next((s for s in all_sprints if s.get(key, 0) == n + 1), None)
+    upcoming_label = (
+        f"Sprint {upcoming.get(key)}: {upcoming.get('title', '')}" if upcoming
+        else "(none — this was the last planned sprint in the preserved plan)"
+    )
+    report = gpt([
+        {"role": "system", "content": CONTINUATION_COMPLETION_REPORT_SYSTEM},
+        {"role": "user", "content": (
+            f"## SOURCE RUN\n{source_info['source_run']} (detected mode: {detected_mode})\n\n"
+            f"## SPRINT BUILT\nSprint {n}: {next_sprint.get('title', '')}\n"
+            f"Goal: {next_sprint.get('goal', '')}\n\n"
+            f"## NEXT SPRINT (if any)\n{upcoming_label}\n\n"
+            f"## CLAUDE CODE BUILD OUTPUT (tail)\n{build_output[-4000:]}\n\n"
+            f"## REGRESSION STATUS: {regression_status}\n{regression_report}\n\n"
+            f"## SMOKE LOG\n{smoke_log[:2000]}\n\n"
+            "Write the continuation completion report."
+        )},
+    ])
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "continuation_completion_report.md").write_text(report, encoding="utf-8")
+    return report
+
+
+def build_continuation_sprint(run_id: str, app_path: Path, build_prompt_text: str) -> str:
+    """Runs Claude Code IN PLACE inside the COPIED app baseline for this
+    continuation run (never the source run's folder). Same in-place build
+    mechanics as build_feature_sprint."""
+    full_prompt = (
+        f"{build_prompt_text}\n\n"
+        "---\n"
+        "You are working inside a COPY of an existing multi-sprint application's directory. "
+        "Do not create a new project at the top level. Add files relative to the existing "
+        "structure you can already see here.\n"
+        "After building, print a summary of every file you created and every file you modified.\n"
+    )
+    output = _stream_subprocess(
+        CLAUDE_CODE_CMD + [full_prompt],
+        cwd=str(app_path),
+        timeout=CLAUDE_TIMEOUT,
+    )
+    save_artifact(run_id, "claude_build_output.txt", output)
+    log_event(run_id, "claude_build_continuation_sprint", output[:500])
+    return output
+
+
+def pipeline_continue_sprint(
+    continue_run: str,
+    continue_sprint: int,
+    continue_plan_only: bool = False,
+    use_deepseek: bool = True,
+    run_id: str | None = None,
+) -> str:
+    """
+    Multi-Sprint Continuation Mode entry point. Loads (never regenerates) the
+    preserved sprint plan from a previous run, copies that run's app baseline
+    into a NEW run folder (never mutating the source run), builds ONLY the
+    requested next sprint on top of it, runs a regression check against
+    everything previously completed, and writes a continuation completion
+    report. Works for both normal sprint-mode runs and Existing App Upgrade runs.
+    """
+    source_info = detect_continuation_source(Path(continue_run))
+    detected_mode = source_info["detected_mode"]
+    source_run_path = Path(source_info["source_run"])
+
+    plan_json = load_preserved_sprint_plan(source_info)
+    next_sprint = select_continuation_sprint(plan_json, detected_mode, continue_sprint)
+    key = _sprint_key(detected_mode)
+    previous_sprint = None
+    prev_num = source_info.get("previous_selected_sprint")
+    if prev_num:
+        for s in plan_json.get("sprints", []):
+            if s.get(key) == prev_num:
+                previous_sprint = s
+                break
+
+    if not run_id:
+        run_id = next_run_id()
+    rdir = run_dir(run_id)
+    init_run(run_id, f"Sprint Continuation — from {source_run_path} — Sprint {continue_sprint}")
+    _update_state(run_id, {
+        "mode": "continue_sprint",
+        "source_run": str(source_run_path),
+        "continue_sprint": continue_sprint,
+        "source_mode": detected_mode,
+        "status": "continuation_planning" if continue_plan_only else "continuation_building",
+    })
+
+    print(f"\n{'='*60}")
+    print("  Multi-Sprint Continuation Mode")
+    print(f"  Run folder    : {rdir}")
+    print(f"  Source run    : {source_run_path}")
+    print(f"  Detected mode : {detected_mode}")
+    print(f"  Next sprint   : {continue_sprint}")
+    print(f"  Plan only     : {continue_plan_only}")
+    print(f"{'='*60}\n")
+
+    print("▶ Step 1  Copying app baseline into new run folder (source run untouched)...")
+    t0 = time.time()
+    app_path = copy_baseline_app_for_continuation(source_info, rdir)
+    record_step_time(run_id, "copy_baseline", t0)
+    print(f"  App baseline copied to: {app_path}")
+
+    print("▶ Step 2  Loading preserved sprint plan (not regenerated)...")
+    preserved_plan_md = write_preserved_sprint_plan_artifacts(plan_json, detected_mode, rdir)
+
+    print("▶ Step 3  Writing continuation source artifact...")
+    write_continuation_source_artifact(source_info, continue_sprint, app_path, rdir)
+
+    print("▶ Step 4  Scanning current app baseline...")
+    t0 = time.time()
+    current_scan, current_inventory_md = scan_current_app_for_continuation(app_path, rdir)
+    record_step_time(run_id, "current_app_scan", t0)
+    print(f"  Detected stack: {', '.join(current_scan['tech_stack'])}")
+
+    print("▶ Step 5  Writing continuation gap analysis...")
+    t0 = time.time()
+    generate_continuation_gap_analysis(
+        preserved_plan_md, previous_sprint, next_sprint, current_inventory_md, detected_mode, rdir,
+    )
+    record_step_time(run_id, "continuation_gap_analysis", t0)
+
+    print(f"▶ Step 6  Writing selected continuation sprint scope + build prompt (Sprint {continue_sprint})...")
+    build_prompt_text = generate_continuation_sprint_build_prompt(
+        detected_mode, plan_json, next_sprint, previous_sprint, current_scan, rdir,
+    )
+    _update_state(run_id, {})
+
+    if continue_plan_only:
+        _update_state(run_id, {"status": "continuation_plan_only_done", "current_step": "done"})
+        log_event(run_id, "continuation_plan_only_done")
+        print(f"\n{'='*60}")
+        print("  📝  Continuation plan-only run complete — planning artifacts generated. "
+              "No Claude Code or DeepSeek calls made.")
+        print(f"  Run folder : {rdir}")
+        print(f"  Source run : {source_run_path} (untouched)")
+        print("  Artifacts  :")
+        for f in sorted(rdir.iterdir()):
+            if f.is_file():
+                print(f"        {f.name}")
+        print(f"{'='*60}\n")
+        return run_id
+
+    print("▶ Step 7  Snapshotting app baseline before build...")
+    snapshot_app_for_continuation(app_path, rdir)
+
+    print(f"\n▶ Step 8  Claude Code — building Sprint {continue_sprint} on top of previous sprint(s)...")
+    t0 = time.time()
+    _update_state(run_id, {"current_step": "building", "status": "continuation_building"})
+    build_output = build_continuation_sprint(run_id, app_path, build_prompt_text)
+    record_step_time(run_id, "built", t0)
+    _update_state(run_id, {"status": "built"})
+
+    print("\n▶ Step 9  Continuation regression check...")
+    smoke_log = ""
+    try:
+        smoke_log = run_smoke_checks(run_id, app_path)
+    except Exception as e:
+        smoke_log = f"Smoke checks could not run: {e}"
+    save_artifact(run_id, "continuation_smoke_log.txt", smoke_log)
+    regression_status, regression_report = run_continuation_regression_check(
+        app_path, rdir, next_sprint, detected_mode, smoke_log,
+    )
+    print(f"  Regression result: {regression_status}")
+    if regression_status == "FAIL":
+        print("  ⚠️  WARNING: unexpected changes to previously-completed sprint files were detected.")
+
+    if use_deepseek and DEEPSEEK_API_KEY:
+        print("\n▶ Step 10  DeepSeek review (optional)...")
+        deepseek_report = deepseek_attack_review(
+            f"Continuation Sprint {continue_sprint} built on top of source run {source_run_path} "
+            f"(detected mode: {detected_mode}).",
+            app_path, smoke_log + "\n\n" + regression_report,
+        )
+        save_artifact(run_id, "deepseek_attack_report.md", deepseek_report)
+        if not is_approved(deepseek_report):
+            print("  Applying one fix iteration based on DeepSeek review...")
+            fix_prompt = generate_fix_prompt(
+                f"Continuation Sprint {continue_sprint}: {next_sprint.get('title', '')}",
+                app_path, deepseek_report, 1,
+            )
+            apply_fixes(run_id, app_path, fix_prompt, 1)
+            smoke_log = run_smoke_checks(run_id, app_path)
+            regression_status, regression_report = run_continuation_regression_check(
+                app_path, rdir, next_sprint, detected_mode, smoke_log,
+            )
+            print(f"  Regression result after fix: {regression_status}")
+
+    print("\n▶ Step 11  Writing continuation completion report...")
+    generate_continuation_completion_report(
+        source_info, plan_json, detected_mode, next_sprint, build_output,
+        regression_status, regression_report, smoke_log, rdir,
+    )
+
+    _update_state(run_id, {
+        "status": "continuation_complete", "current_step": "done", "regression_status": regression_status,
+    })
+    log_event(run_id, "continuation_complete", f"regression={regression_status}")
+
+    print(f"\n{'='*60}")
+    print("  Multi-Sprint Continuation — Sprint Complete")
+    print(f"  Run folder : {rdir}")
+    print(f"  Source run : {source_run_path} (untouched)")
+    print(f"  Regression : {regression_status}")
+    print("  Artifacts  :")
+    for f in sorted(rdir.iterdir()):
+        if f.is_file():
+            print(f"        {f.name}")
+    print(f"{'='*60}\n")
+    return run_id
+
+
 # ── Step 3: Claude Code Build ──────────────────────────────────────────────────
 
 def _stream_subprocess(cmd: list, cwd: str, timeout: int) -> str:
@@ -4383,6 +5268,21 @@ if __name__ == "__main__":
                               "(inventory, health check, summary, requirements, gap analysis, "
                               "additive architecture, feature sprint plan, selected sprint build "
                               "prompt) then stop. Skips Claude Code and DeepSeek entirely.")
+
+    # ── Multi-Sprint Continuation mode ───────────────────────────────────────
+    parser.add_argument("--continue-run", default=None, metavar="PATH",
+                         help="Continue a previous run: runs/run_NNN. The source run's preserved "
+                              "sprint plan (sprint_plan.json or feature_sprint_plan.json) is loaded "
+                              "as-is and its app baseline is copied into a NEW run folder — the "
+                              "source run is never modified. Requires --continue-sprint.")
+    parser.add_argument("--continue-sprint", type=int, default=None, metavar="N",
+                         help="Which sprint number to build on top of --continue-run.")
+    parser.add_argument("--continue-plan-only", action="store_true",
+                         help="(Continuation mode) Generate all continuation planning artifacts "
+                              "(continuation_source.md, preserved_sprint_plan.md/.json, "
+                              "current_app_inventory.md, continuation_gap_analysis.md, selected "
+                              "continuation sprint scope + build prompt) then stop. Skips Claude "
+                              "Code and DeepSeek entirely.")
     args = parser.parse_args()
 
     run_id_arg = args.run_id  # may be None
@@ -4395,7 +5295,18 @@ if __name__ == "__main__":
     )
 
     try:
-        if args.upgrade_mode:
+        if args.continue_run:
+            if args.continue_sprint is None:
+                print("--continue-run requires --continue-sprint N.")
+                sys.exit(1)
+            pipeline_continue_sprint(
+                args.continue_run,
+                args.continue_sprint,
+                continue_plan_only=args.continue_plan_only,
+                use_deepseek=not args.no_deepseek,
+                run_id=run_id_arg,
+            )
+        elif args.upgrade_mode:
             if not args.existing_app or not args.feature_request:
                 print("--upgrade-mode requires both --existing-app PATH and --feature-request PATH.")
                 sys.exit(1)
@@ -4434,4 +5345,7 @@ if __name__ == "__main__":
             pipeline(raw, run_id=run_id_arg, use_deepseek=not args.no_deepseek, mode=mode_arg,
                      plan_only=args.plan_only, skip_governance=skip_gov, **sprint_kwargs)
     except RequirementsConsistencyError:
+        sys.exit(1)
+    except ContinuationError as e:
+        print(f"\n  ❌  {e}\n")
         sys.exit(1)

@@ -1252,6 +1252,165 @@ function ExistingAppUpgradeView({ runId, run, onBack }: {
   );
 }
 
+// ── Multi-Sprint Continuation mode view ─────────────────────────────────────────
+// Minimal, read-only v1 mirroring ExistingAppUpgradeView's structure. The preserved
+// sprint plan can be in either shape (normal sprint_plan.json keyed "number", or
+// feature_sprint_plan.json keyed "sprint_number") since continuation mode works on
+// top of both source modes — the roadmap below reads either key.
+
+interface ContinuationPlanSprint {
+  number?: number;
+  sprint_number?: number;
+  title: string;
+  goal: string;
+}
+
+interface ContinuationPlan {
+  mode?: string;
+  product_name?: string;
+  total_sprints?: number;
+  selected_sprint?: number;
+  selected_feature_sprint?: number;
+  baseline?: { sprint_number: number; title: string };
+  sprints?: ContinuationPlanSprint[];
+}
+
+const CONTINUATION_ARTIFACT_PANELS: { file: string; label: string }[] = [
+  { file: "continuation_source.md", label: "Continuation Source" },
+  { file: "preserved_sprint_plan.md", label: "Preserved Sprint Plan" },
+  { file: "current_app_inventory.md", label: "Current App Inventory" },
+  { file: "continuation_gap_analysis.md", label: "Continuation Gap Analysis" },
+  { file: "selected_continuation_sprint_scope.md", label: "Selected Continuation Sprint Scope" },
+  { file: "selected_continuation_sprint_build_prompt.txt", label: "Selected Continuation Sprint Build Prompt" },
+  { file: "continuation_regression_check.md", label: "Continuation Regression Check" },
+  { file: "continuation_completion_report.md", label: "Continuation Completion Report" },
+];
+
+function ContinuationRoadmap({ plan }: { plan: ContinuationPlan }) {
+  const selected = plan.selected_feature_sprint ?? plan.selected_sprint;
+  const sprints = [...(plan.sprints ?? [])].sort(
+    (a, b) => (a.sprint_number ?? a.number ?? 0) - (b.sprint_number ?? b.number ?? 0)
+  );
+  return (
+    <div className="upgrade-roadmap">
+      {plan.baseline && (
+        <div className="upgrade-sprint-card upgrade-sprint-baseline">
+          <div className="upgrade-sprint-title">Sprint 0 — {plan.baseline.title ?? "Baseline"}</div>
+          <div className="upgrade-sprint-meta">Not buildable — regression target only</div>
+        </div>
+      )}
+      {sprints.map(s => {
+        const n = s.sprint_number ?? s.number ?? 0;
+        return (
+          <div key={n} className={`upgrade-sprint-card${n === selected ? " upgrade-sprint-selected" : ""}`}>
+            <div className="upgrade-sprint-title">
+              Sprint {n} — {s.title}
+              {n === selected && <span className="upgrade-sprint-pill">CONTINUING HERE</span>}
+            </div>
+            <div className="upgrade-sprint-goal">{s.goal}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ContinuationView({ runId, run, onBack }: {
+  runId: string; run: RunDetail | null; onBack: () => void;
+}) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const [content, setContent] = useState<string>("");
+  const [plan, setPlan] = useState<ContinuationPlan | null>(null);
+  const [sourceRun, setSourceRun] = useState<string | null>(null);
+  const artifacts = run?.artifacts ?? [];
+
+  useEffect(() => {
+    if (!artifacts.includes("preserved_sprint_plan.json")) return;
+    getArtifact(runId, "preserved_sprint_plan.json")
+      .then(a => { try { setPlan(JSON.parse(a.content)); } catch { /* ignore */ } })
+      .catch(() => {});
+  }, [runId, artifacts]);
+
+  useEffect(() => {
+    if (!artifacts.includes("continuation_source.md")) return;
+    getArtifact(runId, "continuation_source.md")
+      .then(a => {
+        const m = a.content.match(/\*\*Source run:\*\*\s*`([^`]+)`/);
+        if (m) setSourceRun(m[1]);
+      })
+      .catch(() => {});
+  }, [runId, artifacts]);
+
+  useEffect(() => {
+    if (!selected) return;
+    getArtifact(runId, selected).then(a => setContent(a.content)).catch(() => setContent("(error loading content)"));
+  }, [runId, selected]);
+
+  const regressionStatus = (() => {
+    const m = content.match(/\*\*Status:\*\*\s*(\w+)/);
+    return selected === "continuation_regression_check.md" && m ? m[1] : null;
+  })();
+
+  const availablePanels = CONTINUATION_ARTIFACT_PANELS.filter(p => artifacts.includes(p.file));
+  const selectedSprintNum = plan?.selected_feature_sprint ?? plan?.selected_sprint;
+
+  return (
+    <div className="pipeline-view upgrade-view">
+      <div className="pipeline-body">
+        <div className="steps-panel">
+          <div className="steps-panel-header">
+            <button className="topbar-back" onClick={onBack}><IconBack /> MVP Pipeline</button>
+          </div>
+          <div className="steps-panel-scroll">
+            <div className="sprint-mode-banner">
+              <span className="sprint-mode-pill">Sprint Continuation Mode</span>
+              <span className="sprint-mode-line">
+                {sourceRun ? `Continuing from ${sourceRun.split("/").pop()}` : "Continuing a previous run"}
+                {selectedSprintNum ? ` — Sprint ${selectedSprintNum}` : ""}. Status: {run?.status ?? "running"}
+              </span>
+            </div>
+            {plan && <ContinuationRoadmap plan={plan} />}
+          </div>
+        </div>
+        <div className="right-panel">
+          <div className="artifact-panel">
+            {availablePanels.length > 0 && (
+              <div className="artifact-tabs">
+                {availablePanels.map(p => (
+                  <button
+                    key={p.file}
+                    className={`artifact-tab ${selected === p.file ? "active" : ""}`}
+                    onClick={() => setSelected(p.file)}
+                  >{p.label}</button>
+                ))}
+              </div>
+            )}
+            <div className="artifact-body">
+              {selected ? (
+                <>
+                  <div className="artifact-filename">
+                    {CONTINUATION_ARTIFACT_PANELS.find(p => p.file === selected)?.label ?? selected}
+                    {regressionStatus && (
+                      <span className={`upgrade-regression-badge upgrade-regression-${regressionStatus.toLowerCase()}`}>
+                        Regression: {regressionStatus}
+                      </span>
+                    )}
+                  </div>
+                  <div className="artifact-content">
+                    <pre key={selected}>{content}</pre>
+                  </div>
+                </>
+              ) : (
+                <div className="artifact-filename">Select an artifact on the left to view it.</div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () => void; onNewRun: (id: string) => void }) {
   const [run, setRun] = useState<RunDetail | null>(null);
   const [selectedArtifact, setSelectedArtifact] = useState<string | null>(null);
@@ -1277,6 +1436,12 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
   // signal (set both for dashboard-triggered and CLI-triggered upgrade runs, since the
   // backend's generic artifact endpoint serves any filename written by the pipeline).
   const upgradeModeActive = (run?.artifacts ?? []).includes("feature_sprint_plan.json");
+  // Multi-Sprint Continuation mode detection: presence of continuation_source.md (or a
+  // "continuation_" status, for the brief window before that artifact lands) is the signal.
+  // Checked independently of upgradeModeActive above — a continuation run never writes
+  // feature_sprint_plan.json itself (it writes preserved_sprint_plan.json/.md instead).
+  const continuationModeActive = (run?.artifacts ?? []).includes("continuation_source.md") ||
+    !!run?.status?.startsWith("continuation_");
   // Sprint-plan-only ("Stage 1") vs an actual selected-sprint build ("Stage 2") — these get
   // different banner copy and different step semantics ("Not being run" vs in-progress).
   const sprintPlanOnlyActive = !!run?.sprint_plan_only || run?.status === "sprint_plan_only_done";
@@ -1432,6 +1597,17 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
   if (upgradeModeActive) {
     return (
       <ExistingAppUpgradeView runId={runId} run={run} onBack={onBack} />
+    );
+  }
+
+  // Multi-Sprint Continuation mode similarly gets its own dedicated read-only view —
+  // its artifact shape (continuation_source.md, preserved_sprint_plan.*,
+  // current_app_inventory.md, continuation_gap_analysis.md, continuation_regression_check.md,
+  // continuation_completion_report.md) doesn't fit the six-section rollup either. Checked
+  // after upgradeModeActive since the two are mutually exclusive in practice.
+  if (continuationModeActive) {
+    return (
+      <ContinuationView runId={runId} run={run} onBack={onBack} />
     );
   }
 
