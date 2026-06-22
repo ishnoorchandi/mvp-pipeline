@@ -1100,6 +1100,158 @@ function PipelineSectionOverview({ sections }: { sections: SectionDef[] }) {
 
 // ── Pipeline view (main redesign) ──────────────────────────────────────────────
 
+// ── Existing App Upgrade mode view ──────────────────────────────────────────────
+// Minimal, read-only v1: a panel per planning/build artifact plus a feature sprint
+// roadmap parsed from feature_sprint_plan.json. Scaffolding for a richer dashboard
+// later (Gap Analysis / Additive Architecture as structured panels, sprint-card
+// "Run next sprint" actions like normal sprint mode) — kept simple here on purpose.
+
+interface FeatureSprintEntry {
+  sprint_number: number;
+  title: string;
+  goal: string;
+  features?: string[];
+  depends_on?: number[];
+  status?: string;
+  buildable?: boolean;
+  must_not_modify?: string[];
+}
+
+interface FeatureSprintPlan {
+  mode?: string;
+  product_name?: string;
+  reason_for_split?: string;
+  baseline?: { sprint_number: number; title: string; status: string; buildable: boolean; description: string };
+  sprints?: FeatureSprintEntry[];
+  total_sprints?: number;
+  selected_feature_sprint?: number;
+}
+
+const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
+  { file: "existing_app_inventory.md", label: "Existing App Inventory" },
+  { file: "baseline_health_check.md", label: "Baseline Health Check" },
+  { file: "existing_app_summary.md", label: "Existing App Summary" },
+  { file: "new_feature_requirements.md", label: "New Feature Requirements" },
+  { file: "change_gap_analysis.md", label: "Gap Analysis" },
+  { file: "additive_architecture.md", label: "Additive Architecture" },
+  { file: "selected_feature_sprint_scope.md", label: "Selected Feature Sprint Scope" },
+  { file: "selected_feature_sprint_build_prompt.txt", label: "Selected Feature Sprint Build Prompt" },
+  { file: "regression_check.md", label: "Regression Check" },
+  { file: "feature_completion_report.md", label: "Feature Completion Report" },
+];
+
+function FeatureSprintRoadmap({ plan }: { plan: FeatureSprintPlan }) {
+  const selected = plan.selected_feature_sprint;
+  const sprints = [...(plan.sprints ?? [])].sort((a, b) => a.sprint_number - b.sprint_number);
+  return (
+    <div className="upgrade-roadmap">
+      <div className={`upgrade-sprint-card upgrade-sprint-baseline`}>
+        <div className="upgrade-sprint-title">Sprint 0 — {plan.baseline?.title ?? "Baseline Existing App"}</div>
+        <div className="upgrade-sprint-meta">Not buildable — regression target only</div>
+      </div>
+      {sprints.map(s => (
+        <div
+          key={s.sprint_number}
+          className={`upgrade-sprint-card${s.sprint_number === selected ? " upgrade-sprint-selected" : ""}`}
+        >
+          <div className="upgrade-sprint-title">
+            Sprint {s.sprint_number} — {s.title}
+            {s.sprint_number === selected && <span className="upgrade-sprint-pill">SELECTED</span>}
+          </div>
+          <div className="upgrade-sprint-goal">{s.goal}</div>
+          <div className="upgrade-sprint-meta">
+            Depends on: {(s.depends_on ?? [0]).map(d => `Sprint ${d}`).join(", ")} · Status: {s.status ?? "ready"}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ExistingAppUpgradeView({ runId, run, onBack }: {
+  runId: string; run: RunDetail | null; onBack: () => void;
+}) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const [content, setContent] = useState<string>("");
+  const [plan, setPlan] = useState<FeatureSprintPlan | null>(null);
+  const artifacts = run?.artifacts ?? [];
+
+  useEffect(() => {
+    if (!artifacts.includes("feature_sprint_plan.json")) return;
+    getArtifact(runId, "feature_sprint_plan.json")
+      .then(a => { try { setPlan(JSON.parse(a.content)); } catch { /* ignore */ } })
+      .catch(() => {});
+  }, [runId, artifacts]);
+
+  useEffect(() => {
+    if (!selected) return;
+    getArtifact(runId, selected).then(a => setContent(a.content)).catch(() => setContent("(error loading content)"));
+  }, [runId, selected]);
+
+  const regressionStatus = (() => {
+    const m = content.match(/\*\*Status:\*\*\s*(\w+)/);
+    return selected === "regression_check.md" && m ? m[1] : null;
+  })();
+
+  const availablePanels = UPGRADE_ARTIFACT_PANELS.filter(p => artifacts.includes(p.file));
+
+  return (
+    <div className="pipeline-view upgrade-view">
+      <div className="pipeline-body">
+        <div className="steps-panel">
+          <div className="steps-panel-header">
+            <button className="topbar-back" onClick={onBack}><IconBack /> MVP Pipeline</button>
+          </div>
+          <div className="steps-panel-scroll">
+            <div className="sprint-mode-banner">
+              <span className="sprint-mode-pill">Existing App Upgrade Mode</span>
+              <span className="sprint-mode-line">
+                {plan?.product_name ? `${plan.product_name} — ` : ""}
+                additive feature work on top of an existing app. Status: {run?.status ?? "running"}
+              </span>
+            </div>
+            {plan && <FeatureSprintRoadmap plan={plan} />}
+          </div>
+        </div>
+        <div className="right-panel">
+          <div className="artifact-panel">
+            {availablePanels.length > 0 && (
+              <div className="artifact-tabs">
+                {availablePanels.map(p => (
+                  <button
+                    key={p.file}
+                    className={`artifact-tab ${selected === p.file ? "active" : ""}`}
+                    onClick={() => setSelected(p.file)}
+                  >{p.label}</button>
+                ))}
+              </div>
+            )}
+            <div className="artifact-body">
+              {selected ? (
+                <>
+                  <div className="artifact-filename">
+                    {UPGRADE_ARTIFACT_PANELS.find(p => p.file === selected)?.label ?? selected}
+                    {regressionStatus && (
+                      <span className={`upgrade-regression-badge upgrade-regression-${regressionStatus.toLowerCase()}`}>
+                        Regression: {regressionStatus}
+                      </span>
+                    )}
+                  </div>
+                  <div className="artifact-content">
+                    <pre key={selected}>{content}</pre>
+                  </div>
+                </>
+              ) : (
+                <div className="artifact-filename">Select an artifact on the left to view it.</div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () => void; onNewRun: (id: string) => void }) {
   const [run, setRun] = useState<RunDetail | null>(null);
   const [selectedArtifact, setSelectedArtifact] = useState<string | null>(null);
@@ -1120,6 +1272,11 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
   const sprintModeActive = !!(run?.sprint_plan || run?.sprint_plan_only) ||
     run?.current_step === "sprint_plan" ||
     (run?.artifacts ?? []).some(a => a === "sprint_plan.json" || a === "sprint_plan.md" || a === "selected_sprint_scope.md");
+
+  // Existing App Upgrade mode detection: presence of feature_sprint_plan.json is the
+  // signal (set both for dashboard-triggered and CLI-triggered upgrade runs, since the
+  // backend's generic artifact endpoint serves any filename written by the pipeline).
+  const upgradeModeActive = (run?.artifacts ?? []).includes("feature_sprint_plan.json");
   // Sprint-plan-only ("Stage 1") vs an actual selected-sprint build ("Stage 2") — these get
   // different banner copy and different step semantics ("Not being run" vs in-progress).
   const sprintPlanOnlyActive = !!run?.sprint_plan_only || run?.status === "sprint_plan_only_done";
@@ -1265,6 +1422,18 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
     sprintInfo,
     selectedSprintNum,
   });
+
+  // Existing App Upgrade mode has a different artifact shape (existing_app_summary.md,
+  // change_gap_analysis.md, feature_sprint_plan.json, regression_check.md, ...) than the
+  // normal/sprint pipeline's step vocabulary, so it gets its own dedicated read-only view
+  // instead of being forced through the six-section step rollup above. This early return
+  // sits AFTER all hooks have run (rules-of-hooks safe) and never affects normal-mode or
+  // sprint-mode runs, which fall through to the unchanged return below.
+  if (upgradeModeActive) {
+    return (
+      <ExistingAppUpgradeView runId={runId} run={run} onBack={onBack} />
+    );
+  }
 
   return (
     <div className="pipeline-view">

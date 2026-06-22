@@ -665,6 +665,29 @@ button { cursor: pointer; border: none; outline: none; background: none; font-fa
 .sprint-mode-banner-planning .sprint-mode-line { color: #92400e; }
 .sprint-mode-banner-planning .sprint-mode-future { color: #a16207; }
 
+/* ── Existing App Upgrade mode ─────────────────────────────────────────────── */
+.upgrade-roadmap { display: flex; flex-direction: column; gap: 8px; padding: 14px 20px; }
+.upgrade-sprint-card {
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  background: var(--bg2);
+}
+.upgrade-sprint-baseline { opacity: 0.7; }
+.upgrade-sprint-selected { border-color: #7c3aed; background: #f5f3ff; }
+.upgrade-sprint-title { font-size: 13px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 8px; }
+.upgrade-sprint-pill {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+  color: #fff; background: #7c3aed; padding: 2px 7px; border-radius: 99px;
+}
+.upgrade-sprint-goal { font-size: 12px; color: var(--text2); margin-top: 4px; }
+.upgrade-sprint-meta { font-size: 11px; color: var(--text3); margin-top: 4px; }
+.upgrade-regression-badge {
+  font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 99px;
+  margin-left: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.upgrade-regression-pass { color: #166534; background: #dcfce7; }
+.upgrade-regression-fail { color: #991b1b; background: #fee2e2; }
+.upgrade-regression-unknown { color: #92400e; background: #fef3c7; }
+
 /* ══════════════════════════════════════════════════════
    SPRINT CARDS (Stage 2 entry point — generated plan → pick a sprint)
 ══════════════════════════════════════════════════════ */

@@ -25,6 +25,7 @@ Usage:
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -1495,6 +1496,1333 @@ def generate_selected_sprint_build_prompt(
     (run_dir / f"sprint_{num}_build_prompt.txt").write_text(prompt_text, encoding="utf-8")
 
     return prompt_text
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Existing App Upgrade Mode
+# ═════════════════════════════════════════════════════════════════════════════
+# A second, additive entry point alongside the normal "idea -> new MVP" pipeline.
+# Given an existing local app + a feature request, this mode inspects the app,
+# normalizes the requested features, finds the gap between them, and plans/builds
+# ONLY the new feature work as numbered "feature sprints" on top of an immutable
+# Sprint 0 baseline. It never regenerates the app from scratch and never says so.
+
+_SCAN_IGNORE_DIRS = {
+    "node_modules", "__pycache__", "venv", ".venv", ".git", "dist", "build",
+    ".next", ".turbo", "coverage", ".pytest_cache", ".mypy_cache", "vendor",
+    "target", ".idea", ".vscode",
+}
+_SCAN_MAX_FILES = 4000
+
+
+def _safe_read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _safe_read_text(path: Path, max_chars: int = 4000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+    except Exception:
+        return ""
+
+
+def scan_existing_app(existing_app_path: Path) -> dict:
+    """
+    Deterministic static repo scanner — no GPT call. Walks the existing app
+    (skipping node_modules/.git/etc) and reports tech stack, package manager,
+    frameworks, folder structure, entry points, and likely routes/components/
+    API/data files. A robust simple scan is enough for v1 — this is not meant
+    to be a perfect AST-level analysis.
+    """
+    existing_app_path = Path(existing_app_path).resolve()
+    all_files: list[Path] = []
+    top_level_dirs: list[str] = []
+
+    for root, dirs, files in os.walk(existing_app_path):
+        dirs[:] = [d for d in sorted(dirs) if d not in _SCAN_IGNORE_DIRS and not d.startswith(".")]
+        root_path = Path(root)
+        if root_path == existing_app_path:
+            top_level_dirs = list(dirs)
+        for fname in files:
+            if len(all_files) >= _SCAN_MAX_FILES:
+                break
+            all_files.append(root_path / fname)
+        if len(all_files) >= _SCAN_MAX_FILES:
+            break
+
+    rel_files = [str(f.relative_to(existing_app_path)) for f in all_files]
+
+    def _find(*candidates: str) -> Path | None:
+        for c in candidates:
+            p = existing_app_path / c
+            if p.exists():
+                return p
+        return None
+
+    package_json_path = _find("package.json", "frontend/package.json")
+    package_json = _safe_read_json(package_json_path) if package_json_path else {}
+    deps = {**package_json.get("dependencies", {}), **package_json.get("devDependencies", {})}
+
+    requirements_txt_path = _find("requirements.txt", "backend/requirements.txt")
+    pyproject_path = _find("pyproject.toml", "backend/pyproject.toml")
+    py_deps_text = (_safe_read_text(requirements_txt_path) if requirements_txt_path else "") + \
+                   (_safe_read_text(pyproject_path) if pyproject_path else "")
+
+    tech_stack: list[str] = []
+    frontend_framework = None
+    backend_framework = None
+    package_manager = None
+
+    if package_json_path:
+        package_manager = "npm"
+        if _find("pnpm-lock.yaml"):
+            package_manager = "pnpm"
+        elif _find("yarn.lock"):
+            package_manager = "yarn"
+        if "next" in deps:
+            frontend_framework = "Next.js"
+        elif "vite" in deps and "react" in deps:
+            frontend_framework = "React + Vite"
+        elif "react-scripts" in deps:
+            frontend_framework = "React (Create React App)"
+        elif "react" in deps:
+            frontend_framework = "React"
+        elif "vue" in deps:
+            frontend_framework = "Vue"
+        if "express" in deps:
+            backend_framework = "Express / Node"
+        tech_stack.append("Node.js")
+        if frontend_framework:
+            tech_stack.append(frontend_framework)
+
+    if requirements_txt_path or pyproject_path:
+        package_manager = package_manager or "pip"
+        if re.search(r"\bflask\b", py_deps_text, re.IGNORECASE):
+            backend_framework = backend_framework or "Flask"
+        elif re.search(r"\bfastapi\b", py_deps_text, re.IGNORECASE):
+            backend_framework = backend_framework or "FastAPI"
+        elif re.search(r"\bdjango\b", py_deps_text, re.IGNORECASE):
+            backend_framework = backend_framework or "Django"
+        tech_stack.append("Python")
+        if backend_framework:
+            tech_stack.append(backend_framework)
+
+    if not tech_stack:
+        tech_stack.append("Unknown / undetected")
+
+    database = None
+    auth = None
+    combined_dep_text = " ".join(deps.keys()) + " " + py_deps_text
+    if re.search(r"sqlite", combined_dep_text, re.IGNORECASE) or any(f.endswith(".db") for f in rel_files):
+        database = "SQLite"
+    elif re.search(r"\bpg\b|postgres|psycopg", combined_dep_text, re.IGNORECASE):
+        database = "PostgreSQL"
+    elif re.search(r"mongoose|mongodb|pymongo", combined_dep_text, re.IGNORECASE):
+        database = "MongoDB"
+    elif re.search(r"sequelize|prisma|sqlalchemy", combined_dep_text, re.IGNORECASE):
+        database = "SQL (ORM detected)"
+    if re.search(r"passport|next-auth|firebase|jsonwebtoken|jwt|flask-login|flask-jwt", combined_dep_text, re.IGNORECASE):
+        auth = "Auth library detected (see dependencies)"
+
+    entry_points = [f for f in rel_files if Path(f).name in (
+        "app.py", "main.py", "server.js", "index.js", "index.ts",
+        "main.jsx", "main.tsx", "App.jsx", "App.tsx",
+    )]
+
+    def _list_dir_files(*dirnames: str, limit: int = 40) -> list[str]:
+        out = []
+        for d in dirnames:
+            base = existing_app_path / d
+            if base.exists():
+                for f in rel_files:
+                    if f.startswith(d.rstrip("/") + "/") or f.startswith(d.rstrip("/") + os.sep):
+                        out.append(f)
+                        if len(out) >= limit:
+                            return out
+        return out
+
+    routes_pages = _list_dir_files("src/pages", "frontend/src/pages", "pages", "app")
+    components = _list_dir_files("src/components", "frontend/src/components", "components")
+    api_files = _list_dir_files("src/api", "frontend/src/api", "api", "routes", "backend/routes")
+    data_files = _list_dir_files("src/data", "frontend/src/data", "data", "mock", "mocks")
+
+    scripts = package_json.get("scripts", {}) if package_json else {}
+
+    risky_files = [f for f in rel_files if Path(f).name in (
+        ".env", ".env.local", "secrets.json", "credentials.json",
+    ) or "migration" in f.lower() or "schema" in f.lower()]
+
+    return {
+        "root": str(existing_app_path),
+        "tech_stack": tech_stack,
+        "package_manager": package_manager,
+        "frontend_framework": frontend_framework,
+        "backend_framework": backend_framework,
+        "database": database,
+        "auth": auth,
+        "top_level_dirs": top_level_dirs,
+        "file_count": len(rel_files),
+        "entry_points": entry_points,
+        "routes_pages": routes_pages,
+        "components": components,
+        "api_files": api_files,
+        "data_files": data_files,
+        "scripts": scripts,
+        "risky_files": risky_files[:30],
+        "package_json_path": str(package_json_path.relative_to(existing_app_path)) if package_json_path else None,
+        "requirements_txt_path": str(requirements_txt_path.relative_to(existing_app_path)) if requirements_txt_path else None,
+    }
+
+
+def write_existing_app_inventory(scan: dict, run_dir) -> str:
+    """Deterministic — renders the scan dict into existing_app_inventory.md. No GPT call."""
+    lines = ["# Existing App Inventory", "", f"**Root:** `{scan['root']}`", ""]
+    lines.append(f"**Detected tech stack:** {', '.join(scan['tech_stack'])}")
+    lines.append(f"**Package manager:** {scan['package_manager'] or 'Not detected'}")
+    lines.append(f"**Frontend framework:** {scan['frontend_framework'] or 'None detected'}")
+    lines.append(f"**Backend framework:** {scan['backend_framework'] or 'None detected'}")
+    lines.append(f"**Database:** {scan['database'] or 'None detected'}")
+    lines.append(f"**Auth:** {scan['auth'] or 'None detected'}")
+    lines.append("")
+    lines.append(f"**Total files scanned:** {scan['file_count']}")
+    lines.append("")
+    lines.append("## Folder Structure (top level)")
+    for d in scan["top_level_dirs"] or ["(no subfolders)"]:
+        lines.append(f"- {d}/")
+    lines.append("")
+    lines.append("## App Entry Points")
+    for f in scan["entry_points"] or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Routes / Pages (if detectable)")
+    for f in scan["routes_pages"] or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Components (if detectable)")
+    for f in scan["components"] or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## API Files (if detectable)")
+    for f in scan["api_files"] or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Data / Mock Files (if detectable)")
+    for f in scan["data_files"] or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Test / Build Scripts")
+    if scan["scripts"]:
+        for k, v in scan["scripts"].items():
+            lines.append(f"- `{k}`: `{v}`")
+    else:
+        lines.append("(none detected — no package.json scripts found)")
+    lines.append("")
+    lines.append("## Important Files")
+    for f in [scan["package_json_path"], scan["requirements_txt_path"]]:
+        if f:
+            lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Risky / Important Files")
+    for f in scan["risky_files"] or ["(none flagged)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    content = "\n".join(lines) + "\n"
+
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "existing_app_inventory.md").write_text(content, encoding="utf-8")
+    return content
+
+
+def run_baseline_health_check(existing_app_path: Path, scan: dict, run_dir) -> str:
+    """
+    Best-effort, SAFE health check — no installs, no servers started, no network calls.
+    Only does cheap static checks: Python syntax compile on a sample of .py files, and
+    `node --check` on a JS/TS entry point if node is on PATH. Reports HEALTHY / BROKEN /
+    UNKNOWN. Deterministic except for the two optional subprocess checks, which are
+    wrapped so a missing toolchain never crashes the pipeline.
+    """
+    existing_app_path = Path(existing_app_path)
+    findings: list[str] = []
+    broken = False
+    checked_anything = False
+
+    py_files = list(existing_app_path.rglob("*.py"))
+    py_files = [p for p in py_files if not any(part in _SCAN_IGNORE_DIRS for part in p.parts)][:60]
+    py_errors = []
+    for p in py_files:
+        checked_anything = True
+        try:
+            compile(p.read_text(encoding="utf-8", errors="ignore"), str(p), "exec")
+        except SyntaxError as e:
+            py_errors.append(f"{p.relative_to(existing_app_path)}: {e}")
+    if py_errors:
+        broken = True
+        findings.append(f"Python syntax errors found in {len(py_errors)} file(s):")
+        findings.extend(f"  - {e}" for e in py_errors[:10])
+    elif py_files:
+        findings.append(f"Python syntax check: {len(py_files)} file(s) compiled cleanly.")
+
+    js_entry = None
+    for cand in ("index.js", "main.jsx", "main.tsx", "App.jsx", "App.tsx", "server.js"):
+        for ep in scan.get("entry_points", []):
+            if Path(ep).name == cand:
+                js_entry = existing_app_path / ep
+                break
+        if js_entry:
+            break
+    if js_entry and js_entry.suffix == ".js":
+        checked_anything = True
+        try:
+            result = subprocess.run(
+                ["node", "--check", str(js_entry)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                broken = True
+                findings.append(f"`node --check {js_entry.name}` failed:\n{result.stderr.strip()[:500]}")
+            else:
+                findings.append(f"`node --check {js_entry.name}` passed.")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            findings.append("node not available on PATH — skipped JS syntax check.")
+
+    install_cmd = None
+    build_cmd = None
+    dev_cmd = None
+    test_cmd = None
+    scripts = scan.get("scripts") or {}
+    if scan.get("package_manager"):
+        pm = scan["package_manager"]
+        install_cmd = f"{pm} install"
+        if "build" in scripts:
+            build_cmd = f"{pm} run build"
+        if "dev" in scripts or "start" in scripts:
+            dev_cmd = f"{pm} run {'dev' if 'dev' in scripts else 'start'}"
+        if "test" in scripts:
+            test_cmd = f"{pm} run test"
+    elif scan.get("requirements_txt_path"):
+        install_cmd = "pip install -r requirements.txt"
+        dev_cmd = "python app.py" if "app.py" in [Path(e).name for e in scan.get("entry_points", [])] else None
+
+    if broken:
+        status = "BROKEN"
+    elif checked_anything:
+        status = "HEALTHY"
+    else:
+        status = "UNKNOWN"
+        findings.append("No safe static checks were applicable (no .py files, no recognizable JS entry point).")
+
+    lines = ["# Baseline Health Check", "", f"**Status:** {status}", ""]
+    lines.append("## Commands Detected")
+    lines.append(f"- Install: `{install_cmd}`" if install_cmd else "- Install: (not detected)")
+    lines.append(f"- Build: `{build_cmd}`" if build_cmd else "- Build: (not detected)")
+    lines.append(f"- Dev: `{dev_cmd}`" if dev_cmd else "- Dev: (not detected)")
+    lines.append(f"- Test: `{test_cmd}`" if test_cmd else "- Test: (not detected)")
+    lines.append("")
+    lines.append("## Findings")
+    for f in findings or ["(no findings)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    if status == "BROKEN":
+        lines.append("## ⚠️ WARNING")
+        lines.append(
+            "The existing app appears to have pre-existing errors. Feature work will be planned "
+            "and built on top of this baseline anyway, but regression checks below will have "
+            "lower confidence, and any pre-existing breakage is NOT caused by this upgrade run."
+        )
+    elif status == "UNKNOWN":
+        lines.append("## Note")
+        lines.append(
+            "Health could not be determined with safe static checks alone. Continuing, but "
+            "regression-check confidence for this run is limited."
+        )
+    content = "\n".join(lines) + "\n"
+
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "baseline_health_check.md").write_text(content, encoding="utf-8")
+    return content
+
+
+EXISTING_APP_SUMMARY_SYSTEM = """You are a senior engineer onboarding onto an existing codebase you did \
+not write. You are given a static repo scan and a baseline health check. Write a clear, honest, \
+human-readable summary of what this app appears to do and how it is built.
+
+Write in this exact format:
+
+# Existing App Summary
+
+## What This App Appears To Do
+2-4 sentences, in plain product terms.
+
+## Current Stack
+Bullet list of frontend/backend/database/auth as detected.
+
+## Current Features
+Bullet list of the features/screens/flows you can infer exist.
+
+## Data / Storage / Auth / API
+What persistence, authentication, or API surface (if any) appears to exist today.
+
+## What Is Missing Or Uncertain
+Bullet list — be honest about what the static scan could not determine.
+
+## What Should Be Preserved
+Bullet list of behaviors, files, or conventions that future feature work must not break.
+
+Do not invent features that are not evidenced by the inventory. Do not suggest rewriting anything. \
+Never say this is a "new MVP" — this is an existing app being inspected, not created.
+"""
+
+
+def generate_existing_app_summary(inventory_md: str, health_md: str, run_dir) -> str:
+    summary = gpt([
+        {"role": "system", "content": EXISTING_APP_SUMMARY_SYSTEM},
+        {"role": "user", "content": (
+            f"## EXISTING APP INVENTORY\n{inventory_md}\n\n"
+            f"## BASELINE HEALTH CHECK\n{health_md}\n\n"
+            "Write the existing app summary."
+        )},
+    ])
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "existing_app_summary.md").write_text(summary, encoding="utf-8")
+    return summary
+
+
+FEATURE_REQUIREMENTS_SYSTEM = """You are a product analyst normalizing a feature request against an \
+existing application. You are given the existing app summary and the raw feature request text.
+
+Write in this exact format:
+
+# New Feature Requirements
+
+## Requested Features
+Numbered list — one clear feature per item, in the requester's own intent (not your redesign of it).
+
+## Constraints From User
+Bullet list of any explicit constraints stated in the request (e.g. "no new dependencies", \
+"keep it free-tier"). If none stated, write "None stated."
+
+## Explicit Non-Goals
+Bullet list of things the request explicitly says NOT to do, or that are clearly out of scope.
+
+## Assumptions
+Bullet list of reasonable assumptions you had to make to fill gaps in the request.
+
+## Ambiguities
+Bullet list of anything genuinely unclear that a human should confirm before or during the sprint.
+
+## Dependency Notes
+Bullet list of which requested features depend on others (e.g. "AI reminders" depends on \
+"persisted events" existing first).
+
+This is feature work to ADD to the existing app above — never describe building a new app from \
+scratch, and never restate the whole existing app as if it needs to be rebuilt.
+"""
+
+
+def generate_new_feature_requirements(feature_request_text: str, existing_app_summary: str, run_dir) -> str:
+    requirements = gpt([
+        {"role": "system", "content": FEATURE_REQUIREMENTS_SYSTEM},
+        {"role": "user", "content": (
+            f"## EXISTING APP SUMMARY\n{existing_app_summary}\n\n"
+            f"## RAW FEATURE REQUEST\n{feature_request_text}\n\n"
+            "Write the normalized feature requirements."
+        )},
+    ])
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "new_feature_requirements.md").write_text(requirements, encoding="utf-8")
+    return requirements
+
+
+GAP_ANALYSIS_SYSTEM = """You are a staff engineer performing a change-impact / gap analysis before any \
+code is written. You are given the existing app summary and the normalized new feature requirements.
+
+Write in this exact format:
+
+# Change Gap Analysis
+
+## What Already Exists
+Bullet list of existing capabilities that the requested features can build on.
+
+## What Is Missing
+Bullet list of capabilities that do not exist yet and must be added.
+
+## Files / Areas Likely Impacted
+Bullet list of specific files, folders, or modules (from the inventory) likely to be touched.
+
+## Risks
+Bullet list of concrete risks (breaking existing behavior, data migration, scope creep, etc).
+
+## Feature Dependencies
+Bullet list — which requested features must come before others.
+
+## Migration Concerns
+Bullet list — note any backend/database/auth migration implications. Write "None" if not applicable.
+
+## Classification
+One line: state whether this overall change is ADDITIVE, INVASIVE, or RISKY, with a one-sentence \
+justification. ADDITIVE = mostly new files/routes/components with minimal touch to existing code. \
+INVASIVE = requires modifying core existing files/behavior. RISKY = touches auth, data integrity, \
+or has a high chance of breaking existing functionality.
+
+Be specific and grounded in the actual existing app summary — do not write generic boilerplate.
+"""
+
+
+def generate_change_gap_analysis(existing_app_summary: str, new_feature_requirements: str,
+                                  inventory_md: str, run_dir) -> str:
+    gap = gpt([
+        {"role": "system", "content": GAP_ANALYSIS_SYSTEM},
+        {"role": "user", "content": (
+            f"## EXISTING APP SUMMARY\n{existing_app_summary}\n\n"
+            f"## NEW FEATURE REQUIREMENTS\n{new_feature_requirements}\n\n"
+            f"## EXISTING APP INVENTORY\n{inventory_md}\n\n"
+            "Write the change gap analysis."
+        )},
+    ])
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "change_gap_analysis.md").write_text(gap, encoding="utf-8")
+    return gap
+
+
+ADDITIVE_ARCHITECTURE_SYSTEM = """You are a staff architect designing how to ADD features to an \
+existing application safely. You are given the existing app summary, the new feature requirements, \
+and the change gap analysis.
+
+HARD RULES:
+- Do not rewrite the app unless the gap analysis explicitly classifies the change as requiring it.
+- Preserve the existing stack and conventions — do not introduce a different framework/language.
+- Prefer adding new files/components/routes over modifying existing ones.
+- Identify clean extension points in the existing structure.
+- Keep every sprint runnable — no sprint should leave the app in a broken state.
+
+Write in this exact format:
+
+# Additive Architecture
+
+## Extension Points
+Bullet list of specific places in the existing app where new code should be hooked in (e.g. "add a \
+new route module imported into the existing router", "add a new top-level nav item").
+
+## Files Likely To Be Created
+Bullet list of new files/folders this work will likely introduce.
+
+## Files Likely To Be Modified
+Bullet list of existing files that will likely need small, additive edits.
+
+## Files That Should NOT Be Touched
+Bullet list of existing files/areas that must be left alone (core app shell, unrelated features, \
+existing styling conventions, etc).
+
+## Migration Path
+If backend, database, or auth is involved, describe the additive migration path (e.g. "add new \
+tables; do not alter existing tables without a migration script"). Write "Not applicable" if none \
+of those are involved.
+
+## Sprint-Readiness Notes
+1-3 sentences on how this architecture supports splitting the feature work into small, independently \
+runnable sprints.
+"""
+
+
+def generate_additive_architecture(existing_app_summary: str, new_feature_requirements: str,
+                                    gap_analysis: str, run_dir) -> str:
+    arch = gpt([
+        {"role": "system", "content": ADDITIVE_ARCHITECTURE_SYSTEM},
+        {"role": "user", "content": (
+            f"## EXISTING APP SUMMARY\n{existing_app_summary}\n\n"
+            f"## NEW FEATURE REQUIREMENTS\n{new_feature_requirements}\n\n"
+            f"## CHANGE GAP ANALYSIS\n{gap_analysis}\n\n"
+            "Write the additive architecture."
+        )},
+    ])
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "additive_architecture.md").write_text(arch, encoding="utf-8")
+    return arch
+
+
+# ── Feature Sprint Plan ────────────────────────────────────────────────────────
+
+FEATURE_SPRINT_PLAN_SYSTEM = """You are a senior staff engineer splitting NEW FEATURE WORK for an \
+EXISTING application into small, additive, independently-buildable feature sprints.
+
+You are given the existing app summary, the new feature requirements, the change gap analysis, and \
+the additive architecture. Sprint 0 (the existing app baseline) already exists and is handled outside \
+of your output — you must NEVER describe Sprint 0 or re-describe the whole existing app from scratch. \
+Only plan the NEW feature work, numbered starting at 1.
+
+Design rules:
+- Each sprint adds ONE clear new capability on top of the existing app (and on top of earlier sprints).
+- Each sprint must be additive: it should not require rewriting unrelated existing code.
+- Each sprint must leave the app in a runnable state — no sprint should be a "half feature".
+- Order sprints by real dependency order (e.g. a persistence layer sprint before a feature that needs \
+  persisted data; a roles/auth sprint before role-gated features).
+- depends_on must include 0 (the baseline) for every sprint, plus any earlier feature sprint numbers \
+  it actually requires.
+- must_not_modify should name specific existing files/areas (from the additive architecture's "Files \
+  That Should NOT Be Touched") that this sprint must leave alone.
+- Sprint count should match the actual number of distinct requested features/capabilities — do not \
+  pad or compress artificially. Typically 2-6 feature sprints.
+
+Output STRICT JSON ONLY — no markdown fences, no prose before or after — matching exactly this shape:
+
+{
+  "product_name": "<short product name, from context>",
+  "reason_for_split": "<1-2 sentences on why the work was split this way>",
+  "sprints": [
+    {
+      "sprint_number": 1,
+      "title": "<short sprint title>",
+      "goal": "<1-2 sentences: what new capability this sprint adds>",
+      "features": ["<specific feature this sprint delivers>", "..."],
+      "depends_on": [0],
+      "status": "ready",
+      "buildable": true,
+      "likely_files_created": ["<path>", "..."],
+      "likely_files_modified": ["<path>", "..."],
+      "must_not_modify": ["<path or area>", "..."],
+      "completion_criteria": ["<concrete, checkable criterion>", "..."]
+    }
+  ]
+}
+
+Field rules:
+- "sprint_number" starts at 1 and increments by 1, no gaps, no Sprint 0 entry.
+- "status" is "ready" if depends_on are all satisfied by baseline + earlier sprints, else "locked".
+- "buildable" is true for every feature sprint (Sprint 0 is the only non-buildable sprint, and it is \
+  not part of your output).
+- Every field is required for every sprint. Do not omit fields.
+"""
+
+
+_FEATURE_SPRINT_FIELD_DEFAULTS = {
+    "title": "",
+    "goal": "",
+    "features": [],
+    "depends_on": [0],
+    "status": "ready",
+    "buildable": True,
+    "likely_files_created": [],
+    "likely_files_modified": [],
+    "must_not_modify": [],
+    "completion_criteria": [],
+}
+
+
+def normalize_feature_sprint_plan(data: dict, existing_app_summary: str) -> dict:
+    """Deterministic — fills defaults, coerces types, prepends the immutable Sprint 0
+    baseline regardless of what the model produced. No GPT call."""
+    sprints_in = data.get("sprints") or []
+    normalized = []
+    for i, raw in enumerate(sprints_in):
+        entry = dict(_FEATURE_SPRINT_FIELD_DEFAULTS)
+        entry.update(raw or {})
+        try:
+            entry["sprint_number"] = int(raw.get("sprint_number", i + 1))
+        except (TypeError, ValueError):
+            entry["sprint_number"] = i + 1
+        if entry["sprint_number"] <= 0:
+            entry["sprint_number"] = i + 1
+        for k in ("features", "likely_files_created", "likely_files_modified",
+                  "must_not_modify", "completion_criteria"):
+            entry[k] = _coerce_list(entry[k])
+        entry["depends_on"] = sorted(set(
+            [0] + [int(d) for d in _coerce_list(entry["depends_on"]) if str(d).strip().lstrip("-").isdigit()]
+        ))
+        entry["buildable"] = True
+        if entry.get("status") not in ("ready", "locked"):
+            entry["status"] = "ready"
+        normalized.append(entry)
+    normalized.sort(key=lambda s: s["sprint_number"])
+
+    baseline = {
+        "sprint_number": 0,
+        "title": "Baseline Existing App",
+        "status": "complete",
+        "buildable": False,
+        "description": "Existing app before feature work. Used as the regression target — "
+                        "never rebuilt, never described as new.",
+    }
+
+    return {
+        "mode": "existing_app_upgrade",
+        "product_name": data.get("product_name", ""),
+        "reason_for_split": str(data.get("reason_for_split") or "").strip(),
+        "baseline": baseline,
+        "sprints": normalized,
+        "total_sprints": len(normalized),
+    }
+
+
+def parse_feature_sprint_plan_json(raw_text: str, existing_app_summary: str) -> dict:
+    candidate = _extract_json_object(raw_text)
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError as e:
+        raise SprintPlanParseError(
+            f"Could not parse feature sprint plan JSON: {e}\n\nRaw model output:\n{raw_text[:1500]}"
+        )
+    if not isinstance(data, dict) or not data.get("sprints"):
+        raise SprintPlanParseError(
+            f"Feature sprint plan JSON is missing a non-empty 'sprints' list.\n\n"
+            f"Raw model output:\n{raw_text[:1500]}"
+        )
+    return normalize_feature_sprint_plan(data, existing_app_summary)
+
+
+def select_feature_sprint(plan_json: dict, selected_sprint_number: int) -> dict:
+    """Deterministic lookup. Sprint 0 is the baseline and is never selectable for build."""
+    if selected_sprint_number == 0:
+        raise SprintNotFoundError(
+            "Sprint 0 is the existing baseline and is not buildable. Choose a feature sprint >= 1."
+        )
+    for s in plan_json.get("sprints", []):
+        if s.get("sprint_number") == selected_sprint_number:
+            return s
+    available = [s.get("sprint_number") for s in plan_json.get("sprints", [])]
+    raise SprintNotFoundError(
+        f"Feature sprint {selected_sprint_number} not found in plan (available: {available})"
+    )
+
+
+def render_feature_sprint_plan_markdown(plan_json: dict) -> str:
+    """Deterministic — feature_sprint_plan.md. No GPT call."""
+    sprints = sorted(plan_json.get("sprints", []), key=lambda s: s.get("sprint_number", 0))
+    total = plan_json.get("total_sprints", len(sprints))
+    product = plan_json.get("product_name", "")
+    baseline = plan_json.get("baseline", {})
+    lines = [f"# Feature Sprint Plan{f': {product}' if product else ''}", ""]
+    if plan_json.get("reason_for_split"):
+        lines.append(f"**Reason for split:** {plan_json['reason_for_split']}")
+        lines.append("")
+    lines.append(f"Total feature sprints: {total} (plus Sprint 0 baseline)")
+    lines.append("")
+    lines.append(f"## Sprint 0: {baseline.get('title', 'Baseline Existing App')}")
+    lines.append("")
+    lines.append(f"**Status:** {baseline.get('status', 'complete')} (not buildable)")
+    lines.append("")
+    lines.append(baseline.get("description", ""))
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    for s in sprints:
+        n = s.get("sprint_number")
+        lines.append(f"## Sprint {n} of {total}: {s.get('title', '')}")
+        lines.append("")
+        lines.append(f"**Goal:** {s.get('goal', '')}")
+        lines.append("")
+        lines.append("**Features:**")
+        for f in s.get("features") or ["(not specified)"]:
+            lines.append(f"- {f}")
+        lines.append("")
+        deps = s.get("depends_on") or [0]
+        lines.append(f"**Depends on:** {', '.join('Sprint ' + str(d) for d in deps)}")
+        lines.append("")
+        lines.append(f"**Status:** {s.get('status', 'ready')}")
+        lines.append("")
+        lines.append("**Likely files created:**")
+        for f in s.get("likely_files_created") or ["(not specified)"]:
+            lines.append(f"- {f}")
+        lines.append("")
+        lines.append("**Likely files modified:**")
+        for f in s.get("likely_files_modified") or ["(none)"]:
+            lines.append(f"- {f}")
+        lines.append("")
+        lines.append("**Must not modify:**")
+        for f in s.get("must_not_modify") or ["(none specified)"]:
+            lines.append(f"- {f}")
+        lines.append("")
+        lines.append("**Completion criteria:**")
+        for c in s.get("completion_criteria") or ["(not specified)"]:
+            lines.append(f"- {c}")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_feature_sprint_plan_terminal(plan_json: dict, selected_sprint_number: int) -> str:
+    sprints = sorted(plan_json.get("sprints", []), key=lambda s: s.get("sprint_number", 0))
+    total = plan_json.get("total_sprints", len(sprints))
+    lines = ["Existing App Upgrade — Feature Sprint Plan", ""]
+    lines.append("Sprint 0: Baseline Existing App (not buildable)")
+    for s in sprints:
+        n = s.get("sprint_number")
+        marker = " <-- SELECTED" if n == selected_sprint_number else ""
+        lines.append(f"Sprint {n} of {total}: {s.get('title', '')}{marker}")
+        lines.append(f"  Goal: {s.get('goal', '')}")
+    lines.append("")
+    lines.append(f"Selected Feature Sprint: Sprint {selected_sprint_number} of {total}")
+    return "\n".join(lines)
+
+
+def generate_feature_sprint_plan(
+    existing_app_summary: str,
+    new_feature_requirements: str,
+    gap_analysis: str,
+    additive_architecture: str,
+    run_dir,
+    selected_sprint_number: int | None = None,
+) -> tuple[dict, str]:
+    """Uses GPT4O_MODEL (same model tier as the normal sprint architect). Writes
+    feature_sprint_plan.json and feature_sprint_plan.md into run_dir."""
+    user_msg = (
+        f"## EXISTING APP SUMMARY\n{existing_app_summary}\n\n"
+        f"## NEW FEATURE REQUIREMENTS\n{new_feature_requirements}\n\n"
+        f"## CHANGE GAP ANALYSIS\n{gap_analysis}\n\n"
+        f"## ADDITIVE ARCHITECTURE\n{additive_architecture}\n\n"
+        "Now produce the feature sprint decomposition. Output STRICT JSON ONLY — no markdown, "
+        "no commentary, no code fences."
+    )
+    raw = gpt4o([
+        {"role": "system", "content": FEATURE_SPRINT_PLAN_SYSTEM},
+        {"role": "user", "content": user_msg},
+    ])
+    plan_json = parse_feature_sprint_plan_json(raw, existing_app_summary)
+    if selected_sprint_number is not None:
+        plan_json["selected_feature_sprint"] = selected_sprint_number
+    plan_md = render_feature_sprint_plan_markdown(plan_json)
+
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "feature_sprint_plan.json").write_text(json.dumps(plan_json, indent=2), encoding="utf-8")
+    (run_dir / "feature_sprint_plan.md").write_text(plan_md, encoding="utf-8")
+    return plan_json, plan_md
+
+
+def render_selected_feature_sprint_scope_markdown(selected_sprint: dict, plan_json: dict) -> str:
+    total = plan_json.get("total_sprints", len(plan_json.get("sprints", [])))
+    n = selected_sprint.get("sprint_number")
+    lines = [
+        f"# Selected Feature Sprint Scope — Sprint {n} of {total}",
+        "",
+        f"## Title\n{selected_sprint.get('title', '')}",
+        "",
+        f"## Goal\n{selected_sprint.get('goal', '')}",
+        "",
+        "## Features To Build",
+    ]
+    for f in selected_sprint.get("features") or ["(not specified)"]:
+        lines.append(f"- {f}")
+    deps = selected_sprint.get("depends_on") or [0]
+    lines += ["", "## Dependencies", ", ".join(f"Sprint {d}" for d in deps)]
+    lines += ["", "## Allowed Files / Areas (may create)"]
+    for f in selected_sprint.get("likely_files_created") or ["(use judgment within the architecture)"]:
+        lines.append(f"- {f}")
+    lines += ["", "## Allowed Files / Areas (may modify)"]
+    for f in selected_sprint.get("likely_files_modified") or ["(none specified)"]:
+        lines.append(f"- {f}")
+    lines += ["", "## Protected Files / Areas (must not modify)"]
+    for f in selected_sprint.get("must_not_modify") or ["(none specified)"]:
+        lines.append(f"- {f}")
+    lines += ["", "## Completion Criteria"]
+    for c in selected_sprint.get("completion_criteria") or ["(not specified)"]:
+        lines.append(f"- {c}")
+    lines += [
+        "", "## Regression Expectations",
+        "- All existing behavior outside this sprint's scope must continue to work unchanged.",
+        "- Protected files/areas listed above must not be modified — verified by regression_check.md.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def generate_selected_feature_sprint_build_prompt(
+    existing_app_summary: str,
+    scan: dict,
+    plan_json: dict,
+    selected_sprint: dict,
+    run_dir,
+) -> str:
+    """
+    Deterministic template — NO GPT call. This is the strict prompt Claude Code
+    receives for Existing App Upgrade mode. It must never read like a from-scratch
+    build prompt, and it must heavily discourage unrelated rewrites.
+
+    Writes selected_feature_sprint_scope.md and selected_feature_sprint_build_prompt.txt.
+    """
+    total = plan_json.get("total_sprints", len(plan_json.get("sprints", [])))
+    num = selected_sprint.get("sprint_number")
+    title = selected_sprint.get("title") or f"Sprint {num}"
+    all_sprints = sorted(plan_json.get("sprints", []), key=lambda s: s.get("sprint_number", 0))
+    future_sprints = [s for s in all_sprints if s.get("sprint_number", 0) > num]
+    earlier_sprints = [s for s in all_sprints if 0 < s.get("sprint_number", 0) < num]
+
+    may_create = selected_sprint.get("likely_files_created") or []
+    may_modify = selected_sprint.get("likely_files_modified") or []
+    must_not_modify = selected_sprint.get("must_not_modify") or []
+
+    parts = [
+        "## CONTEXT: EXISTING APP",
+        "You are extending an existing application. Do NOT rewrite it.",
+        "",
+        existing_app_summary,
+        "",
+        "## CURRENT TECH STACK",
+        ", ".join(scan.get("tech_stack") or ["Unknown"]),
+        "",
+        f"## SELECTED FEATURE SPRINT — Sprint {num} of {total}: {title}",
+        f"Goal: {selected_sprint.get('goal', '')}",
+        "",
+        "Features to build in this sprint:",
+    ]
+    for f in selected_sprint.get("features") or ["(see goal above)"]:
+        parts.append(f"- {f}")
+
+    if earlier_sprints:
+        parts += ["", "## EARLIER FEATURE SPRINTS (assume already built)"]
+        for s in earlier_sprints:
+            parts.append(f"- Sprint {s.get('sprint_number')}: {s.get('title', '')} — already exists; "
+                          "do not rebuild it, but you may use/extend it.")
+
+    parts += [
+        "",
+        "## YOU MAY CREATE",
+    ]
+    for f in may_create or ["(use judgment, but prefer new files over editing existing ones)"]:
+        parts.append(f"- {f}")
+    parts += ["", "## YOU MAY MODIFY"]
+    for f in may_modify or ["(none — prefer creating new files instead)"]:
+        parts.append(f"- {f}")
+    parts += ["", "## YOU MUST NOT MODIFY"]
+    for f in must_not_modify or ["(no specific files flagged — still apply PRESERVATION RULES below)"]:
+        parts.append(f"- {f}")
+    parts += ["", "## YOU MUST NOT DELETE", "Any existing file not explicitly listed under YOU MAY MODIFY above."]
+
+    parts += [
+        "",
+        "## PRESERVATION RULES",
+        "- Preserve existing behavior unless this sprint explicitly requires changing it.",
+        "- Do not rewrite unrelated files.",
+        "- Do not change the tech stack.",
+        "- Reuse existing style/components/patterns where possible.",
+        "- Do not touch files outside this sprint's scope, even if they look improvable.",
+        "- Do not add a backend, database, or auth unless this sprint's scope explicitly requires it.",
+    ]
+
+    if future_sprints:
+        parts += ["", "## FUTURE FEATURE SPRINTS — REFERENCE ONLY, DO NOT BUILD"]
+        for s in future_sprints:
+            parts.append(f"- Sprint {s.get('sprint_number')}: {s.get('title', '')} — "
+                          f"{s.get('goal', '')} (NOT in scope now.)")
+
+    parts += ["", "## COMPLETION CRITERIA"]
+    for c in selected_sprint.get("completion_criteria") or ["(not specified)"]:
+        parts.append(f"- {c}")
+
+    parts += [
+        "",
+        "## REGRESSION REQUIREMENTS",
+        "- All existing pages/routes/components/behavior must continue to work exactly as before.",
+        "- Do not remove or rename existing exports/functions/routes that other code may depend on.",
+        "- Keep the app runnable end-to-end after this sprint, the same way it was runnable before.",
+        "",
+        "## AFTER YOU FINISH",
+        "Print a clear summary of every file you created and every file you modified, and confirm "
+        "you did not touch anything under YOU MUST NOT MODIFY.",
+    ]
+
+    prompt_text = "\n".join(parts)
+
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    scope_md = render_selected_feature_sprint_scope_markdown(selected_sprint, plan_json)
+    (run_dir / "selected_feature_sprint_scope.md").write_text(scope_md, encoding="utf-8")
+    (run_dir / "selected_feature_sprint_build_prompt.txt").write_text(prompt_text, encoding="utf-8")
+    (run_dir / f"feature_sprint_{num}_scope.md").write_text(scope_md, encoding="utf-8")
+    (run_dir / f"feature_sprint_{num}_build_prompt.txt").write_text(prompt_text, encoding="utf-8")
+    return prompt_text
+
+
+# ── Regression Protection ──────────────────────────────────────────────────────
+
+def _hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def _resolve_protected_paths(existing_app_path: Path, patterns: list[str]) -> list[Path]:
+    existing_app_path = Path(existing_app_path)
+    resolved: list[Path] = []
+    for pattern in patterns:
+        if any(ch in pattern for ch in "*?["):
+            resolved.extend(existing_app_path.glob(pattern))
+        else:
+            p = existing_app_path / pattern
+            if p.is_file():
+                resolved.append(p)
+            elif p.is_dir():
+                resolved.extend(f for f in p.rglob("*") if f.is_file()
+                                and not any(part in _SCAN_IGNORE_DIRS for part in f.parts))
+    return [p for p in dict.fromkeys(resolved) if p.is_file()]
+
+
+def snapshot_protected_files(existing_app_path: Path, must_not_modify: list[str], run_dir) -> dict:
+    """Deterministic — hashes every protected file BEFORE build so regression_check
+    can detect unexpected changes afterward. Writes baseline_file_hashes.json."""
+    files = _resolve_protected_paths(existing_app_path, must_not_modify)
+    hashes = {}
+    for f in files:
+        try:
+            hashes[str(f.relative_to(existing_app_path))] = _hash_file(f)
+        except Exception:
+            pass
+    record = {"protected_patterns": must_not_modify, "hashes": hashes}
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "baseline_file_hashes.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return record
+
+
+def run_regression_check(
+    existing_app_path: Path,
+    run_dir,
+    selected_sprint: dict,
+    smoke_log: str = "",
+) -> tuple[str, str]:
+    """
+    Compares protected-file hashes before vs after build. PASS if none of the
+    protected files changed and expected new files exist (where checkable);
+    FAIL if any protected file changed unexpectedly; UNKNOWN if there was no
+    baseline to compare against (e.g. no must_not_modify list was given).
+    Writes regression_check.md. Returns (status, report_text).
+    """
+    run_dir = Path(run_dir)
+    existing_app_path = Path(existing_app_path)
+    baseline_path = run_dir / "baseline_file_hashes.json"
+    if not baseline_path.exists():
+        status = "UNKNOWN"
+        changed, missing = [], []
+        baseline_hashes = {}
+    else:
+        baseline = _safe_read_json(baseline_path)
+        baseline_hashes = baseline.get("hashes", {})
+        changed, missing = [], []
+        if not baseline_hashes:
+            status = "UNKNOWN"
+        else:
+            for rel, old_hash in baseline_hashes.items():
+                p = existing_app_path / rel
+                if not p.exists():
+                    missing.append(rel)
+                    continue
+                try:
+                    new_hash = _hash_file(p)
+                except Exception:
+                    missing.append(rel)
+                    continue
+                if new_hash != old_hash:
+                    changed.append(rel)
+            status = "FAIL" if (changed or missing) else "PASS"
+
+    expected_new = selected_sprint.get("likely_files_created") or []
+    confirmed_new, missing_new = [], []
+    for f in expected_new:
+        if any(ch in f for ch in "*?["):
+            continue  # glob hints aren't checkable as exact paths
+        (confirmed_new if (existing_app_path / f).exists() else missing_new).append(f)
+
+    lines = ["# Regression Check", "", f"**Status:** {status}", ""]
+    lines.append("## Protected Files Checked")
+    lines.append(f"{len(baseline_hashes)} file(s) tracked from must_not_modify list.")
+    lines.append("")
+    lines.append("## Unexpectedly Changed Protected Files")
+    for f in changed or ["(none)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Missing Protected Files")
+    for f in missing or ["(none)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Expected New Files")
+    lines.append(f"Confirmed present: {len(confirmed_new)}/{len(expected_new)}")
+    for f in missing_new:
+        lines.append(f"- MISSING expected new file: {f}")
+    lines.append("")
+    if smoke_log:
+        lines.append("## Smoke / Runtime Check Results")
+        lines.append("```")
+        lines.append(smoke_log[:2000])
+        lines.append("```")
+        lines.append("")
+    if status == "UNKNOWN":
+        lines.append("## Note")
+        lines.append(
+            "No protected-file baseline was available to compare against (the selected sprint's "
+            "must_not_modify list was empty, or no tests exist for this app). Regression confidence "
+            "for this run is limited to the static/expected-file checks above."
+        )
+    content = "\n".join(lines) + "\n"
+    (run_dir / "regression_check.md").write_text(content, encoding="utf-8")
+    return status, content
+
+
+FEATURE_COMPLETION_REPORT_SYSTEM = """You are writing the handoff summary for ONE completed feature \
+sprint built on top of an existing application. Be practical, honest, and specific. Never describe \
+this as a "new MVP" — this app already existed before this sprint.
+
+Write in this exact format:
+
+# Feature Completion Report
+
+## Feature Sprint Completed
+Name and number of the sprint.
+
+## What Was Added
+Bullet list of what this sprint actually added.
+
+## What Existing Behavior Was Preserved
+Bullet list, grounded in the regression check.
+
+## Files Created / Modified / Deleted
+Summarize from the build output and regression check.
+
+## Regression Result
+State the PASS/FAIL/UNKNOWN result and what it means.
+
+## Smoke Check Result
+State the result if available, or "Not run."
+
+## What Was Intentionally Not Touched
+Bullet list, from the must_not_modify list.
+
+## Next Recommended Feature Sprint
+Name the next sprint from the plan and why it comes next.
+
+## Warnings / Risks
+Bullet list. Be honest — include anything regression flagged.
+"""
+
+
+def generate_feature_completion_report(
+    existing_app_summary: str,
+    plan_json: dict,
+    selected_sprint: dict,
+    build_output: str,
+    regression_status: str,
+    regression_report: str,
+    smoke_log: str,
+    run_dir,
+) -> str:
+    all_sprints = sorted(plan_json.get("sprints", []), key=lambda s: s.get("sprint_number", 0))
+    n = selected_sprint.get("sprint_number")
+    next_sprint = next((s for s in all_sprints if s.get("sprint_number") == n + 1), None)
+    next_sprint_label = (
+        f"Sprint {next_sprint.get('sprint_number')}: {next_sprint.get('title', '')}"
+        if next_sprint else "(none — this was the last planned feature sprint)"
+    )
+    report = gpt([
+        {"role": "system", "content": FEATURE_COMPLETION_REPORT_SYSTEM},
+        {"role": "user", "content": (
+            f"## EXISTING APP SUMMARY\n{existing_app_summary}\n\n"
+            f"## SELECTED SPRINT\nSprint {n}: {selected_sprint.get('title', '')}\n"
+            f"Goal: {selected_sprint.get('goal', '')}\n"
+            f"Must not modify: {selected_sprint.get('must_not_modify') or '(none specified)'}\n\n"
+            f"## NEXT SPRINT (if any)\n{next_sprint_label}\n\n"
+            f"## CLAUDE CODE BUILD OUTPUT (tail)\n{build_output[-4000:]}\n\n"
+            f"## REGRESSION STATUS: {regression_status}\n{regression_report}\n\n"
+            f"## SMOKE LOG\n{smoke_log[:2000]}\n\n"
+            "Write the feature completion report."
+        )},
+    ])
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "feature_completion_report.md").write_text(report, encoding="utf-8")
+    return report
+
+
+def build_feature_sprint(run_id: str, existing_app_path: Path, build_prompt_text: str) -> str:
+    """Runs Claude Code IN PLACE inside the existing app directory — never creates a
+    fresh app folder, unlike build_mvp() for normal mode."""
+    full_prompt = (
+        f"{build_prompt_text}\n\n"
+        "---\n"
+        "You are working inside an EXISTING application's directory. Do not create a new project "
+        "at the top level. Add files relative to the existing structure you can already see here.\n"
+        "After building, print a summary of every file you created and every file you modified.\n"
+    )
+    output = _stream_subprocess(
+        CLAUDE_CODE_CMD + [full_prompt],
+        cwd=str(existing_app_path),
+        timeout=CLAUDE_TIMEOUT,
+    )
+    save_artifact(run_id, "claude_build_output.txt", output)
+    log_event(run_id, "claude_build_feature_sprint", output[:500])
+    return output
+
+
+def pipeline_existing_app_upgrade(
+    existing_app_path: str,
+    feature_request_text: str,
+    run_id: str | None = None,
+    selected_feature_sprint: int = 1,
+    feature_plan_only: bool = False,
+    use_deepseek: bool = True,
+) -> str:
+    """
+    Existing App Upgrade mode entry point. Additive, not generative-from-scratch:
+    inspect -> summarize -> normalize feature request -> gap analysis -> additive
+    architecture -> feature sprint plan -> build ONE selected feature sprint ->
+    regression check -> (optional) review/fix -> feature completion report.
+    """
+    existing_app_path = Path(existing_app_path).resolve()
+    if not existing_app_path.exists():
+        raise FileNotFoundError(f"--existing-app path does not exist: {existing_app_path}")
+
+    if not run_id:
+        run_id = next_run_id()
+    rdir = run_dir(run_id)
+    init_run(run_id, f"Existing App Upgrade — {existing_app_path}\n\n{feature_request_text}")
+    save_artifact(run_id, "feature_request.md", feature_request_text)
+    _update_state(run_id, {"mode": "existing_app_upgrade", "existing_app_path": str(existing_app_path)})
+
+    print(f"\n{'='*60}")
+    print("  Existing App Upgrade Mode")
+    print(f"  Run folder    : {rdir}")
+    print(f"  Existing app  : {existing_app_path}")
+    print(f"  DeepSeek      : {'enabled' if use_deepseek and DEEPSEEK_API_KEY else 'disabled (no key)'}")
+    print(f"  Plan only     : {feature_plan_only}")
+    print(f"{'='*60}\n")
+
+    print("▶ Step 1  Scanning existing app...")
+    t0 = time.time()
+    scan = scan_existing_app(existing_app_path)
+    inventory_md = write_existing_app_inventory(scan, rdir)
+    record_step_time(run_id, "existing_app_scan", t0)
+    print(f"  Detected stack: {', '.join(scan['tech_stack'])}")
+
+    print("▶ Step 2  Checking baseline health...")
+    t0 = time.time()
+    health_md = run_baseline_health_check(existing_app_path, scan, rdir)
+    record_step_time(run_id, "baseline_health_check", t0)
+    health_status = "UNKNOWN"
+    m = re.search(r"\*\*Status:\*\*\s*(\w+)", health_md)
+    if m:
+        health_status = m.group(1)
+    print(f"  Baseline health: {health_status}")
+    if health_status == "BROKEN":
+        print("  ⚠️  WARNING: the existing app appears to have pre-existing errors. "
+              "Continuing — see baseline_health_check.md.")
+
+    print("▶ Step 3  Writing existing app summary...")
+    t0 = time.time()
+    existing_app_summary = generate_existing_app_summary(inventory_md, health_md, rdir)
+    record_step_time(run_id, "existing_app_summary", t0)
+
+    print("▶ Step 4  Normalizing requested features...")
+    t0 = time.time()
+    feature_requirements = generate_new_feature_requirements(feature_request_text, existing_app_summary, rdir)
+    record_step_time(run_id, "feature_requirements", t0)
+
+    print("▶ Step 5  Writing change gap analysis...")
+    t0 = time.time()
+    gap_analysis = generate_change_gap_analysis(existing_app_summary, feature_requirements, inventory_md, rdir)
+    record_step_time(run_id, "gap_analysis", t0)
+
+    print("▶ Step 6  Creating additive architecture...")
+    t0 = time.time()
+    additive_architecture = generate_additive_architecture(existing_app_summary, feature_requirements, gap_analysis, rdir)
+    record_step_time(run_id, "additive_architecture", t0)
+
+    print("▶ Step 7  Creating feature sprint plan...")
+    t0 = time.time()
+    plan_json, _plan_md = generate_feature_sprint_plan(
+        existing_app_summary, feature_requirements, gap_analysis, additive_architecture,
+        rdir, selected_sprint_number=selected_feature_sprint,
+    )
+    record_step_time(run_id, "feature_sprint_plan", t0)
+    _update_state(run_id, {})
+    print(f"\n{render_feature_sprint_plan_terminal(plan_json, selected_feature_sprint)}\n")
+
+    selected_sprint = select_feature_sprint(plan_json, selected_feature_sprint)
+    total = plan_json.get("total_sprints", len(plan_json.get("sprints", [])))
+    print(f"Selected Feature Sprint: Sprint {selected_feature_sprint} of {total}")
+
+    print("▶ Step 8  Writing selected feature sprint scope + build prompt...")
+    build_prompt_text = generate_selected_feature_sprint_build_prompt(
+        existing_app_summary, scan, plan_json, selected_sprint, rdir,
+    )
+    _update_state(run_id, {})
+
+    if feature_plan_only:
+        _update_state(run_id, {"status": "feature_plan_only_done", "current_step": "done"})
+        log_event(run_id, "feature_plan_only_done")
+        print(f"\n{'='*60}")
+        print("  📝  Feature-plan-only run complete — planning artifacts generated. "
+              "No Claude Code or DeepSeek calls made.")
+        print(f"  Run folder : {rdir}")
+        print("  Artifacts  :")
+        for f in sorted(rdir.iterdir()):
+            if f.is_file():
+                print(f"        {f.name}")
+        print(f"{'='*60}\n")
+        return run_id
+
+    must_not_modify = selected_sprint.get("must_not_modify") or []
+    snapshot_protected_files(existing_app_path, must_not_modify, rdir)
+
+    print(f"\n▶ Step 9  Claude Code — building Sprint {selected_feature_sprint} in place...")
+    t0 = time.time()
+    _update_state(run_id, {"current_step": "building", "status": "building"})
+    build_output = build_feature_sprint(run_id, existing_app_path, build_prompt_text)
+    record_step_time(run_id, "built", t0)
+    _update_state(run_id, {"status": "built"})
+
+    print("\n▶ Step 10  Regression check...")
+    smoke_log = ""
+    try:
+        smoke_log = run_smoke_checks(run_id, existing_app_path)
+    except Exception as e:
+        smoke_log = f"Smoke checks could not run: {e}"
+    save_artifact(run_id, "feature_sprint_smoke_log.txt", smoke_log)
+    regression_status, regression_report = run_regression_check(
+        existing_app_path, rdir, selected_sprint, smoke_log,
+    )
+    print(f"  Regression result: {regression_status}")
+    if regression_status == "FAIL":
+        print("  ⚠️  WARNING: unexpected changes to protected files were detected.")
+
+    if use_deepseek and DEEPSEEK_API_KEY:
+        print("\n▶ Step 11  DeepSeek review (optional)...")
+        deepseek_report = deepseek_attack_review(existing_app_summary, existing_app_path, smoke_log + "\n\n" + regression_report)
+        save_artifact(run_id, "deepseek_attack_report.md", deepseek_report)
+        if not is_approved(deepseek_report):
+            print("  Applying one fix iteration based on DeepSeek review...")
+            fix_prompt = generate_fix_prompt(existing_app_summary, existing_app_path, deepseek_report, 1)
+            apply_fixes(run_id, existing_app_path, fix_prompt, 1)
+            smoke_log = run_smoke_checks(run_id, existing_app_path)
+            regression_status, regression_report = run_regression_check(
+                existing_app_path, rdir, selected_sprint, smoke_log,
+            )
+            print(f"  Regression result after fix: {regression_status}")
+
+    print("\n▶ Step 12  Writing feature completion report...")
+    generate_feature_completion_report(
+        existing_app_summary, plan_json, selected_sprint, build_output,
+        regression_status, regression_report, smoke_log, rdir,
+    )
+
+    _update_state(run_id, {"status": "done", "current_step": "done", "regression_status": regression_status})
+    log_event(run_id, "done", f"regression={regression_status}")
+
+    print(f"\n{'='*60}")
+    print("  Existing App Upgrade — Feature Sprint Complete")
+    print(f"  Run folder : {rdir}")
+    print(f"  Regression : {regression_status}")
+    print("  Artifacts  :")
+    for f in sorted(rdir.iterdir()):
+        if f.is_file():
+            print(f"        {f.name}")
+    print(f"{'='*60}\n")
+    return run_id
 
 
 # ── Step 3: Claude Code Build ──────────────────────────────────────────────────
@@ -3029,6 +4357,32 @@ if __name__ == "__main__":
                          help="Generate the sprint plan and the selected sprint's build prompt, "
                               "then stop. Implies sprint planning; skips Claude Code and DeepSeek "
                               "entirely (like --plan-only, but sprint-aware).")
+
+    # ── Existing App Upgrade mode ────────────────────────────────────────────
+    parser.add_argument("--existing-app", default=None, metavar="PATH",
+                         help="Path to an existing local app/MVP to upgrade additively. "
+                              "Requires --feature-request and --upgrade-mode.")
+    parser.add_argument("--feature-request", default=None, metavar="PATH",
+                         help="Path to a .md/.txt file describing the feature(s) to add to "
+                              "--existing-app.")
+    parser.add_argument("--upgrade-mode", action="store_true",
+                         help="Run Existing App Upgrade mode instead of the normal new-MVP "
+                              "pipeline: inspect --existing-app, normalize --feature-request, "
+                              "and plan/build additive feature sprints on top of it. Sprint 0 "
+                              "is always the existing baseline and is never rebuilt.")
+    parser.add_argument("--feature-sprint-plan", action="store_true",
+                         help="(Existing App Upgrade mode) Decompose the requested feature work "
+                              "into numbered feature sprints (feature_sprint_plan.md/.json) on "
+                              "top of the Sprint 0 baseline. Currently always on in upgrade mode; "
+                              "flag kept for explicit/future CLI compatibility.")
+    parser.add_argument("--selected-feature-sprint", type=int, default=1, metavar="N",
+                         help="(Existing App Upgrade mode) Which feature sprint number to build "
+                              "(default: 1). Sprint 0 is the baseline and cannot be selected.")
+    parser.add_argument("--feature-plan-only", action="store_true",
+                         help="(Existing App Upgrade mode) Generate all planning artifacts "
+                              "(inventory, health check, summary, requirements, gap analysis, "
+                              "additive architecture, feature sprint plan, selected sprint build "
+                              "prompt) then stop. Skips Claude Code and DeepSeek entirely.")
     args = parser.parse_args()
 
     run_id_arg = args.run_id  # may be None
@@ -3041,7 +4395,20 @@ if __name__ == "__main__":
     )
 
     try:
-        if args.resume:
+        if args.upgrade_mode:
+            if not args.existing_app or not args.feature_request:
+                print("--upgrade-mode requires both --existing-app PATH and --feature-request PATH.")
+                sys.exit(1)
+            feature_request_text = Path(args.feature_request).read_text(encoding="utf-8").strip()
+            pipeline_existing_app_upgrade(
+                args.existing_app,
+                feature_request_text,
+                run_id=run_id_arg,
+                selected_feature_sprint=args.selected_feature_sprint,
+                feature_plan_only=args.feature_plan_only,
+                use_deepseek=not args.no_deepseek,
+            )
+        elif args.resume:
             resume_id = Path(args.resume).name
             raw = (run_dir(resume_id) / "raw_input.md").read_text()
             pipeline(raw, run_id=resume_id, resume=True, use_deepseek=not args.no_deepseek,
