@@ -28,6 +28,13 @@ export interface RunDetail {
   sprint_plan_only?: boolean;
   selected_sprint?: number;
   no_deepseek?: boolean;
+  upgrade_mode?: boolean;
+  existing_app?: string;
+  selected_feature_sprint?: number;
+  feature_plan_only?: boolean;
+  continue_run?: string;
+  continue_sprint?: number;
+  continue_plan_only?: boolean;
 }
 
 export interface Artifact {
@@ -80,4 +87,39 @@ export async function createRun(
   });
   if (!r.ok) throw new Error("Failed to create run");
   return r.json();
+}
+
+export interface UpgradeRunPayload {
+  upgrade_mode: true;
+  existing_app: string;
+  feature_request_text: string;
+  feature_sprint_plan: true;
+  selected_feature_sprint: number;
+  feature_plan_only: boolean;
+  no_deepseek: boolean;
+}
+
+export interface ContinuationRunPayload {
+  continue_run: string;
+  continue_sprint: number;
+  continue_plan_only: boolean;
+  no_deepseek: boolean;
+}
+
+async function postRun<T extends object>(body: T): Promise<{ run_id: string; status: string }> {
+  const r = await fetch(`${BASE}/api/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export function createUpgradeRun(payload: UpgradeRunPayload) {
+  return postRun(payload);
+}
+
+export function createContinuationRun(payload: ContinuationRunPayload) {
+  return postRun(payload);
 }

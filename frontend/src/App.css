@@ -58,6 +58,11 @@ button { cursor: pointer; border: none; outline: none; background: none; font-fa
 .home-title { font-size: 26px; font-weight: 700; letter-spacing: -0.3px; }
 .home-sub   { font-size: 15px; color: var(--text2); }
 
+.home-section { display: flex; flex-direction: column; align-items: center; gap: 18px; width: 100%; animation: fadeUp 0.5s ease both; }
+.home-section-header { text-align: center; }
+.home-section-title { font-size: 12.5px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--text2); }
+.home-section-sub { font-size: 12.5px; color: var(--text3); margin-top: 4px; }
+
 .entry-cards { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
 .entry-card {
   width: 256px; background: var(--bg2); border: 1px solid var(--border);
@@ -84,15 +89,49 @@ button { cursor: pointer; border: none; outline: none; background: none; font-fa
 }
 .card-arrow { color: var(--card-color); transition: transform 0.14s; }
 .entry-card:hover .card-arrow { transform: translateX(3px); }
+.entry-card-active { border-color: var(--card-color); box-shadow: var(--shadow-lg); }
 
-.home-footer { animation: fadeIn 0.6s ease 0.4s both; }
-.runs-link {
-  display: inline-flex; align-items: center; gap: 6px;
-  color: var(--text2); font-size: 13px; padding: 7px 14px;
-  border-radius: 8px; border: 1px solid var(--border); background: var(--bg2);
-  box-shadow: var(--shadow-sm); transition: color 0.13s, border-color 0.13s, box-shadow 0.13s;
+/* ── Inline expanded panel (Existing App Upgrade / Continue Previous Sprint) ── */
+.expand-panel {
+  width: 100%; max-width: 640px; background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); overflow: hidden; box-shadow: var(--shadow);
+  animation: fadeUp 0.22s ease;
 }
-.runs-link:hover { color: var(--text); border-color: var(--border2); box-shadow: var(--shadow); }
+.expand-panel-header {
+  padding: 16px 22px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 12px;
+}
+.expand-panel-icon {
+  width: 32px; height: 32px; border-radius: 9px;
+  background: var(--card-bg); color: var(--card-color);
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.expand-panel-title { font-size: 15px; font-weight: 600; flex: 1; }
+.expand-panel-close {
+  font-size: 18px; line-height: 1; color: var(--text3); width: 26px; height: 26px;
+  border-radius: 7px; display: flex; align-items: center; justify-content: center;
+  transition: color 0.13s, background 0.13s;
+}
+.expand-panel-close:hover { color: var(--text); background: var(--bg3); }
+
+.expand-panel-body { padding: 20px 22px 24px; display: flex; flex-direction: column; gap: 14px; }
+.expand-field { display: flex; flex-direction: column; gap: 6px; }
+.expand-field-label { font-size: 12.5px; font-weight: 600; color: var(--text2); }
+.expand-input {
+  width: 100%; background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); font-size: 13.5px;
+  font-family: inherit; padding: 10px 13px; transition: border-color 0.15s, box-shadow 0.15s;
+}
+.expand-input:focus { outline: none; border-color: var(--card-color); box-shadow: 0 0 0 3px rgba(0,0,0,0.05); }
+.expand-input::placeholder { color: var(--text3); }
+.expand-textarea { min-height: 110px; resize: vertical; font-size: 13.5px; }
+.expand-field-inline { max-width: 180px; }
+.expand-input-num { width: 90px; }
+
+.expand-checkboxes { display: flex; flex-direction: column; gap: 8px; }
+.expand-checkbox { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text2); cursor: pointer; }
+.expand-checkbox input { width: 15px; height: 15px; accent-color: var(--card-color, #6366f1); cursor: pointer; }
+.expand-checkbox em { font-style: normal; color: var(--text3); }
 
 /* ══════════════════════════════════════════════════════
    INPUT VIEW

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { getRuns, getRun, getArtifact } from "./api";
+import type { ReactElement } from "react";
+import { getRuns, getRun, getArtifact, createUpgradeRun, createContinuationRun } from "./api";
 import type { RunSummary, RunDetail } from "./api";
 import "./App.css";
 
@@ -99,6 +100,27 @@ const ARTIFACT_LABELS: Record<string, string> = {
   "sprint_plan.json":                  "Sprint Plan JSON",
   "selected_sprint_scope.md":          "Selected Sprint Scope",
   "selected_sprint_build_prompt.txt":  "Selected Sprint Build Prompt",
+  "existing_app_inventory.md":         "Existing App Inventory",
+  "baseline_health_check.md":          "Baseline Health Check",
+  "existing_app_summary.md":           "Existing App Summary",
+  "new_feature_requirements.md":       "New Feature Requirements",
+  "change_gap_analysis.md":            "Change Gap Analysis",
+  "additive_architecture.md":          "Additive Architecture",
+  "feature_sprint_plan.md":            "Feature Sprint Plan",
+  "feature_sprint_plan.json":          "Feature Sprint Plan JSON",
+  "selected_feature_sprint_scope.md":  "Selected Feature Sprint Scope",
+  "selected_feature_sprint_build_prompt.txt": "Selected Feature Sprint Build Prompt",
+  "regression_check.md":               "Regression Check",
+  "feature_completion_report.md":      "Feature Completion Report",
+  "continuation_source.md":            "Continuation Source",
+  "preserved_sprint_plan.json":        "Preserved Sprint Plan JSON",
+  "preserved_sprint_plan.md":          "Preserved Sprint Plan",
+  "current_app_inventory.md":          "Current App Inventory",
+  "continuation_gap_analysis.md":      "Continuation Gap Analysis",
+  "selected_continuation_sprint_scope.md": "Selected Continuation Sprint Scope",
+  "selected_continuation_sprint_build_prompt.txt": "Selected Continuation Build Prompt",
+  "continuation_regression_check.md":  "Continuation Regression Check",
+  "continuation_completion_report.md": "Continuation Completion Report",
 };
 
 function artifactDisplayName(filename: string): string {
@@ -341,13 +363,6 @@ function IconBack() {
     </svg>
   );
 }
-function IconHistory() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-      <polyline points="1,4 1,10 7,10"/><path d="M3.51 15a9 9 0 1 0 .49-4.95"/>
-    </svg>
-  );
-}
 function IconPipeline() {
   return (
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round">
@@ -385,6 +400,31 @@ function IconJira() {
   return (
     <svg width="22" height="22" viewBox="0 0 32 32" fill="currentColor">
       <path d="M15.86 0C11.7 0 8.3 3.37 8.3 7.53v1.3H3.1A3.1 3.1 0 0 0 0 11.93v15.41C0 29.83 2.17 32 4.84 32h15.3a3.1 3.1 0 0 0 3.1-3.1v-1.3h5.22A4.54 4.54 0 0 0 32 23.06V7.53A7.53 7.53 0 0 0 24.47 0zm0 3.08a4.45 4.45 0 0 1 4.45 4.45v1.3h-8.9V7.53a4.45 4.45 0 0 1 4.45-4.45zm7.53 21.54H8.3V11.93c0-.01.01-.02.02-.02h14.93c.01 0 .02.01.02.02zm5.51-1.56a1.46 1.46 0 0 1-1.46 1.46h-1.97V11.93a3.1 3.1 0 0 0-3.1-3.1H11.4V7.53a4.45 4.45 0 0 1 8.9 0v.7h1.3a4.45 4.45 0 0 1 4.45 4.45v12.38z"/>
+    </svg>
+  );
+}
+function IconWrench() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z"/>
+    </svg>
+  );
+}
+function IconRepeat() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="17 1 21 5 17 9"/>
+      <path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+      <polyline points="7 23 3 19 7 15"/>
+      <path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+    </svg>
+  );
+}
+function IconClock() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10"/>
+      <polyline points="12 6 12 12 16 14"/>
     </svg>
   );
 }
@@ -1134,6 +1174,8 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "new_feature_requirements.md", label: "New Feature Requirements" },
   { file: "change_gap_analysis.md", label: "Gap Analysis" },
   { file: "additive_architecture.md", label: "Additive Architecture" },
+  { file: "feature_sprint_plan.md", label: "Feature Sprint Plan" },
+  { file: "feature_sprint_plan.json", label: "Feature Sprint Plan JSON" },
   { file: "selected_feature_sprint_scope.md", label: "Selected Feature Sprint Scope" },
   { file: "selected_feature_sprint_build_prompt.txt", label: "Selected Feature Sprint Build Prompt" },
   { file: "regression_check.md", label: "Regression Check" },
@@ -1204,7 +1246,7 @@ function ExistingAppUpgradeView({ runId, run, onBack }: {
           </div>
           <div className="steps-panel-scroll">
             <div className="sprint-mode-banner">
-              <span className="sprint-mode-pill">Existing App Upgrade Mode</span>
+              <span className="sprint-mode-pill">Mode: Existing App Upgrade</span>
               <span className="sprint-mode-line">
                 {plan?.product_name ? `${plan.product_name} — ` : ""}
                 additive feature work on top of an existing app. Status: {run?.status ?? "running"}
@@ -1277,11 +1319,12 @@ interface ContinuationPlan {
 
 const CONTINUATION_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "continuation_source.md", label: "Continuation Source" },
+  { file: "preserved_sprint_plan.json", label: "Preserved Sprint Plan JSON" },
   { file: "preserved_sprint_plan.md", label: "Preserved Sprint Plan" },
   { file: "current_app_inventory.md", label: "Current App Inventory" },
   { file: "continuation_gap_analysis.md", label: "Continuation Gap Analysis" },
   { file: "selected_continuation_sprint_scope.md", label: "Selected Continuation Sprint Scope" },
-  { file: "selected_continuation_sprint_build_prompt.txt", label: "Selected Continuation Sprint Build Prompt" },
+  { file: "selected_continuation_sprint_build_prompt.txt", label: "Selected Continuation Build Prompt" },
   { file: "continuation_regression_check.md", label: "Continuation Regression Check" },
   { file: "continuation_completion_report.md", label: "Continuation Completion Report" },
 ];
@@ -1363,7 +1406,7 @@ function ContinuationView({ runId, run, onBack }: {
           </div>
           <div className="steps-panel-scroll">
             <div className="sprint-mode-banner">
-              <span className="sprint-mode-pill">Sprint Continuation Mode</span>
+              <span className="sprint-mode-pill">Mode: Sprint Continuation</span>
               <span className="sprint-mode-line">
                 {sourceRun ? `Continuing from ${sourceRun.split("/").pop()}` : "Continuing a previous run"}
                 {selectedSprintNum ? ` — Sprint ${selectedSprintNum}` : ""}. Status: {run?.status ?? "running"}
@@ -1435,12 +1478,14 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
   // Existing App Upgrade mode detection: presence of feature_sprint_plan.json is the
   // signal (set both for dashboard-triggered and CLI-triggered upgrade runs, since the
   // backend's generic artifact endpoint serves any filename written by the pipeline).
-  const upgradeModeActive = (run?.artifacts ?? []).includes("feature_sprint_plan.json");
+  const upgradeModeActive = !!run?.upgrade_mode ||
+    (run?.artifacts ?? []).includes("feature_sprint_plan.json");
   // Multi-Sprint Continuation mode detection: presence of continuation_source.md (or a
   // "continuation_" status, for the brief window before that artifact lands) is the signal.
   // Checked independently of upgradeModeActive above — a continuation run never writes
   // feature_sprint_plan.json itself (it writes preserved_sprint_plan.json/.md instead).
-  const continuationModeActive = (run?.artifacts ?? []).includes("continuation_source.md") ||
+  const continuationModeActive = !!run?.continue_run ||
+    (run?.artifacts ?? []).includes("continuation_source.md") ||
     !!run?.status?.startsWith("continuation_");
   // Sprint-plan-only ("Stage 1") vs an actual selected-sprint build ("Stage 2") — these get
   // different banner copy and different step semantics ("Not being run" vs in-progress).
@@ -1747,7 +1792,159 @@ const ENTRY_CARDS = [
   { mode: "jira"  as EntryMode, icon: <IconJira />, title: "Jira Ticket",       sub: "Pull a ticket directly from your Jira workspace by key", color: "#0052cc", colorBg: "#e8f0fb", hint: "e.g. MDP-1" },
 ];
 
-function HomeView({ onSelect, onRuns }: { onSelect: (m: EntryMode) => void; onRuns: () => void }) {
+type SecondaryCardMode = "upgrade" | "continuation" | "runs";
+
+const SECONDARY_CARDS: { mode: SecondaryCardMode; icon: ReactElement; title: string; sub: string; color: string; colorBg: string; hint: string }[] = [
+  { mode: "upgrade",      icon: <IconWrench />, title: "Existing App Upgrade",      sub: "Add features to an existing MVP without rebuilding it from scratch", color: "#0d9488", colorBg: "#f0fdfa", hint: "App path + feature request" },
+  { mode: "continuation", icon: <IconRepeat />, title: "Continue Previous Sprint",  sub: "Use a previous run as the baseline and plan the next sprint",        color: "#7c3aed", colorBg: "#f5f3ff", hint: "Source run + sprint number" },
+  { mode: "runs",         icon: <IconClock />,  title: "View Past Runs",            sub: "Open previous runs, artifacts, reports, and sprint plans",            color: "#64748b", colorBg: "#f8fafc", hint: "Run history" },
+];
+
+// ── Existing App Upgrade form panel ─────────────────────────────────────────────
+
+function UpgradePanel({ onCreated, onCancel }: { onCreated: (id: string) => void; onCancel: () => void }) {
+  const [existingApp, setExistingApp] = useState("");
+  const [featureRequest, setFeatureRequest] = useState("");
+  const [selectedSprint, setSelectedSprint] = useState(1);
+  const [planOnly, setPlanOnly] = useState(true);
+  const [noDeepseek, setNoDeepseek] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const canSubmit = existingApp.trim().length > 0 && featureRequest.trim().length > 0;
+
+  const submit = async () => {
+    setLoading(true); setError(null);
+    try {
+      const data = await createUpgradeRun({
+        upgrade_mode: true,
+        existing_app: existingApp.trim(),
+        feature_request_text: featureRequest.trim(),
+        feature_sprint_plan: true,
+        selected_feature_sprint: selectedSprint,
+        feature_plan_only: planOnly,
+        no_deepseek: noDeepseek,
+      });
+      onCreated(data.run_id);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="expand-panel" style={{ "--card-color": "#0d9488", "--card-bg": "#f0fdfa" } as React.CSSProperties}>
+      <div className="expand-panel-header">
+        <div className="expand-panel-icon"><IconWrench /></div>
+        <span className="expand-panel-title">Existing App Upgrade</span>
+        <button className="expand-panel-close" onClick={onCancel}>×</button>
+      </div>
+      <div className="expand-panel-body">
+        <label className="expand-field">
+          <span className="expand-field-label">Existing app path</span>
+          <input className="expand-input" value={existingApp} onChange={e => setExistingApp(e.target.value)}
+            placeholder="/path/to/app" disabled={loading} autoFocus />
+        </label>
+        <label className="expand-field">
+          <span className="expand-field-label">Feature request</span>
+          <textarea className="input-textarea expand-textarea" value={featureRequest} onChange={e => setFeatureRequest(e.target.value)}
+            placeholder="Describe the features to add to this app..." rows={5} disabled={loading} />
+        </label>
+        <label className="expand-field expand-field-inline">
+          <span className="expand-field-label">Selected sprint</span>
+          <input className="expand-input expand-input-num" type="number" min={1} max={12} value={selectedSprint}
+            onChange={e => setSelectedSprint(Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)))} disabled={loading} />
+        </label>
+        <div className="expand-checkboxes">
+          <label className="expand-checkbox">
+            <input type="checkbox" checked={planOnly} onChange={e => setPlanOnly(e.target.checked)} disabled={loading} />
+            <span>Plan only <em>— no Claude Code build</em></span>
+          </label>
+          <label className="expand-checkbox">
+            <input type="checkbox" checked={noDeepseek} onChange={e => setNoDeepseek(e.target.checked)} disabled={loading} />
+            <span>Skip DeepSeek review</span>
+          </label>
+        </div>
+        {error && <p className="input-error">{error}</p>}
+        <button className="submit-btn" onClick={submit} disabled={loading || !canSubmit}>
+          {loading ? "Starting…" : planOnly ? "Generate Upgrade Sprint Plan →" : "Run Upgrade →"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Continue Previous Sprint form panel ─────────────────────────────────────────
+
+function ContinuationPanel({ onCreated, onCancel }: { onCreated: (id: string) => void; onCancel: () => void }) {
+  const [sourceRun, setSourceRun] = useState("");
+  const [continueSprint, setContinueSprint] = useState(2);
+  const [planOnly, setPlanOnly] = useState(true);
+  const [noDeepseek, setNoDeepseek] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const canSubmit = sourceRun.trim().length > 0;
+
+  const submit = async () => {
+    setLoading(true); setError(null);
+    try {
+      const data = await createContinuationRun({
+        continue_run: sourceRun.trim(),
+        continue_sprint: continueSprint,
+        continue_plan_only: planOnly,
+        no_deepseek: noDeepseek,
+      });
+      onCreated(data.run_id);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="expand-panel" style={{ "--card-color": "#7c3aed", "--card-bg": "#f5f3ff" } as React.CSSProperties}>
+      <div className="expand-panel-header">
+        <div className="expand-panel-icon"><IconRepeat /></div>
+        <span className="expand-panel-title">Continue Previous Sprint</span>
+        <button className="expand-panel-close" onClick={onCancel}>×</button>
+      </div>
+      <div className="expand-panel-body">
+        <label className="expand-field">
+          <span className="expand-field-label">Source run</span>
+          <input className="expand-input" value={sourceRun} onChange={e => setSourceRun(e.target.value)}
+            placeholder="runs/run_049" disabled={loading} autoFocus />
+        </label>
+        <label className="expand-field expand-field-inline">
+          <span className="expand-field-label">Continue sprint</span>
+          <input className="expand-input expand-input-num" type="number" min={1} max={12} value={continueSprint}
+            onChange={e => setContinueSprint(Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)))} disabled={loading} />
+        </label>
+        <div className="expand-checkboxes">
+          <label className="expand-checkbox">
+            <input type="checkbox" checked={planOnly} onChange={e => setPlanOnly(e.target.checked)} disabled={loading} />
+            <span>Plan only <em>— no Claude Code build</em></span>
+          </label>
+          <label className="expand-checkbox">
+            <input type="checkbox" checked={noDeepseek} onChange={e => setNoDeepseek(e.target.checked)} disabled={loading} />
+            <span>Skip DeepSeek review</span>
+          </label>
+        </div>
+        {error && <p className="input-error">{error}</p>}
+        <button className="submit-btn" onClick={submit} disabled={loading || !canSubmit}>
+          {loading ? "Starting…" : planOnly ? "Generate Continuation Plan →" : "Continue Sprint →"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function HomeView({ onSelect, onRuns, onRunCreated }: { onSelect: (m: EntryMode) => void; onRuns: () => void; onRunCreated: (id: string) => void }) {
+  const [expanded, setExpanded] = useState<"upgrade" | "continuation" | null>(null);
+
+  const handleSecondaryClick = (mode: SecondaryCardMode) => {
+    if (mode === "runs") { onRuns(); return; }
+    setExpanded(prev => (prev === mode ? null : mode));
+  };
+
   return (
     <div className="home-view">
       <div className="home-hero">
@@ -1757,31 +1954,66 @@ function HomeView({ onSelect, onRuns }: { onSelect: (m: EntryMode) => void; onRu
         </div>
         <p className="home-sub">Turn ideas into working applications, automatically.</p>
       </div>
-      <div className="entry-cards">
-        {ENTRY_CARDS.map((card, i) => (
-          <button
-            key={card.mode}
-            className="entry-card"
-            style={{ "--card-color": card.color, "--card-bg": card.colorBg, animationDelay: `${i * 70 + 150}ms` } as React.CSSProperties}
-            onClick={() => onSelect(card.mode)}
-          >
-            <div className="card-top-bar" />
-            <div className="card-inner">
-              <div className="card-icon-wrap">{card.icon}</div>
-              <div className="card-text">
-                <div className="card-title">{card.title}</div>
-                <div className="card-sub">{card.sub}</div>
+
+      <div className="home-section">
+        <div className="home-section-header">
+          <div className="home-section-title">Start a New MVP</div>
+        </div>
+        <div className="entry-cards">
+          {ENTRY_CARDS.map((card, i) => (
+            <button
+              key={card.mode}
+              className="entry-card"
+              style={{ "--card-color": card.color, "--card-bg": card.colorBg, animationDelay: `${i * 70 + 150}ms` } as React.CSSProperties}
+              onClick={() => onSelect(card.mode)}
+            >
+              <div className="card-top-bar" />
+              <div className="card-inner">
+                <div className="card-icon-wrap">{card.icon}</div>
+                <div className="card-text">
+                  <div className="card-title">{card.title}</div>
+                  <div className="card-sub">{card.sub}</div>
+                </div>
               </div>
-            </div>
-            <div className="card-footer">
-              <span>{card.hint}</span>
-              <span className="card-arrow">→</span>
-            </div>
-          </button>
-        ))}
+              <div className="card-footer">
+                <span>{card.hint}</span>
+                <span className="card-arrow">→</span>
+              </div>
+            </button>
+          ))}
+        </div>
       </div>
-      <div className="home-footer">
-        <button className="runs-link" onClick={onRuns}><IconHistory /> View past runs</button>
+
+      <div className="home-section">
+        <div className="home-section-header">
+          <div className="home-section-title">Continue or Upgrade</div>
+          <div className="home-section-sub">Work from an existing app or continue a previous sprint.</div>
+        </div>
+        <div className="entry-cards">
+          {SECONDARY_CARDS.map((card, i) => (
+            <button
+              key={card.mode}
+              className={`entry-card ${expanded === card.mode ? "entry-card-active" : ""}`}
+              style={{ "--card-color": card.color, "--card-bg": card.colorBg, animationDelay: `${i * 70 + 150}ms` } as React.CSSProperties}
+              onClick={() => handleSecondaryClick(card.mode)}
+            >
+              <div className="card-top-bar" />
+              <div className="card-inner">
+                <div className="card-icon-wrap">{card.icon}</div>
+                <div className="card-text">
+                  <div className="card-title">{card.title}</div>
+                  <div className="card-sub">{card.sub}</div>
+                </div>
+              </div>
+              <div className="card-footer">
+                <span>{card.hint}</span>
+                <span className="card-arrow">→</span>
+              </div>
+            </button>
+          ))}
+        </div>
+        {expanded === "upgrade" && <UpgradePanel onCreated={onRunCreated} onCancel={() => setExpanded(null)} />}
+        {expanded === "continuation" && <ContinuationPanel onCreated={onRunCreated} onCancel={() => setExpanded(null)} />}
       </div>
     </div>
   );
@@ -1956,7 +2188,7 @@ export default function App() {
   const [view, setView] = useState<View>({ type: "home" });
   return (
     <div className="app">
-      {view.type === "home"     && <HomeView onSelect={mode => setView({ type: "input", mode })} onRuns={() => setView({ type: "runs" })} />}
+      {view.type === "home"     && <HomeView onSelect={mode => setView({ type: "input", mode })} onRuns={() => setView({ type: "runs" })} onRunCreated={id => setView({ type: "pipeline", runId: id })} />}
       {view.type === "input"    && <InputView mode={view.mode} onBack={() => setView({ type: "home" })} onCreated={id => setView({ type: "pipeline", runId: id })} />}
       {view.type === "pipeline" && <PipelineView runId={view.runId} onBack={() => setView({ type: "runs" })} onNewRun={id => setView({ type: "pipeline", runId: id })} />}
       {view.type === "runs"     && <RunsView onSelect={id => setView({ type: "pipeline", runId: id })} onBack={() => setView({ type: "home" })} />}

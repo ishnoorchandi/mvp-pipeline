@@ -63,6 +63,46 @@ def list_runs() -> list[dict]:
     return runs
 
 
+def _spawn_pipeline(run_id: str, cmd: list[str]):
+    """Run a pipeline_mvp_builder.py invocation to completion, streaming to pipeline.log.
+
+    Shared by every run-launching path (normal/sprint runs, Existing App Upgrade,
+    Sprint Continuation) — only the cmd list differs between them.
+    """
+    log_file = RUNS_DIR / run_id / "pipeline.log"
+    print(f"[backend] Spawning: {' '.join(cmd)}", flush=True)
+    try:
+        with open(log_file, "w") as lf:
+            result = subprocess.run(
+                cmd, cwd=str(BASE_DIR),
+                stdout=lf, stderr=subprocess.STDOUT
+            )
+        if result.returncode != 0:
+            print(f"[backend] Pipeline exited with code {result.returncode} — see {log_file}", flush=True)
+            # Mark run as failed if still queued
+            state_path = RUNS_DIR / run_id / "run_state.json"
+            try:
+                state = json.loads(state_path.read_text())
+                if state.get("status") == "queued":
+                    state["status"] = "failed"
+                    state["error"] = f"Pipeline crashed (exit {result.returncode}). Check runs/{run_id}/pipeline.log"
+                    state_path.write_text(json.dumps(state, indent=2))
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"[backend] Failed to spawn pipeline: {exc}", flush=True)
+
+
+def allocate_run_id() -> str:
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    existing = sorted([
+        d.name for d in RUNS_DIR.iterdir()
+        if d.is_dir() and d.name.startswith("run_")
+    ])
+    last_num = int(existing[-1].split("_")[1]) if existing else 0
+    return f"run_{last_num + 1:03d}"
+
+
 def run_pipeline_async(
     run_id: str,
     jira_key: str = "",
@@ -100,29 +140,61 @@ def run_pipeline_async(
             cmd += ["--sprint-plan-only"]
         if no_deepseek:
             cmd += ["--no-deepseek"]
+        _spawn_pipeline(run_id, cmd)
 
-        log_file = RUNS_DIR / run_id / "pipeline.log"
-        print(f"[backend] Spawning: {' '.join(cmd)}", flush=True)
-        try:
-            with open(log_file, "w") as lf:
-                result = subprocess.run(
-                    cmd, cwd=str(BASE_DIR),
-                    stdout=lf, stderr=subprocess.STDOUT
-                )
-            if result.returncode != 0:
-                print(f"[backend] Pipeline exited with code {result.returncode} — see {log_file}", flush=True)
-                # Mark run as failed if still queued
-                state_path = RUNS_DIR / run_id / "run_state.json"
-                try:
-                    state = json.loads(state_path.read_text())
-                    if state.get("status") == "queued":
-                        state["status"] = "failed"
-                        state["error"] = f"Pipeline crashed (exit {result.returncode}). Check runs/{run_id}/pipeline.log"
-                        state_path.write_text(json.dumps(state, indent=2))
-                except Exception:
-                    pass
-        except Exception as exc:
-            print(f"[backend] Failed to spawn pipeline: {exc}", flush=True)
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+def run_pipeline_upgrade_async(
+    run_id: str,
+    existing_app: str,
+    feature_request_path: str,
+    selected_feature_sprint: int,
+    feature_plan_only: bool,
+    no_deepseek: bool,
+):
+    """Existing App Upgrade mode — maps to --existing-app/--feature-request/--upgrade-mode."""
+    def _run():
+        cmd = [
+            sys.executable, str(PIPELINE_SCRIPT),
+            "--existing-app", existing_app,
+            "--feature-request", feature_request_path,
+            "--upgrade-mode",
+            "--feature-sprint-plan",
+            "--selected-feature-sprint", str(selected_feature_sprint),
+            "--run-id", run_id,
+        ]
+        if feature_plan_only:
+            cmd += ["--feature-plan-only"]
+        if no_deepseek:
+            cmd += ["--no-deepseek"]
+        _spawn_pipeline(run_id, cmd)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+def run_pipeline_continuation_async(
+    run_id: str,
+    continue_run: str,
+    continue_sprint: int,
+    continue_plan_only: bool,
+    no_deepseek: bool,
+):
+    """Sprint Continuation mode — maps to --continue-run/--continue-sprint."""
+    def _run():
+        cmd = [
+            sys.executable, str(PIPELINE_SCRIPT),
+            "--continue-run", continue_run,
+            "--continue-sprint", str(continue_sprint),
+            "--run-id", run_id,
+        ]
+        if continue_plan_only:
+            cmd += ["--continue-plan-only"]
+        if no_deepseek:
+            cmd += ["--no-deepseek"]
+        _spawn_pipeline(run_id, cmd)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -148,6 +220,15 @@ def get_runs():
 @app.route("/api/runs", methods=["POST"])
 def create_run():
     body = request.get_json(force=True, silent=True) or {}
+
+    # Existing App Upgrade and Sprint Continuation have their own payload shapes
+    # and CLI mapping — handled by dedicated helpers before falling through to the
+    # original idea/requirements/file/jira run-creation path below.
+    if body.get("continue_run"):
+        return create_continuation_run(body)
+    if body.get("upgrade_mode"):
+        return create_upgrade_run(body)
+
     raw_input = body.get("raw_input", "").strip()
     jira_key  = body.get("jira_key",  "").strip().upper()
     mode      = body.get("mode",      "").strip().lower()
@@ -168,15 +249,7 @@ def create_run():
     if not raw_input and not jira_key:
         abort(400, "raw_input or jira_key is required")
 
-    # Pre-allocate a run ID
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    existing = sorted([
-        d.name for d in RUNS_DIR.iterdir()
-        if d.is_dir() and d.name.startswith("run_")
-    ])
-    last_num = int(existing[-1].split("_")[1]) if existing else 0
-    run_id = f"run_{last_num + 1:03d}"
-
+    run_id = allocate_run_id()
     run_path = RUNS_DIR / run_id
     run_path.mkdir(parents=True, exist_ok=True)
 
@@ -203,6 +276,92 @@ def create_run():
         plan_only=plan_only, sprint_plan=sprint_plan,
         selected_sprint=selected_sprint, sprint_plan_only=sprint_plan_only,
         no_deepseek=no_deepseek,
+    )
+
+    return jsonify({"run_id": run_id, "status": "queued"}), 201
+
+
+def create_upgrade_run(body: dict):
+    """Existing App Upgrade payload → pre-allocated run + --existing-app/--upgrade-mode CLI.
+
+    Defaults feature_plan_only/no_deepseek to True (safety default: no Claude Code
+    build or DeepSeek spend unless the dashboard form explicitly unchecks plan-only).
+    """
+    existing_app = (body.get("existing_app") or "").strip()
+    feature_request_text = (body.get("feature_request_text") or body.get("feature_request") or "").strip()
+    if not existing_app or not feature_request_text:
+        abort(400, "existing_app and feature_request_text are required")
+    try:
+        selected_feature_sprint = int(body.get("selected_feature_sprint", 1))
+    except (TypeError, ValueError):
+        selected_feature_sprint = 1
+    feature_plan_only = bool(body.get("feature_plan_only", True))
+    no_deepseek = bool(body.get("no_deepseek", True))
+
+    run_id = allocate_run_id()
+    run_path = RUNS_DIR / run_id
+    run_path.mkdir(parents=True, exist_ok=True)
+
+    feature_request_path = run_path / "feature_request_input.md"
+    feature_request_path.write_text(feature_request_text)
+
+    state = {
+        "run_id": run_id,
+        "status": "queued",
+        "current_step": "queued",
+        "fix_iteration": 0,
+        "artifacts": [],
+        "upgrade_mode": True,
+        "existing_app": existing_app,
+        "selected_feature_sprint": selected_feature_sprint,
+        "feature_plan_only": feature_plan_only,
+        "no_deepseek": no_deepseek,
+    }
+    (run_path / "run_state.json").write_text(json.dumps(state, indent=2))
+
+    run_pipeline_upgrade_async(
+        run_id, existing_app, str(feature_request_path),
+        selected_feature_sprint, feature_plan_only, no_deepseek,
+    )
+
+    return jsonify({"run_id": run_id, "status": "queued"}), 201
+
+
+def create_continuation_run(body: dict):
+    """Sprint Continuation payload → pre-allocated run + --continue-run/--continue-sprint CLI.
+
+    Defaults continue_plan_only/no_deepseek to True — actual continuation builds
+    aren't fully tested yet, so plan-only is the safe default until a user opts out.
+    """
+    continue_run = (body.get("continue_run") or "").strip()
+    if not continue_run:
+        abort(400, "continue_run is required")
+    try:
+        continue_sprint = int(body.get("continue_sprint", 2))
+    except (TypeError, ValueError):
+        continue_sprint = 2
+    continue_plan_only = bool(body.get("continue_plan_only", True))
+    no_deepseek = bool(body.get("no_deepseek", True))
+
+    run_id = allocate_run_id()
+    run_path = RUNS_DIR / run_id
+    run_path.mkdir(parents=True, exist_ok=True)
+
+    state = {
+        "run_id": run_id,
+        "status": "queued",
+        "current_step": "queued",
+        "fix_iteration": 0,
+        "artifacts": [],
+        "continue_run": continue_run,
+        "continue_sprint": continue_sprint,
+        "continue_plan_only": continue_plan_only,
+        "no_deepseek": no_deepseek,
+    }
+    (run_path / "run_state.json").write_text(json.dumps(state, indent=2))
+
+    run_pipeline_continuation_async(
+        run_id, continue_run, continue_sprint, continue_plan_only, no_deepseek,
     )
 
     return jsonify({"run_id": run_id, "status": "queued"}), 201
