@@ -100,6 +100,9 @@ const ARTIFACT_LABELS: Record<string, string> = {
   "sprint_plan.json":                  "Sprint Plan JSON",
   "selected_sprint_scope.md":          "Selected Sprint Scope",
   "selected_sprint_build_prompt.txt":  "Selected Sprint Build Prompt",
+  "requirement_coverage_map.md":       "Requirement Coverage Map",
+  "requirement_coverage_map.json":     "Requirement Coverage Map JSON",
+  "sprint_coverage_check.txt":         "Sprint Coverage Check",
   "existing_app_inventory.md":         "Existing App Inventory",
   "baseline_health_check.md":          "Baseline Health Check",
   "existing_app_summary.md":           "Existing App Summary",
@@ -144,6 +147,9 @@ const ARTIFACT_ORDER = [
   "sprint_plan.json",
   "selected_sprint_scope.md",
   "selected_sprint_build_prompt.txt",
+  "requirement_coverage_map.md",
+  "requirement_coverage_map.json",
+  "sprint_coverage_check.txt",
   "sprint_1_scope.md",
   "sprint_1_build_prompt.txt",
   "requirements_consistency_check.txt",
@@ -770,7 +776,11 @@ interface SprintEntry {
   number: number;
   title: string;
   goal?: string;
+  requirements_covered?: Array<{ id?: string; title?: string } | string>;
+  build_items?: string[];
+  not_included?: string[];
   user_visible_result?: string;
+  completion_criteria?: string[];
   dependencies?: number[];
   independently_demoable?: boolean;
   build_now?: boolean;
@@ -855,6 +865,14 @@ function SprintCards({ sprints, selected, onRun, launching, canRun, builtSprints
             : deps.length === 0 && s.build_now
             ? "Ready to run · Recommended first"
             : "Ready to run";
+          const requirements = (s.requirements_covered ?? []).map(requirement =>
+            typeof requirement === "string"
+              ? { id: "", title: requirement }
+              : { id: requirement.id ?? "", title: requirement.title ?? "" }
+          );
+          const requirementLabels = requirements.map(r => r.id || r.title).filter(Boolean);
+          const visibleRequirementLabels = requirementLabels.slice(0, 4);
+          const buildItems = (s.build_items ?? []).filter(Boolean).slice(0, 4);
           return (
             <div key={s.number} className={`sprint-card ${s.number === selected ? "sprint-card-selected" : ""}`}>
               <div className="sc2-top">
@@ -864,6 +882,21 @@ function SprintCards({ sprints, selected, onRun, launching, canRun, builtSprints
               </div>
               <div className="sc2-title">{s.title}</div>
               {s.goal && <div className="sc2-goal">{s.goal}</div>}
+              {!!visibleRequirementLabels.length && (
+                <div className="sc2-requirements">
+                  <span className="sc2-detail-label">Requirements</span>
+                  <div className="sc2-requirement-pills">
+                    {visibleRequirementLabels.map((label, i) => <span key={`${label}-${i}`} className="sc2-requirement-pill">{label}</span>)}
+                    {requirementLabels.length > 4 && <span className="sc2-requirement-more">+{requirementLabels.length - 4}</span>}
+                  </div>
+                </div>
+              )}
+              {!!buildItems.length && (
+                <div className="sc2-builds">
+                  <span className="sc2-detail-label">Builds</span>
+                  <ul>{buildItems.map((item, i) => <li key={i}>{item}</li>)}</ul>
+                </div>
+              )}
               {s.user_visible_result && (
                 <div className="sc2-output"><span>Output:</span> {s.user_visible_result}</div>
               )}
@@ -1849,10 +1882,11 @@ function UpgradePanel({ onCreated, onCancel }: { onCreated: (id: string) => void
           <textarea className="input-textarea expand-textarea" value={featureRequest} onChange={e => setFeatureRequest(e.target.value)}
             placeholder="Describe the features to add to this app..." rows={5} disabled={loading} />
         </label>
-        <label className="expand-field expand-field-inline">
-          <span className="expand-field-label">Selected sprint</span>
+        <label className="expand-field">
+          <span className="expand-field-label">Feature sprint to select</span>
           <input className="expand-input expand-input-num" type="number" min={1} max={12} value={selectedSprint}
             onChange={e => setSelectedSprint(Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)))} disabled={loading} />
+          <span className="expand-field-help">The pipeline scans the app and creates a feature sprint plan first. Leave this as 1 unless you already know you want a later feature sprint.</span>
         </label>
         <div className="expand-checkboxes">
           <label className="expand-checkbox">
@@ -1913,10 +1947,11 @@ function ContinuationPanel({ onCreated, onCancel }: { onCreated: (id: string) =>
           <input className="expand-input" value={sourceRun} onChange={e => setSourceRun(e.target.value)}
             placeholder="runs/run_049" disabled={loading} autoFocus />
         </label>
-        <label className="expand-field expand-field-inline">
-          <span className="expand-field-label">Continue sprint</span>
+        <label className="expand-field">
+          <span className="expand-field-label">Next sprint number</span>
           <input className="expand-input expand-input-num" type="number" min={1} max={12} value={continueSprint}
             onChange={e => setContinueSprint(Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)))} disabled={loading} />
+          <span className="expand-field-help">This uses the source run’s preserved sprint plan. If Sprint 1 is complete, choose 2.</span>
         </label>
         <div className="expand-checkboxes">
           <label className="expand-checkbox">
@@ -2121,7 +2156,7 @@ function InputView({ mode, onBack, onCreated }: { mode: EntryMode; onBack: () =>
               <details className="run-mode-advanced">
                 <summary>Advanced: default sprint (optional)</summary>
                 <div className="run-mode-sprint-pick">
-                  <label htmlFor="selected-sprint-input">Default selected sprint</label>
+                  <label htmlFor="selected-sprint-input">Sprint to build after planning</label>
                   <input
                     id="selected-sprint-input" type="number" min={1} max={12}
                     value={selectedSprintInput}
@@ -2130,7 +2165,7 @@ function InputView({ mode, onBack, onCreated }: { mode: EntryMode; onBack: () =>
                   />
                 </div>
                 <p className="run-mode-hint">
-                  The architect decides the full sprint plan. This number only affects which sprint's scope doc is pre-generated — you'll pick a sprint to build from the plan itself afterward.
+                  The roadmap is generated first, then only this sprint is built or prepared.
                 </p>
               </details>
             )}

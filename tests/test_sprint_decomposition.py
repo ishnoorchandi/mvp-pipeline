@@ -29,6 +29,13 @@ from pipeline_mvp_builder import (
     SprintPlanParseError,
     render_sprint_plan_markdown,
     render_sprint_plan_terminal,
+    build_requirement_coverage_map,
+    reconcile_sprint_requirement_ids,
+    reconcile_sprint_requirement_coverage,
+    repair_missing_sprint_requirement_coverage,
+    render_requirement_coverage_map_markdown,
+    render_sprint_coverage_check,
+    _extract_source_jira_requirements,
     generate_selected_sprint_build_prompt,
     detect_negative_constraints,
     check_requirements_consistency,
@@ -527,6 +534,334 @@ def test_future_sprints_not_included_as_build_instructions_in_complex_plan():
     print("PASS: in an 8-sprint complex plan, sprints 2-8 are reference-only, never build instructions")
 
 
+def test_requirement_coverage_map_preserves_jira_ids_and_repairs_missing():
+    source = (
+        "# Dashboard\nATS-29 — KPI Summary Cards\nATS-30 — Approval Queue\n"
+        "# Progress\nATS-39 — NDA Signature Tracking\n"
+    )
+    plan = normalize_sprint_plan({"sprints": [
+        {"number": 1, "requirements_covered": [
+            {"id": "ATS-29", "title": "KPI Summary Cards"},
+            {"id": "ATS-30", "title": "Approval Queue"},
+        ]},
+    ]})
+    coverage = build_requirement_coverage_map(source, plan)
+    by_id = {item["id"]: item for item in coverage["coverage_items"]}
+    assert by_id["ATS-29"]["covered_by_sprints"] == [1]
+    assert by_id["ATS-39"]["coverage_status"] == "covered"
+    markdown = render_requirement_coverage_map_markdown(coverage)
+    assert "| ATS-29 | KPI Summary Cards | Dashboard | Sprint 1 | covered |" in markdown
+    ok, report = render_sprint_coverage_check(source, json.dumps(coverage))
+    assert ok is True
+    assert "Result: PASS" in report and "Missing IDs: none" in report
+    print("PASS: coverage map preserves Jira IDs and deterministically repairs omissions")
+
+
+def test_model_renumbered_ids_are_restored_to_source_ids_and_pass_coverage():
+    source = (
+        "# OneATS Stories\n"
+        "ATS-29 — Dashboard KPI Cards\n"
+        "ATS-30 — Approval Queue\n"
+        "ATS-31 — Job Requisitions\n"
+    )
+    model_plan = normalize_sprint_plan({"sprints": [
+        {
+            "number": 1,
+            "requirements_covered": [
+                {"id": "ATS-1", "title": "Dashboard KPI Cards"},
+                {"id": "ATS-2", "title": "Approval Queue"},
+            ],
+            "build_items": ["KPI cards", "Approval queue"],
+            "not_included": ["Requisition workflow"],
+            "completion_criteria": ["Dashboard stories render"],
+        },
+        {
+            "number": 2,
+            "requirements_covered": [
+                {"id": "ATS-3", "title": "Job Requisitions"},
+            ],
+        },
+    ]})
+
+    reconciled = reconcile_sprint_requirement_ids(source, model_plan)
+    reconciled_ids = [
+        requirement["id"]
+        for sprint in reconciled["sprints"]
+        for requirement in sprint["requirements_covered"]
+    ]
+    assert reconciled_ids == ["ATS-29", "ATS-30", "ATS-31"]
+
+    plan_json = json.dumps(reconciled)
+    plan_md = render_sprint_plan_markdown(reconciled)
+    coverage = build_requirement_coverage_map(source, reconciled)
+    coverage_json = json.dumps(coverage)
+    coverage_md = render_requirement_coverage_map_markdown(coverage)
+    for requirement_id in ("ATS-29", "ATS-30", "ATS-31"):
+        assert requirement_id in plan_json
+        assert requirement_id in plan_md
+        assert requirement_id in coverage_json
+        assert requirement_id in coverage_md
+    for invented_id in ("ATS-1", "ATS-2", "ATS-3"):
+        assert f'"{invented_id}"' not in plan_json
+        assert f"| {invented_id} |" not in coverage_md
+
+    ok, report = render_sprint_coverage_check(source, plan_json, plan_md, coverage_json)
+    assert ok is True
+    assert "Covered IDs: ATS-29, ATS-30, ATS-31" in report
+    assert "Missing IDs: none" in report
+    assert "Result: PASS" in report
+    print("PASS: model-renumbered ATS-1/2/3 IDs are restored to ATS-29/30/31 everywhere")
+
+
+def test_detailed_jira_blocks_override_header_ranges_and_attach_exact_titles():
+    source = """OneATS User Stories
+Stories: ATS-29 to ATS-44
+Generated on June 1, 2026
+ATS-44 | Appearance summary row from page header
+
+1. Dashboard KPI Summary Cards
+Jira: ATS-29 | Feature: Dashboard | Role: Admin
+As an Admin, I want KPI cards so that I can see recruiting activity.
+Acceptance Criteria:
+- Four KPI cards are visible.
+
+2. Approval Queue with Inline Actions
+Jira: ATS-30 | Feature: Dashboard | Role: Admin
+As an Admin, I want inline approval actions.
+Acceptance Criteria:
+- Approve and reject actions update the row.
+
+14. User & Role Management – View, Edit, and Invite Users
+Jira: ATS-42 | Feature: Users & Roles | Role: Admin
+As an Admin, I want to manage users and roles.
+Acceptance Criteria:
+- Users can be invited.
+
+15. Account Profile Management
+Jira: ATS-43 | Feature: Settings | Role: User
+As a User, I want to update my account profile.
+Acceptance Criteria:
+- Profile changes can be saved.
+
+16. Appearance / Dark Mode / Accent Themes
+Jira: ATS-44 | Feature: Settings | Role: User
+As a User, I want to configure appearance.
+Acceptance Criteria:
+- Dark mode and accent themes can be selected.
+"""
+    extracted = _extract_source_jira_requirements(source)
+    assert [item["id"] for item in extracted] == ["ATS-29", "ATS-30", "ATS-42", "ATS-43", "ATS-44"]
+    titles = {item["id"]: item["title"] for item in extracted}
+    assert titles == {
+        "ATS-29": "Dashboard KPI Summary Cards",
+        "ATS-30": "Approval Queue with Inline Actions",
+        "ATS-42": "User & Role Management – View, Edit, and Invite Users",
+        "ATS-43": "Account Profile Management",
+        "ATS-44": "Appearance / Dark Mode / Accent Themes",
+    }
+    assert extracted[-1]["title"] != "Appearance summary row from page header"
+    assert extracted[2]["source_area"] == "Users & Roles"
+    assert extracted[2]["role"] == "Admin"
+    assert extracted[2]["story_text"].startswith("As an Admin")
+    assert extracted[2]["acceptance_criteria"] == ["Users can be invited."]
+
+    plan = normalize_sprint_plan({"sprints": [{
+        "number": 1,
+        "requirements_covered": [
+            {"id": item["id"], "title": item["title"]} for item in extracted
+        ],
+    }]})
+    coverage = build_requirement_coverage_map(source, plan)
+    assert coverage["coverage_summary"] == {
+        "total_items": 5, "covered_items": 5, "uncovered_items": 0, "deferred_items": 0,
+    }
+    ok, report = render_sprint_coverage_check(source, json.dumps(plan), json.dumps(coverage))
+    assert ok is True
+    assert "Covered IDs: ATS-29, ATS-30, ATS-42, ATS-43, ATS-44" in report
+    assert "Missing IDs: none" in report
+    assert "Result: PASS" in report
+    print("PASS: detailed Jira blocks override range/header metadata and preserve exact story titles")
+
+
+def test_semantic_reconciliation_repairs_shifted_missing_and_deferred_coverage():
+    source = """1. Job Requisition – Create, View, and Search Requisitions
+Jira: ATS-31 | Feature: Requisitions | Role: Admin
+As an Admin, I want to create, view, and search requisitions.
+Acceptance Criteria:
+- A requisition modal and searchable requisition list are available.
+
+2. AI Requisition Auto-Approval
+Jira: ATS-32 | Feature: Requisitions | Role: Admin
+As an Admin, I want AI review and automatic requisition approval.
+Acceptance Criteria:
+- Requisitions can be auto-approved.
+
+3. AI Resume Matching
+Jira: ATS-33 | Feature: Candidates | Role: Recruiter
+As a Recruiter, I want ranked candidates and match scores.
+Acceptance Criteria:
+- Resume matching displays a match score.
+
+4. Interview & Progress Tracking
+Jira: ATS-37 | Feature: Progress | Role: Recruiter
+As a Recruiter, I want interview schedules and progress tracking.
+Acceptance Criteria:
+- Interview tracking updates candidate progress.
+
+5. Offer Approval Workflow
+Jira: ATS-38 | Feature: Approvals | Role: Admin
+As an Admin, I want to approve offers or send them back.
+Acceptance Criteria:
+- Offer approval actions are available.
+
+6. Settings – Appearance: Dark Mode and Accent Colour Themes
+Jira: ATS-44 | Feature: Settings | Role: User
+As a User, I want appearance and theme customization.
+Acceptance Criteria:
+- Dark mode and accent colour themes can be selected.
+"""
+    bad_plan = normalize_sprint_plan({
+        "deferred_requirements": [
+            {"id": "ATS-31", "title": "Job Requisition", "reason": "Later"},
+            {"id": "ATS-37", "title": "Interview Tracking", "reason": "Later"},
+            {"id": "ATS-44", "title": "Appearance", "reason": "Later"},
+        ],
+        "sprints": [
+            {"number": 1, "title": "Requisition Workspace", "goal": "Create, view, and search job requisitions.",
+             "requirements_covered": [{"id": "ATS-32", "title": "AI Requisition Auto-Approval"}],
+             "build_items": ["Requisition creation modal", "Searchable requisition list"]},
+            {"number": 2, "title": "AI Requisition Review", "goal": "Add AI auto-approval for requisitions.",
+             "requirements_covered": [{"id": "ATS-33", "title": "AI Resume Matching"}],
+             "build_items": ["AI review", "Auto-approved requisition state"]},
+            {"number": 3, "title": "Resume Matching", "goal": "Rank candidates using AI resume matching.",
+             "requirements_covered": [], "build_items": ["Ranked candidates", "Match score"]},
+            {"number": 4, "title": "Interview Tracking", "goal": "Track interview schedules and candidate progress.",
+             "requirements_covered": [{"id": "ATS-38", "title": "Offer Approval Workflow"}],
+             "build_items": ["Interview schedule", "Progress tracking"]},
+            {"number": 5, "title": "Offer Approval", "goal": "Approve offers or send offers back.",
+             "requirements_covered": [], "build_items": ["Offer approval actions"]},
+            {"number": 6, "title": "Appearance Customization", "goal": "Add dark mode and accent color themes.",
+             "requirements_covered": [], "build_items": ["Theme customization"]},
+        ],
+    })
+
+    repaired = reconcile_sprint_requirement_ids(source, bad_plan)
+    repaired = reconcile_sprint_requirement_coverage(source, repaired)
+    ids_by_sprint = {
+        sprint["number"]: [item["id"] for item in sprint["requirements_covered"]]
+        for sprint in repaired["sprints"]
+    }
+    assert ids_by_sprint == {
+        1: ["ATS-31"], 2: ["ATS-32"], 3: ["ATS-33"],
+        4: ["ATS-37"], 5: ["ATS-38"], 6: ["ATS-44"],
+    }
+    assert repaired["deferred_requirements"] == []
+
+    coverage = build_requirement_coverage_map(source, repaired)
+    assert coverage["coverage_summary"]["covered_items"] == 6
+    assert coverage["coverage_summary"]["uncovered_items"] == 0
+    plan_text = json.dumps(repaired)
+    coverage_text = json.dumps(coverage)
+    ok, report = render_sprint_coverage_check(source, plan_text, coverage_text)
+    assert ok is True
+    assert "Missing IDs: none" in report
+    assert "Result: PASS" in report
+    print("PASS: semantic reconciliation repairs shifted, missing, and incorrectly deferred Jira coverage")
+
+
+def test_missing_requirement_repair_attaches_or_creates_sprints_and_passes_coverage():
+    source = """1. Candidate Submissions Tracker
+Jira: ATS-35 | Feature: Candidates | Role: Recruiter
+As a Recruiter, I want to track all candidate submissions.
+Acceptance Criteria:
+- All submissions are visible across recruiters.
+
+2. Interview & Progress Tracking
+Jira: ATS-37 | Feature: Progress | Role: Recruiter
+As a Recruiter, I want interview schedules and progress tracking.
+Acceptance Criteria:
+- Interview status updates candidate progress.
+
+3. Offer Approval Workflow
+Jira: ATS-38 | Feature: Approvals | Role: Admin
+As an Admin, I want to approve or send back offers.
+Acceptance Criteria:
+- Offer approval actions update status.
+
+4. Placement Approval and Automatic Document Handoff
+Jira: ATS-40 | Feature: Placements | Role: Admin
+As an Admin, I want placement approval and document handoff.
+Acceptance Criteria:
+- Approved placements automatically hand off documents.
+
+5. Candidate Document Management
+Jira: ATS-41 | Feature: Documents | Role: Recruiter
+As a Recruiter, I want to attach required candidate documents.
+Acceptance Criteria:
+- Required candidate documents can be attached and reviewed.
+"""
+    bad_plan = normalize_sprint_plan({"sprints": [
+        {"number": 1, "title": "Candidate Management", "goal": "Add and view candidate profiles.",
+         "requirements_covered": [], "build_items": ["Candidate profile workspace"]},
+        {"number": 2, "title": "Duplicate Candidate Detection", "goal": "Detect and merge duplicate candidates.",
+         "requirements_covered": [], "build_items": ["Duplicate detection", "Merge candidates"]},
+        {"number": 3, "title": "User Management", "goal": "Invite users and manage roles.",
+         "requirements_covered": [], "build_items": ["User invitations", "Role management"]},
+        {"number": 4, "title": "Settings", "goal": "Manage profile and appearance settings.",
+         "requirements_covered": [], "build_items": ["Account profile", "Dark mode"]},
+    ]})
+
+    repaired = repair_missing_sprint_requirement_coverage(source, bad_plan)
+    all_ids = [
+        requirement["id"]
+        for sprint in repaired["sprints"]
+        for requirement in sprint["requirements_covered"]
+        if isinstance(requirement, dict)
+    ]
+    assert set(all_ids) == {"ATS-35", "ATS-37", "ATS-38", "ATS-40", "ATS-41"}
+    assert repaired["total_sprints"] == len(repaired["sprints"])
+    assert repaired["recommended_sprint_count"] == len(repaired["sprints"])
+    assert [sprint["number"] for sprint in repaired["sprints"]] == list(range(1, len(repaired["sprints"]) + 1))
+
+    for requirement_id in all_ids:
+        sprint = next(
+            sprint for sprint in repaired["sprints"]
+            if any(isinstance(item, dict) and item.get("id") == requirement_id for item in sprint["requirements_covered"])
+        )
+        assert sprint["build_items"], f"{requirement_id} repair must add a build item"
+        assert sprint["completion_criteria"], f"{requirement_id} repair must add completion criteria"
+
+    plan_md = render_sprint_plan_markdown(repaired)
+    for requirement_id in ("ATS-35", "ATS-37", "ATS-38", "ATS-40", "ATS-41"):
+        assert requirement_id in plan_md
+    coverage = build_requirement_coverage_map(source, repaired)
+    ok, report = render_sprint_coverage_check(source, json.dumps(repaired), json.dumps(coverage), plan_md)
+    assert ok is True
+    assert coverage["coverage_summary"]["uncovered_items"] == 0
+    assert "Missing IDs: none" in report
+    assert "Result: PASS" in report
+    print("PASS: omitted source stories attach/create concrete sprints and produce PASS coverage")
+
+
+def test_new_sprint_fields_are_normalized_and_rendered():
+    plan = normalize_sprint_plan({"sprints": [{
+        "number": 1,
+        "title": "Dashboard Shell",
+        "requirements_covered": [{"id": "ATS-29", "title": "KPI Cards"}],
+        "build_items": ["Four KPI cards", "Approval queue"],
+        "not_included": ["Persistence"],
+        "completion_criteria": ["All KPI cards render"],
+    }]})
+    sprint = plan["sprints"][0]
+    assert sprint["requirements_covered"][0]["id"] == "ATS-29"
+    markdown = render_sprint_plan_markdown(plan)
+    assert "**Requirements covered:**" in markdown
+    assert "- ATS-29 — KPI Cards" in markdown
+    assert "**What will be built:**" in markdown
+    assert "**Completion criteria:**" in markdown
+    print("PASS: new sprint specificity fields normalize and render without removing old fields")
+
+
 if __name__ == "__main__":
     # 1. Sprint plan JSON parser can select Sprint 1
     test_parse_sprint_plan_json_basic()
@@ -575,5 +910,13 @@ if __name__ == "__main__":
     test_sprint_plan_prompt_steers_sprint_1_toward_visual_shell()
     test_sprint_plan_prompt_discourages_narrow_sprint_1()
     test_sprint_plan_prompt_includes_recruiting_workspace_example()
+
+    # Requirement coverage and richer sprint schema
+    test_requirement_coverage_map_preserves_jira_ids_and_repairs_missing()
+    test_model_renumbered_ids_are_restored_to_source_ids_and_pass_coverage()
+    test_detailed_jira_blocks_override_header_ranges_and_attach_exact_titles()
+    test_semantic_reconciliation_repairs_shifted_missing_and_deferred_coverage()
+    test_missing_requirement_repair_attaches_or_creates_sprints_and_passes_coverage()
+    test_new_sprint_fields_are_normalized_and_rendered()
 
     print("\nALL TESTS PASSED")

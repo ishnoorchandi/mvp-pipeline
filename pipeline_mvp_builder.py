@@ -1001,6 +1001,17 @@ not the smallest technically-first task.
   with no UI).
 
 Other sprint design rules:
+- Before assigning any sprint, extract EVERY major requirement, user story, Jira key, feature, and
+  acceptance-criteria group from the clean requirements. Treat this as a coverage checklist.
+- If Jira-style IDs are present (for example ATS-29), EVERY ID must appear in at least one sprint's
+  requirements_covered list. Preserve the exact ID and its requirement title.
+- Do not silently drop requirements or swallow a major workflow inside a vague "integration",
+  "testing", or "polish" sprint. Progress tracking, approvals, signatures, placements, documents,
+  settings, and similarly distinct workflows must be named explicitly when the source requires them.
+- Every sprint must state exactly which requirements it covers and list concrete UI/workflow/API
+  build items. Complex apps must not compress unrelated workflows into one vague sprint.
+- If a source requirement is intentionally outside the current roadmap, include it in
+  deferred_requirements with an ID/title and a specific reason. Never omit it.
 - Each later sprint must build on top of previous sprints without requiring a rewrite of earlier work.
 - Each sprint must be independently buildable by Claude Code in a single run without needing human \
   design decisions mid-build.
@@ -1035,14 +1046,23 @@ Output STRICT JSON ONLY — no markdown fences, no prose before or after — mat
   "recommended_sprint_count": <integer 2-12>,
   "reason_for_sprint_count": "<1-3 sentences: the specific complexity factors that drove this count>",
   "total_sprints": <integer, must equal recommended_sprint_count and the number of sprints below>,
+  "deferred_requirements": [
+    {"id": "<source ID or stable short ID>", "title": "<requirement title>", "reason": "<why deferred>"}
+  ],
   "sprints": [
     {
       "number": 1,
       "title": "<short sprint title>",
       "goal": "<1-2 sentences: what this sprint accomplishes>",
       "why_this_order": "<1-2 sentences: why this sprint comes at this point in the sequence>",
+      "requirements_covered": [
+        {"id": "<Jira key or stable requirement ID>", "title": "<exact requirement/story title>"}
+      ],
+      "build_items": ["<specific screen, interaction, workflow, API, or state being built>", "..."],
+      "not_included": ["<specific nearby capability intentionally left for a later sprint>", "..."],
       "files_modules_touched": ["<file or module path>", "..."],
       "user_visible_result": "<what a user/demo audience will actually see and be able to do>",
+      "completion_criteria": ["<observable, testable completion condition>", "..."],
       "smoke_checks": ["<concrete check, e.g. 'npm run build succeeds'>", "..."],
       "dependencies": [],
       "independently_demoable": true,
@@ -1059,6 +1079,12 @@ Field rules:
   concerns."), not a generic restatement of the number.
 - "dependencies" is a list of sprint numbers (integers) this sprint requires to already be built. \
   Sprint 1 must have an empty dependencies list.
+- "requirements_covered" must name every source requirement assigned to the sprint. Across all
+  sprints plus deferred_requirements, every extracted source requirement must appear at least once.
+- "build_items" must contain concrete product work, not generic labels such as "implement features"
+  or "integration and testing". "completion_criteria" must be observable and testable.
+- "not_included" distinguishes later work from accidental omission; use an empty list when nothing
+  nearby needs clarification.
 - "independently_demoable" is true only if this sprint alone produces something a person could look \
   at and understand, even with no later sprints built.
 - "build_now" is your own recommendation for which sprint should be built first — normally true only \
@@ -1101,8 +1127,12 @@ _SPRINT_FIELD_DEFAULTS = {
     "title": "",
     "goal": "",
     "why_this_order": "",
+    "requirements_covered": [],
+    "build_items": [],
+    "not_included": [],
     "files_modules_touched": [],
     "user_visible_result": "",
+    "completion_criteria": [],
     "smoke_checks": [],
     "dependencies": [],
     "independently_demoable": False,
@@ -1139,6 +1169,15 @@ def normalize_sprint_plan(data: dict) -> dict:
         except (TypeError, ValueError):
             entry["number"] = i + 1
         entry["files_modules_touched"] = _coerce_list(entry["files_modules_touched"])
+        entry["requirements_covered"] = _coerce_list(entry["requirements_covered"])
+        entry["requirements_covered"] = [
+            {"id": str(r.get("id") or "").strip(), "title": str(r.get("title") or "").strip()}
+            if isinstance(r, dict) else {"id": "", "title": str(r).strip()}
+            for r in entry["requirements_covered"] if r
+        ]
+        entry["build_items"] = [str(v).strip() for v in _coerce_list(entry["build_items"]) if str(v).strip()]
+        entry["not_included"] = [str(v).strip() for v in _coerce_list(entry["not_included"]) if str(v).strip()]
+        entry["completion_criteria"] = [str(v).strip() for v in _coerce_list(entry["completion_criteria"]) if str(v).strip()]
         entry["smoke_checks"] = _coerce_list(entry["smoke_checks"])
         entry["dependencies"] = [int(d) for d in _coerce_list(entry["dependencies"])
                                   if str(d).strip().lstrip("-").isdigit()]
@@ -1165,6 +1204,7 @@ def normalize_sprint_plan(data: dict) -> dict:
         "recommended_sprint_count": recommended_sprint_count,
         "reason_for_sprint_count": reason_for_sprint_count,
         "total_sprints": data.get("total_sprints", len(normalized)),
+        "deferred_requirements": _coerce_list(data.get("deferred_requirements")),
         "sprints": normalized,
     }
 
@@ -1217,6 +1257,611 @@ def select_sprint(sprint_plan_json: dict, selected_sprint_number: int) -> dict:
     )
 
 
+_JIRA_REQUIREMENT_ID_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,15}-\d+)\b", re.IGNORECASE)
+
+
+def _requirement_title_from_line(line: str, requirement_id: str) -> str:
+    """Best-effort title extraction for Jira-style stories. Deterministic, no GPT call."""
+    title = re.sub(re.escape(requirement_id), "", line, count=1, flags=re.IGNORECASE)
+    title = re.sub(r"^[\s#>*_`\-:|.\d)]+|[\s*_`|]+$", "", title).strip(" —–-:")
+    return title or requirement_id
+
+
+def _extract_source_jira_requirements(source_text: str) -> list[dict]:
+    """Extract authoritative Jira stories while preserving each source ID exactly.
+
+    Detailed ``Jira: KEY | Feature: ... | Role: ...`` blocks win over every summary,
+    header, and range elsewhere in the document. Broad line scanning is retained only
+    for documents that do not contain those detailed story anchors.
+    """
+    lines = (source_text or "").splitlines()
+    jira_anchor_re = re.compile(
+        r"\bJira\s*:\s*([A-Z][A-Z0-9]{1,15}-\d+)"
+        r"(?:\s*\|\s*Feature\s*:\s*([^|]+?))?"
+        r"(?:\s*\|\s*Role\s*:\s*(.+?))?\s*$",
+        re.IGNORECASE,
+    )
+    numbered_title_re = re.compile(r"^\s*\d{1,3}[.)]\s+(.+?)\s*$")
+    anchors = [(i, jira_anchor_re.search(line)) for i, line in enumerate(lines)]
+    anchors = [(i, match) for i, match in anchors if match]
+
+    if anchors:
+        detailed_items: list[dict] = []
+        seen_detailed_ids: set[str] = set()
+        title_indices: list[int | None] = []
+        previous_anchor_index = -1
+        for line_index, _match in anchors:
+            title_index = None
+            for candidate_index in range(line_index - 1, previous_anchor_index, -1):
+                if numbered_title_re.match(lines[candidate_index]):
+                    title_index = candidate_index
+                    break
+            title_indices.append(title_index)
+            previous_anchor_index = line_index
+
+        for anchor_position, ((line_index, match), title_index) in enumerate(zip(anchors, title_indices)):
+            requirement_id = match.group(1).upper()
+            if requirement_id in seen_detailed_ids:
+                continue
+            seen_detailed_ids.add(requirement_id)
+            feature = (match.group(2) or "").strip()
+            role = (match.group(3) or "").strip()
+            title_match = numbered_title_re.match(lines[title_index]) if title_index is not None else None
+            title = title_match.group(1).strip() if title_match else feature or requirement_id
+
+            next_title_index = title_indices[anchor_position + 1] if anchor_position + 1 < len(title_indices) else None
+            next_anchor_index = anchors[anchor_position + 1][0] if anchor_position + 1 < len(anchors) else len(lines)
+            block_end = next_title_index if next_title_index is not None and next_title_index > line_index else next_anchor_index
+            block_lines = lines[line_index + 1:block_end]
+
+            story_parts: list[str] = []
+            acceptance_criteria: list[str] = []
+            in_acceptance_criteria = False
+            for block_line in block_lines:
+                stripped = block_line.strip()
+                if not stripped:
+                    continue
+                if re.match(r"^acceptance\s+criteria\s*:?\s*$", stripped, re.IGNORECASE):
+                    in_acceptance_criteria = True
+                    continue
+                if in_acceptance_criteria:
+                    criterion = re.sub(r"^[\s•*\-–—\d.)]+", "", stripped).strip()
+                    if criterion:
+                        acceptance_criteria.append(criterion)
+                elif re.match(r"^As\s+an?\b", stripped, re.IGNORECASE) or story_parts:
+                    story_parts.append(stripped)
+
+            detailed_items.append({
+                "id": requirement_id,
+                "title": title,
+                "source_area": feature or "General",
+                "role": role,
+                "story_text": " ".join(story_parts),
+                "acceptance_criteria": acceptance_criteria,
+            })
+        return detailed_items
+
+    source_items: list[dict] = []
+    seen_ids: set[str] = set()
+    current_area = "General"
+    for line in lines:
+        heading = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", line)
+        if heading:
+            current_area = heading.group(1).strip()
+        # Range headers are metadata, not story definitions. In particular, do not
+        # treat ATS-44 in "Stories: ATS-29 to ATS-44" as a title-bearing story row.
+        if re.search(r"\bStories\s*:\s*[A-Z][A-Z0-9]+-\d+\s+(?:to|through|[-–—])\s+[A-Z][A-Z0-9]+-\d+", line, re.IGNORECASE):
+            continue
+        if re.search(r"\b(?:generated|created|updated)\s+(?:on|at)\b", line, re.IGNORECASE):
+            continue
+        if re.match(r"^\s*Page\s+\d+(?:\s+of\s+\d+)?\s*$", line, re.IGNORECASE):
+            continue
+        for match in _JIRA_REQUIREMENT_ID_RE.finditer(line):
+            requirement_id = match.group(1).upper()
+            if requirement_id in seen_ids:
+                continue
+            seen_ids.add(requirement_id)
+            source_items.append({
+                "id": requirement_id,
+                "title": _requirement_title_from_line(line, requirement_id),
+                "source_area": current_area,
+            })
+    return source_items
+
+
+def _requirement_title_tokens(value: str) -> set[str]:
+    """Meaningful lowercase title tokens used for deterministic source-title matching."""
+    stopwords = {"a", "an", "and", "for", "in", "of", "the", "to", "with"}
+    return {
+        token for token in re.findall(r"[a-z0-9]+", (value or "").lower())
+        if len(token) > 1 and token not in stopwords
+    }
+
+
+def reconcile_sprint_requirement_ids(source_text: str, sprint_plan_json: dict) -> dict:
+    """Replace model-renumbered Jira IDs with authoritative source IDs.
+
+    Models sometimes turn ATS-29..ATS-44 into ATS-1..ATS-16. Exact source IDs already
+    present are never changed. Invalid same-project IDs are matched by title where possible,
+    then by first appearance against the remaining source IDs. An invented Jira ID is cleared
+    rather than persisted when no authoritative source ID remains.
+    """
+    source_items = _extract_source_jira_requirements(source_text)
+    if not source_items:
+        return sprint_plan_json
+
+    reconciled = json.loads(json.dumps(sprint_plan_json))
+    source_by_id = {item["id"]: item for item in source_items}
+    source_prefixes = {item["id"].rsplit("-", 1)[0] for item in source_items}
+    requirement_refs = [
+        requirement
+        for sprint in reconciled.get("sprints", [])
+        for requirement in sprint.get("requirements_covered") or []
+        if isinstance(requirement, dict)
+    ]
+    requirement_refs += [
+        requirement for requirement in reconciled.get("deferred_requirements") or []
+        if isinstance(requirement, dict)
+    ]
+
+    # Reserve IDs the model preserved correctly before assigning replacements by order.
+    used_source_ids = {
+        str(requirement.get("id") or "").strip().upper()
+        for requirement in requirement_refs
+        if str(requirement.get("id") or "").strip().upper() in source_by_id
+    }
+    remaining_ids = [item["id"] for item in source_items if item["id"] not in used_source_ids]
+    renumbered_map: dict[str, str] = {}
+
+    for requirement in requirement_refs:
+        raw_id = str(requirement.get("id") or "").strip().upper()
+        title = str(requirement.get("title") or "").strip()
+        # Also handle loose model output normalized from "ATS-1 — Story title" strings.
+        embedded = _JIRA_REQUIREMENT_ID_RE.search(title)
+        if not raw_id and embedded:
+            raw_id = embedded.group(1).upper()
+            title = _requirement_title_from_line(title, raw_id)
+            requirement["title"] = title
+        if raw_id in source_by_id:
+            requirement["id"] = raw_id
+            requirement["title"] = source_by_id[raw_id]["title"]
+            continue
+
+        parsed = _JIRA_REQUIREMENT_ID_RE.fullmatch(raw_id)
+        prefix = raw_id.rsplit("-", 1)[0] if parsed else ""
+        if not parsed or prefix not in source_prefixes:
+            continue
+        if raw_id in renumbered_map:
+            requirement["id"] = renumbered_map[raw_id]
+            requirement["title"] = source_by_id[renumbered_map[raw_id]]["title"]
+            continue
+
+        title_tokens = _requirement_title_tokens(title)
+        best_id = None
+        best_score = 0.0
+        for candidate_id in remaining_ids:
+            candidate_tokens = _requirement_title_tokens(source_by_id[candidate_id]["title"])
+            if not title_tokens or not candidate_tokens:
+                continue
+            score = len(title_tokens & candidate_tokens) / len(title_tokens | candidate_tokens)
+            if score > best_score:
+                best_id, best_score = candidate_id, score
+        replacement = best_id if best_score >= 0.35 else (remaining_ids[0] if remaining_ids else None)
+        if replacement:
+            renumbered_map[raw_id] = replacement
+            requirement["id"] = replacement
+            requirement["title"] = source_by_id[replacement]["title"]
+            remaining_ids.remove(replacement)
+        else:
+            requirement["id"] = ""
+
+    return reconciled
+
+
+_SEMANTIC_REQUIREMENT_RULES = [
+    ("job requisition", ("create requisition", "requisition creation", "requisition modal", "requisition list", "view requisition", "search requisition", "requisition search")),
+    ("ai requisition auto approval", ("ai auto approval", "auto approval", "auto approve", "auto approved requisition", "ai review of requisition")),
+    ("ai resume matching", ("resume matching", "ai match", "ranked candidate", "match score")),
+    ("candidate management", ("candidate management", "candidate profile", "add candidate", "view candidate")),
+    ("candidate submissions tracker", ("submissions tracker", "all submissions", "cross recruiter submission", "candidate submission")),
+    ("duplicate candidate detection", ("duplicate detection", "duplicate candidate", "merge candidate", "candidate merge")),
+    ("interview and progress tracking", ("interview tracking", "progress tracking", "interview schedule", "candidate progress")),
+    ("offer approval workflow", ("offer approval", "approve offer", "send back offer", "offer workflow")),
+    ("nda and document signature tracking", ("nda", "signature tracking", "document signature", "send reminder", "expired document")),
+    ("placement approval and automatic document handoff", ("placement approval", "approve placement", "placement closure", "document handoff", "automatic handoff")),
+    ("candidate document management", ("candidate document", "attach document", "required document", "document management")),
+    ("user and role management", ("user management", "role management", "manage user", "invite user", "users and roles")),
+    ("account profile management", ("account profile", "save changes", "reset profile", "profile management")),
+    ("appearance", ("appearance", "dark mode", "accent color", "accent theme", "theme customization", "color theme")),
+]
+
+
+def _semantic_text(value: str) -> str:
+    text = (value or "").lower().replace("&", " and ").replace("colour", "color")
+    return " ".join(re.findall(r"[a-z0-9]+", text))
+
+
+def _sprint_semantic_texts(sprint: dict) -> tuple[str, str]:
+    primary_values = [
+        sprint.get("title", ""), sprint.get("goal", ""),
+        *(_coerce_list(sprint.get("build_items"))),
+        sprint.get("user_visible_result", ""),
+        *(_coerce_list(sprint.get("completion_criteria"))),
+    ]
+    requirement_titles = [
+        requirement.get("title", "") if isinstance(requirement, dict) else str(requirement)
+        for requirement in sprint.get("requirements_covered") or []
+    ]
+    return (
+        _semantic_text(" ".join(str(value) for value in primary_values if value)),
+        _semantic_text(" ".join(requirement_titles)),
+    )
+
+
+def _requirement_sprint_semantic_score(requirement: dict, sprint: dict) -> tuple[float, bool]:
+    """Return (score, strong_primary_match) without trusting requirement IDs."""
+    source_text = _semantic_text(" ".join([
+        str(requirement.get("title") or ""), str(requirement.get("source_area") or ""),
+        str(requirement.get("story_text") or ""),
+        " ".join(str(v) for v in requirement.get("acceptance_criteria") or []),
+    ]))
+    primary_text, secondary_titles = _sprint_semantic_texts(sprint)
+    score = 0.0
+    strong = False
+
+    for source_phrase, sprint_phrases in _SEMANTIC_REQUIREMENT_RULES:
+        if source_phrase not in source_text:
+            continue
+        primary_hits = sum(phrase in primary_text for phrase in sprint_phrases)
+        secondary_hits = sum(phrase in secondary_titles for phrase in sprint_phrases)
+        if primary_hits:
+            score += 10.0 + primary_hits
+            strong = True
+        score += secondary_hits * 0.25
+        break
+
+    source_tokens = _requirement_title_tokens(requirement.get("title", ""))
+    primary_tokens = _requirement_title_tokens(primary_text)
+    overlap = source_tokens & primary_tokens
+    if len(overlap) >= 2 and source_tokens:
+        overlap_ratio = len(overlap) / len(source_tokens)
+        score += overlap_ratio * 5.0
+        if overlap_ratio >= 0.45:
+            strong = True
+    return score, strong
+
+
+def reconcile_sprint_requirement_coverage(source_text: str, sprint_plan_json: dict) -> dict:
+    """Align canonical source Jira stories with the sprint work that describes them.
+
+    The model still chooses sprint structure, but source IDs/titles are rebuilt from the
+    detailed story catalog. Strong title/goal/build/output/criteria matches override shifted
+    IDs, add omitted coverage, and remove matched stories from deferred_requirements.
+    """
+    source_items = _extract_source_jira_requirements(source_text)
+    if not source_items:
+        return sprint_plan_json
+
+    reconciled = json.loads(json.dumps(sprint_plan_json))
+    sprints = reconciled.get("sprints") or []
+    source_by_id = {item["id"]: item for item in source_items}
+    source_ids = set(source_by_id)
+    source_prefixes = {requirement_id.rsplit("-", 1)[0] for requirement_id in source_ids}
+
+    existing_assignments: dict[str, list[int]] = {requirement_id: [] for requirement_id in source_ids}
+    preserved_requirements: dict[int, list] = {}
+    for sprint_index, sprint in enumerate(sprints):
+        preserved_requirements[sprint_index] = []
+        for requirement in sprint.get("requirements_covered") or []:
+            requirement_id = str(requirement.get("id") or "").strip().upper() if isinstance(requirement, dict) else ""
+            if requirement_id in source_ids:
+                existing_assignments[requirement_id].append(sprint_index)
+                continue
+            parsed = _JIRA_REQUIREMENT_ID_RE.fullmatch(requirement_id)
+            if parsed and requirement_id.rsplit("-", 1)[0] in source_prefixes:
+                continue  # never preserve invented same-project IDs
+            preserved_requirements[sprint_index].append(requirement)
+
+    deferred = reconciled.get("deferred_requirements") or []
+    semantic_assignments: dict[str, int] = {}
+    for requirement in source_items:
+        scored = [
+            (*_requirement_sprint_semantic_score(requirement, sprint), sprint_index)
+            for sprint_index, sprint in enumerate(sprints)
+        ]
+        strong_matches = [entry for entry in scored if entry[1]]
+        if strong_matches:
+            best_score, _strong, best_index = max(strong_matches, key=lambda entry: (entry[0], -entry[2]))
+            if best_score > 0:
+                semantic_assignments[requirement["id"]] = best_index
+
+    for sprint_index, sprint in enumerate(sprints):
+        sprint["requirements_covered"] = preserved_requirements[sprint_index]
+
+    for requirement in source_items:
+        requirement_id = requirement["id"]
+        if requirement_id in semantic_assignments:
+            targets = [semantic_assignments[requirement_id]]
+        else:
+            targets = existing_assignments[requirement_id]
+        for sprint_index in targets:
+            sprints[sprint_index]["requirements_covered"].append({
+                "id": requirement_id,
+                "title": requirement["title"],
+            })
+
+    semantically_covered = set(semantic_assignments)
+    reconciled["deferred_requirements"] = [
+        item for item in deferred
+        if not isinstance(item, dict)
+        or str(item.get("id") or "").strip().upper() not in semantically_covered
+    ]
+    return reconciled
+
+
+_MISSING_REQUIREMENT_AFFINITIES = {
+    "candidate submissions tracker": ("candidate management", "candidate profile", "candidate workspace"),
+    "candidate document management": ("document handoff", "placement document", "document management"),
+    "user and role management": ("user management", "role management", "admin settings"),
+    "account profile management": ("settings", "account profile", "profile settings"),
+    "appearance": ("settings", "appearance", "theme"),
+}
+
+
+def _append_unique_text(target: list, values: list[str]):
+    existing = {_semantic_text(str(value)) for value in target}
+    for value in values:
+        cleaned = str(value or "").strip()
+        normalized = _semantic_text(cleaned)
+        if cleaned and normalized not in existing:
+            target.append(cleaned)
+            existing.add(normalized)
+
+
+def _requirement_repair_details(requirement: dict) -> tuple[list[str], list[str]]:
+    title = str(requirement.get("title") or requirement.get("id") or "Requirement").strip()
+    criteria = [str(value).strip() for value in requirement.get("acceptance_criteria") or [] if str(value).strip()]
+    build_items = [f"Implement {title}"]
+    completion_criteria = criteria or [f"{title} is available and works as described in the source story."]
+    return build_items, completion_criteria
+
+
+def _attach_requirement_to_sprint(sprint: dict, requirement: dict):
+    requirement_id = requirement["id"]
+    covered = sprint.setdefault("requirements_covered", [])
+    if not any(
+        isinstance(item, dict) and str(item.get("id") or "").strip().upper() == requirement_id
+        for item in covered
+    ):
+        covered.append({"id": requirement_id, "title": requirement["title"]})
+    build_items, completion_criteria = _requirement_repair_details(requirement)
+    _append_unique_text(sprint.setdefault("build_items", []), build_items)
+    _append_unique_text(sprint.setdefault("completion_criteria", []), completion_criteria)
+
+
+def _best_existing_sprint_for_missing_requirement(requirement: dict, sprints: list[dict]) -> int | None:
+    scored = [
+        (*_requirement_sprint_semantic_score(requirement, sprint), index)
+        for index, sprint in enumerate(sprints)
+    ]
+    strong_matches = [entry for entry in scored if entry[1]]
+    if strong_matches:
+        return max(strong_matches, key=lambda entry: (entry[0], -entry[2]))[2]
+
+    requirement_text = _semantic_text(requirement.get("title", ""))
+    for source_phrase, affinities in _MISSING_REQUIREMENT_AFFINITIES.items():
+        if source_phrase not in requirement_text:
+            continue
+        affinity_matches = []
+        for index, sprint in enumerate(sprints):
+            primary_text, _secondary = _sprint_semantic_texts(sprint)
+            hits = sum(affinity in primary_text for affinity in affinities)
+            if hits:
+                affinity_matches.append((hits, index))
+        if affinity_matches:
+            return max(affinity_matches, key=lambda entry: (entry[0], -entry[1]))[1]
+    return None
+
+
+def _new_requirement_sprint(requirement: dict, previous_sprint_number: int | None) -> dict:
+    build_items, completion_criteria = _requirement_repair_details(requirement)
+    area = str(requirement.get("source_area") or "Requirement").strip()
+    title = str(requirement.get("title") or requirement["id"]).strip()
+    return {
+        "number": (previous_sprint_number or 0) + 1,
+        "title": f"{area}: {title}" if area.lower() not in title.lower() else title,
+        "goal": f"Build the complete {title} workflow from source requirement {requirement['id']}.",
+        "why_this_order": "Added deterministically because the generated roadmap omitted this source requirement.",
+        "requirements_covered": [{"id": requirement["id"], "title": title}],
+        "build_items": build_items,
+        "not_included": [],
+        "files_modules_touched": [],
+        "user_visible_result": f"Users can complete the {title} workflow.",
+        "completion_criteria": completion_criteria,
+        "smoke_checks": completion_criteria[:],
+        "dependencies": [previous_sprint_number] if previous_sprint_number else [],
+        "independently_demoable": True,
+        "build_now": False,
+    }
+
+
+def repair_missing_sprint_requirement_coverage(source_text: str, sprint_plan_json: dict) -> dict:
+    """Guarantee every non-deferred canonical source Jira story appears in a sprint.
+
+    Missing stories attach only on a strong semantic/explicit area affinity. Otherwise a
+    requirement-specific sprint is appended. At the 12-sprint ceiling, remaining stories
+    attach to the closest existing/new sprint so coverage is never silently lost.
+    """
+    source_items = _extract_source_jira_requirements(source_text)
+    if not source_items:
+        return sprint_plan_json
+    repaired = json.loads(json.dumps(sprint_plan_json))
+    sprints = repaired.setdefault("sprints", [])
+    covered_ids = {
+        str(requirement.get("id") or "").strip().upper()
+        for sprint in sprints
+        for requirement in sprint.get("requirements_covered") or []
+        if isinstance(requirement, dict)
+    }
+    explicitly_deferred_ids = {
+        str(item.get("id") or "").strip().upper()
+        for item in repaired.get("deferred_requirements") or []
+        if isinstance(item, dict) and str(item.get("reason") or "").strip()
+    }
+
+    for requirement in source_items:
+        requirement_id = requirement["id"]
+        if requirement_id in covered_ids or requirement_id in explicitly_deferred_ids:
+            continue
+        target_index = _best_existing_sprint_for_missing_requirement(requirement, sprints)
+        if target_index is not None:
+            _attach_requirement_to_sprint(sprints[target_index], requirement)
+        elif len(sprints) < _MAX_SPRINT_COUNT:
+            previous_number = int(sprints[-1].get("number", len(sprints))) if sprints else None
+            sprints.append(_new_requirement_sprint(requirement, previous_number))
+        else:
+            # At the cap, choose the highest relaxed title/area token overlap rather than omit.
+            requirement_tokens = _requirement_title_tokens(
+                f"{requirement.get('title', '')} {requirement.get('source_area', '')}"
+            )
+            target_index = max(
+                range(len(sprints)),
+                key=lambda index: len(requirement_tokens & _requirement_title_tokens(_sprint_semantic_texts(sprints[index])[0])),
+            )
+            _attach_requirement_to_sprint(sprints[target_index], requirement)
+        covered_ids.add(requirement_id)
+
+    old_to_new = {}
+    for new_number, sprint in enumerate(sprints, start=1):
+        try:
+            old_to_new[int(sprint.get("number", new_number))] = new_number
+        except (TypeError, ValueError):
+            pass
+    for new_number, sprint in enumerate(sprints, start=1):
+        sprint["number"] = new_number
+        sprint["dependencies"] = [
+            old_to_new[dependency] for dependency in sprint.get("dependencies") or []
+            if dependency in old_to_new and old_to_new[dependency] < new_number
+        ]
+    if repaired.get("selected_sprint") in old_to_new:
+        repaired["selected_sprint"] = old_to_new[repaired["selected_sprint"]]
+    repaired["total_sprints"] = len(sprints)
+    repaired["recommended_sprint_count"] = len(sprints)
+    return repaired
+
+
+def build_requirement_coverage_map(source_text: str, sprint_plan_json: dict) -> dict:
+    """Build a deterministic source-requirement → sprint map.
+
+    Jira IDs are extracted independently from the source so a model omission is retained as
+    an explicit uncovered item. Non-Jira requirements supplied in requirements_covered are also
+    included for compatibility with prose-only requirement documents.
+    """
+    # Defensive reconciliation keeps direct callers safe as well as generate_sprint_plan().
+    sprint_plan_json = reconcile_sprint_requirement_ids(source_text, sprint_plan_json)
+    sprint_plan_json = reconcile_sprint_requirement_coverage(source_text, sprint_plan_json)
+    sprint_plan_json = repair_missing_sprint_requirement_coverage(source_text, sprint_plan_json)
+    source_items = _extract_source_jira_requirements(source_text)
+    seen_ids = {item["id"] for item in source_items}
+
+    # Model-extracted prose requirements extend the catalog; source Jira IDs remain authoritative.
+    generated_number = 1
+    for sprint in sprint_plan_json.get("sprints", []):
+        for requirement in sprint.get("requirements_covered") or []:
+            if isinstance(requirement, dict):
+                requirement_id = str(requirement.get("id") or "").strip().upper()
+                title = str(requirement.get("title") or "").strip()
+            else:
+                requirement_id, title = "", str(requirement).strip()
+            if not requirement_id:
+                while f"REQ-{generated_number:03d}" in seen_ids:
+                    generated_number += 1
+                requirement_id = f"REQ-{generated_number:03d}"
+                generated_number += 1
+            if requirement_id in seen_ids:
+                existing = next((item for item in source_items if item["id"] == requirement_id), None)
+                if existing and existing["title"] == requirement_id and title:
+                    existing["title"] = title
+            else:
+                seen_ids.add(requirement_id)
+                source_items.append({"id": requirement_id, "title": title or requirement_id, "source_area": "General"})
+
+    deferred_by_id = {
+        str(item.get("id") or "").strip().upper(): item
+        for item in sprint_plan_json.get("deferred_requirements") or []
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    coverage_items = []
+    for item in source_items:
+        requirement_id = item["id"]
+        covered_by = []
+        for sprint in sprint_plan_json.get("sprints", []):
+            sprint_text = json.dumps(sprint, ensure_ascii=False).upper()
+            if requirement_id.upper() in sprint_text:
+                covered_by.append(int(sprint.get("number", 0)))
+        deferred = deferred_by_id.get(requirement_id.upper())
+        status = "covered" if covered_by else "deferred" if deferred else "uncovered"
+        coverage_item = {**item, "covered_by_sprints": covered_by, "coverage_status": status}
+        if deferred:
+            coverage_item["deferred_reason"] = str(deferred.get("reason") or "").strip()
+        coverage_items.append(coverage_item)
+
+    uncovered_items = [item for item in coverage_items if item["coverage_status"] == "uncovered"]
+    covered_count = sum(item["coverage_status"] == "covered" for item in coverage_items)
+    deferred_count = sum(item["coverage_status"] == "deferred" for item in coverage_items)
+    return {
+        "coverage_items": coverage_items,
+        "uncovered_items": uncovered_items,
+        "coverage_summary": {
+            "total_items": len(coverage_items),
+            "covered_items": covered_count,
+            "uncovered_items": len(uncovered_items),
+            "deferred_items": deferred_count,
+        },
+    }
+
+
+def render_requirement_coverage_map_markdown(coverage_map: dict) -> str:
+    """Readable requirement_coverage_map.md renderer. Deterministic, no GPT call."""
+    summary = coverage_map.get("coverage_summary") or {}
+    lines = [
+        "# Requirement Coverage Map", "", "## Summary",
+        f"Total requirements: {summary.get('total_items', 0)}",
+        f"Covered: {summary.get('covered_items', 0)}",
+        f"Uncovered: {summary.get('uncovered_items', 0)}",
+        f"Deferred: {summary.get('deferred_items', 0)}", "", "## Coverage", "",
+        "| ID | Requirement | Area | Covered by Sprint | Status |",
+        "|---|---|---|---|---|",
+    ]
+    for item in coverage_map.get("coverage_items") or []:
+        sprints = item.get("covered_by_sprints") or []
+        covered_by = ", ".join(f"Sprint {n}" for n in sprints) or "—"
+        safe = lambda value: str(value or "").replace("|", "\\|").replace("\n", " ")
+        lines.append(
+            f"| {safe(item.get('id'))} | {safe(item.get('title'))} | "
+            f"{safe(item.get('source_area'))} | {covered_by} | {safe(item.get('coverage_status'))} |"
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_sprint_coverage_check(source_text: str, *coverage_texts: str) -> tuple[bool, str]:
+    """Non-blocking Jira-ID coverage check used after sprint planning."""
+    detected = [item["id"] for item in _extract_source_jira_requirements(source_text)]
+    combined = "\n".join(coverage_texts).upper()
+    covered = [requirement_id for requirement_id in detected if requirement_id in combined]
+    missing = [requirement_id for requirement_id in detected if requirement_id not in combined]
+    lines = [
+        "Sprint Coverage Check",
+        f"Detected requirement IDs: {', '.join(detected) if detected else 'none'}",
+        f"Covered IDs: {', '.join(covered) if covered else 'none'}",
+        f"Missing IDs: {', '.join(missing) if missing else 'none'}",
+        f"Result: {'WARN' if missing else 'PASS'}",
+    ]
+    if missing:
+        lines += ["", "Missing IDs:", *[f"- {requirement_id}" for requirement_id in missing]]
+    return not missing, "\n".join(lines) + "\n"
+
+
 def render_sprint_plan_markdown(sprint_plan_json: dict) -> str:
     """Full human-readable sprint plan (sprint_plan.md). Deterministic, no GPT call."""
     sprints = sorted(sprint_plan_json.get("sprints", []), key=lambda s: s.get("number", 0))
@@ -1243,11 +1888,31 @@ def render_sprint_plan_markdown(sprint_plan_json: dict) -> str:
         lines.append("")
         lines.append(f"**Why this sprint comes at this point:** {s.get('why_this_order', '')}")
         lines.append("")
+        lines.append("**Requirements covered:**")
+        for requirement in s.get("requirements_covered") or ["(not specified)"]:
+            if isinstance(requirement, dict):
+                rid, title = requirement.get("id", ""), requirement.get("title", "")
+                lines.append(f"- {rid + ' — ' if rid else ''}{title}")
+            else:
+                lines.append(f"- {requirement}")
+        lines.append("")
+        lines.append("**What will be built:**")
+        for item in s.get("build_items") or ["(not specified)"]:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("**Not included yet:**")
+        for item in s.get("not_included") or ["(nothing specified)"]:
+            lines.append(f"- {item}")
+        lines.append("")
         lines.append("**Files / modules likely touched:**")
         for f in s.get("files_modules_touched") or ["(not specified)"]:
             lines.append(f"- {f}")
         lines.append("")
         lines.append(f"**User-visible result:** {s.get('user_visible_result', '')}")
+        lines.append("")
+        lines.append("**Completion criteria:**")
+        for c in s.get("completion_criteria") or ["(not specified)"]:
+            lines.append(f"- {c}")
         lines.append("")
         lines.append("**Smoke checks for this sprint:**")
         for c in s.get("smoke_checks") or ["(not specified)"]:
@@ -1306,6 +1971,7 @@ def generate_sprint_plan(
     constraints: dict | None,
     run_dir,
     selected_sprint_number: int | None = None,
+    source_requirements: str | None = None,
 ) -> tuple[dict, str]:
     """
     Smart, complexity-aware sprint decomposition — breaks a large MVP into product-sense,
@@ -1318,10 +1984,13 @@ def generate_sprint_plan(
     authoritative across all sprints (see apply_selected_sprint). It is NOT required — the
     caller may omit it and call apply_selected_sprint()/select_sprint() separately.
 
-    Writes sprint_plan.json and sprint_plan.md directly into `run_dir` (a Path to the
-    run folder) and returns (sprint_plan_json, sprint_plan_md).
+    Writes sprint_plan.json/.md, requirement_coverage_map.json/.md, and the non-blocking
+    sprint_coverage_check.txt directly into `run_dir` (a Path to the run folder), then
+    returns (sprint_plan_json, sprint_plan_md).
     """
     constraint_text = _constraints_to_prompt_text(constraints)
+    coverage_source = "\n".join(text for text in (source_requirements, clean_requirements) if text)
+    authoritative_ids = [item["id"] for item in _extract_source_jira_requirements(coverage_source)]
     user_msg = (
         f"## CLEAN REQUIREMENTS\n{clean_requirements}\n\n"
         f"## MVP SPEC\n{mvp_spec}\n\n"
@@ -1329,6 +1998,13 @@ def generate_sprint_plan(
     )
     if constraint_text:
         user_msg += f"{constraint_text}\n\n"
+    if authoritative_ids:
+        user_msg += (
+            "## AUTHORITATIVE SOURCE REQUIREMENT IDS — PRESERVE EXACTLY\n"
+            f"{', '.join(authoritative_ids)}\n"
+            "Use these exact IDs in requirements_covered. Do not renumber, shorten, or replace "
+            "them (for example, never rewrite ATS-29 as ATS-1).\n\n"
+        )
     if detect_existing_sprint_plan(clean_requirements, mvp_spec):
         user_msg += (
             "## NOTE: existing sprint/phase/milestone plan detected\n"
@@ -1346,6 +2022,9 @@ def generate_sprint_plan(
         {"role": "user", "content": user_msg},
     ])
     sprint_plan_json = parse_sprint_plan_json(raw)
+    sprint_plan_json = reconcile_sprint_requirement_ids(coverage_source, sprint_plan_json)
+    sprint_plan_json = reconcile_sprint_requirement_coverage(coverage_source, sprint_plan_json)
+    sprint_plan_json = repair_missing_sprint_requirement_coverage(coverage_source, sprint_plan_json)
     if selected_sprint_number is not None:
         sprint_plan_json = apply_selected_sprint(sprint_plan_json, selected_sprint_number)
     sprint_plan_md = render_sprint_plan_markdown(sprint_plan_json)
@@ -1354,6 +2033,23 @@ def generate_sprint_plan(
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "sprint_plan.json").write_text(json.dumps(sprint_plan_json, indent=2), encoding="utf-8")
     (run_dir / "sprint_plan.md").write_text(sprint_plan_md, encoding="utf-8")
+
+    coverage_map = build_requirement_coverage_map(coverage_source, sprint_plan_json)
+    coverage_map_json = json.dumps(coverage_map, indent=2, ensure_ascii=False)
+    coverage_map_md = render_requirement_coverage_map_markdown(coverage_map)
+    (run_dir / "requirement_coverage_map.json").write_text(coverage_map_json, encoding="utf-8")
+    (run_dir / "requirement_coverage_map.md").write_text(coverage_map_md, encoding="utf-8")
+
+    # An ID listed only as uncovered in the map does not count as covered. Include mapped
+    # coverage only for items assigned to at least one sprint (or explicitly deferred).
+    mapped_coverage = json.dumps([
+        item for item in coverage_map["coverage_items"]
+        if item.get("coverage_status") in {"covered", "deferred"}
+    ], ensure_ascii=False)
+    _coverage_ok, coverage_report = render_sprint_coverage_check(
+        coverage_source, json.dumps(sprint_plan_json, ensure_ascii=False), sprint_plan_md, mapped_coverage,
+    )
+    (run_dir / "sprint_coverage_check.txt").write_text(coverage_report, encoding="utf-8")
 
     return sprint_plan_json, sprint_plan_md
 
@@ -1371,6 +2067,28 @@ def render_selected_sprint_scope_markdown(selected_sprint: dict, sprint_plan_jso
         "",
         f"## Why This Sprint Comes At This Point\n{selected_sprint.get('why_this_order', '')}",
         "",
+        "## Requirements Covered",
+    ]
+    for requirement in selected_sprint.get("requirements_covered") or ["(not specified)"]:
+        if isinstance(requirement, dict):
+            rid, title = requirement.get("id", ""), requirement.get("title", "")
+            lines.append(f"- {rid + ' — ' if rid else ''}{title}")
+        else:
+            lines.append(f"- {requirement}")
+    lines += [
+        "",
+        "## What Will Be Built",
+    ]
+    for item in selected_sprint.get("build_items") or ["(not specified)"]:
+        lines.append(f"- {item}")
+    lines += [
+        "",
+        "## Not Included Yet",
+    ]
+    for item in selected_sprint.get("not_included") or ["(nothing specified)"]:
+        lines.append(f"- {item}")
+    lines += [
+        "",
         "## Files / Modules Likely Touched",
     ]
     for f in selected_sprint.get("files_modules_touched") or ["(not specified)"]:
@@ -1378,6 +2096,9 @@ def render_selected_sprint_scope_markdown(selected_sprint: dict, sprint_plan_jso
     lines += ["", f"## User-Visible Result\n{selected_sprint.get('user_visible_result', '')}",
               "", "## Smoke Checks For This Sprint"]
     for c in selected_sprint.get("smoke_checks") or ["(not specified)"]:
+        lines.append(f"- {c}")
+    lines += ["", "## Completion Criteria"]
+    for c in selected_sprint.get("completion_criteria") or ["(not specified)"]:
         lines.append(f"- {c}")
     deps = selected_sprint.get("dependencies") or []
     lines += ["", "## Dependencies",
@@ -1428,6 +2149,22 @@ def generate_selected_sprint_build_prompt(
         f"## Sprint {num} — User-Visible Result (what must be demoable when this sprint is done)",
         selected_sprint.get("user_visible_result", ""),
         "",
+        f"## Sprint {num} — Requirements Covered",
+    ]
+    for requirement in selected_sprint.get("requirements_covered") or ["(not specified)"]:
+        if isinstance(requirement, dict):
+            rid, requirement_title = requirement.get("id", ""), requirement.get("title", "")
+            parts.append(f"- {rid + ' — ' if rid else ''}{requirement_title}")
+        else:
+            parts.append(f"- {requirement}")
+    parts += ["", f"## Sprint {num} — Build Items (implement every item below)"]
+    for item in selected_sprint.get("build_items") or ["(not specified — derive only from this sprint's goal)"]:
+        parts.append(f"- {item}")
+    parts += ["", f"## Sprint {num} — Explicitly Not Included"]
+    for item in selected_sprint.get("not_included") or ["(nothing specified)"]:
+        parts.append(f"- {item}")
+    parts += [
+        "",
         f"## Sprint {num} — Files / Modules Likely Touched",
     ]
     for f in selected_sprint.get("files_modules_touched") or [
@@ -1436,6 +2173,9 @@ def generate_selected_sprint_build_prompt(
         parts.append(f"- {f}")
     parts += ["", f"## Sprint {num} — Smoke Checks For This Sprint"]
     for c in selected_sprint.get("smoke_checks") or ["(not specified)"]:
+        parts.append(f"- {c}")
+    parts += ["", f"## Sprint {num} — Completion Criteria"]
+    for c in selected_sprint.get("completion_criteria") or ["(not specified)"]:
         parts.append(f"- {c}")
 
     if earlier_sprints:
@@ -4870,6 +5610,7 @@ def pipeline(
         sprint_plan_json, _sprint_plan_md = generate_sprint_plan(
             clean_requirements, spec, architecture_text, constraints, rdir,
             selected_sprint_number=selected_sprint,
+            source_requirements=raw_input,
         )
         record_step_time(run_id, "sprint_plan", t0)
         _update_state(run_id, {})  # refresh artifacts list (sprint_plan.* written directly to rdir)
