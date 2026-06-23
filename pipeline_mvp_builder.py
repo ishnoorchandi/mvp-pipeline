@@ -248,7 +248,31 @@ def detect_mode(raw_input: str, jira_used: bool = False, override: str | None = 
 _CONSTRAINT_DETECT_PATTERNS = {
     "frontend_only":        [r"frontend[\s-]?only", r"client[\s-]?only"],
     "no_backend":           [r"no backend", r"without (a |an )?backend", r"no server\b"],
-    "no_database":          [r"no database", r"without (a |an )?database", r"no db\b"],
+    # Phrase-based, not a bare "database" keyword scan: a requirements doc can legitimately
+    # talk about a "resume database", data "sourced from the database", "Transport Security
+    # to the Database", an "application-to-database connection", or a known-gap/risk note
+    # like "No DB connection pooling (resource exhaustion risk)" — none of those are
+    # prohibitions on USING a database; the last one is a gap in an *existing* database
+    # setup, not an instruction to avoid one. Only an explicit no-database/without-database/
+    # avoid-database PHRASE counts. Word-boundaried so "database" alone, "database schema",
+    # "database persistence", etc. never match on their own, and "no db"/"no database" is
+    # excluded when followed by another noun that turns it into a missing-SUB-FEATURE note
+    # (e.g. "no db connection pooling", "no database index") rather than a ban on the
+    # database itself.
+    "no_database":          [
+        r"no\s+database\b(?!\s+(connection|pool(ing)?|index(ing)?|migration|schema|table|backup|replica"
+        r"|cluster|server|host|driver|engine|instance|node|shard|tier|layer))",
+        r"no\s+backend\s+database\b",
+        r"no\s+database\s+persistence\b",
+        r"no\s+db\b(?!\s+(connection|pool(ing)?|index(ing)?|migration|schema|table|backup|replica"
+        r"|cluster|server|host|driver|engine|instance|node|shard|tier|layer))",
+        r"do\s+not\s+use\s+(a\s+)?database\b",
+        r"don'?t\s+use\s+(a\s+)?database\b",
+        r"must\s+not\s+use\s+(a\s+)?database\b",
+        r"should\s+not\s+use\s+(a\s+)?database\b",
+        r"without\s+(a\s+|an\s+)?database\b",
+        r"avoid\s+(a\s+|using\s+)?database\b",
+    ],
     "no_login":             [r"no login", r"without (a )?login"],
     "no_auth":              [r"no auth(entication)?\b", r"without auth(entication)?"],
     "no_api":               [r"no api\b", r"without (an )?api"],
@@ -1267,6 +1291,163 @@ def _requirement_title_from_line(line: str, requirement_id: str) -> str:
     return title or requirement_id
 
 
+_HEADING_LED_STORY_RE = re.compile(
+    r"^\s*([A-Za-z]{1,8}-[A-Za-z]{0,2}\d+(?:\.\d+)?)\s*"
+    r"(?:\[\s*([A-Z][A-Z0-9]{1,15}-\d+)\s*\]\s*)?"
+    r"[—–-]\s*(.+?)\s*$"
+)
+_HEADING_LED_STORY_PREFIX_RE = re.compile(
+    r"^[A-Za-z]{1,8}-[A-Za-z]{0,2}\d+(?:\.\d+)?\s*(?:\[\s*[A-Z][A-Z0-9]{1,15}-\d+\s*\]\s*)?[—–-]\s*"
+)
+_HEADING_LED_JIRA_ID_RE = re.compile(r"\bJira\s*:\s*([A-Z][A-Z0-9]{1,15}-\d+)\b", re.IGNORECASE)
+_HEADING_LED_BARE_ID_RE = re.compile(r"^\s*([A-Z][A-Z0-9]{1,15}-\d+)\s*$", re.IGNORECASE)
+_HEADING_LED_RANGE_RE = re.compile(
+    r"\bStories\s*:\s*[A-Z][A-Z0-9]+-\d+\s+(?:to|through|[-–—])\s+[A-Z][A-Z0-9]+-\d+", re.IGNORECASE
+)
+_HEADING_LED_FIELD_LABEL_RE = re.compile(
+    r"^(as\s+an?\b|acceptance\s+criteria\s*:|what\s+it\s+is\s*:|what\s+it\s+uses\s*:|how\s+it'?s\s+used\s*:)",
+    re.IGNORECASE,
+)
+_HEADING_LED_DIVIDER_RE = re.compile(r"^[A-Za-z][\w\s/]{0,60}?\s+[—–]\s+(.+?)\s*$")
+
+
+def _extract_heading_led_requirements(lines: list[str]) -> list[dict] | None:
+    """Extract requirements from documents shaped like:
+
+        US-2.2 — Auto-publish new requisitions to Ceipal
+        As an admin, I want ...
+        Acceptance criteria: ...; ...; ...
+        Jira: ON-45 — US-2.2 — Auto-publish new requisitions to Ceipal
+
+    or security/reverse-engineered requirement summaries with no Jira line at all:
+
+        SR-7 — Transport Security to the Database
+        What it is: Encrypt the application-to-database connection.
+        What it uses: ...
+        How it's used: ...
+
+    Returns None when no such heading-led block exists, so the caller falls back to
+    bare line scanning. This tier exists specifically so these formats get a clean
+    title/story_text/acceptance_criteria instead of the old line-scan fallback, which
+    would otherwise treat both "US-2.2" (the internal story number) and "ON-45" (the
+    real Jira ID) on the SAME story as two separate, badly-titled "requirements" (e.g.
+    a title left as "Jira: — US-2.2 — Auto-publish new requisitions to Ceipal").
+    """
+    def _preceding_bare_id(line_index: int) -> str | None:
+        # A "Jira story index" table flattened to plain text repeats every story as
+        # "<Ticket ID>\n<story-num — Title>\n<Epic>" — when present, the bare ID line
+        # right before the heading is this row's real Jira ID. Using it as the
+        # canonical requirement_id lets ordinary dedup (first occurrence wins) prefer
+        # whichever block — the detailed story earlier in the doc, or this index row —
+        # came first, instead of treating the index row as an unrelated requirement
+        # keyed by its internal story number (e.g. "US-1.1") with a duplicate, blander
+        # extraction of the same story.
+        for previous_index in range(line_index - 1, -1, -1):
+            previous = lines[previous_index].strip()
+            if not previous:
+                continue
+            match = _HEADING_LED_BARE_ID_RE.match(previous)
+            return match.group(1).upper() if match else None
+        return None
+
+    heading_indices = [
+        i for i, line in enumerate(lines)
+        if (stripped := line.strip())
+        and not stripped.lower().startswith("jira")
+        and not _HEADING_LED_RANGE_RE.search(stripped)
+        and _HEADING_LED_STORY_RE.match(stripped)
+    ]
+    if not heading_indices:
+        return None
+
+    # Track a coarse area label per line: markdown headings, or a short, unlabeled
+    # "Subject — Section Name" divider line (e.g. "OneHR — Security Requirements
+    # Summary") that isn't itself a story heading, Jira line, or known field label.
+    area_by_line: list[str] = []
+    current_area = "General"
+    for line in lines:
+        stripped = line.strip()
+        md_heading = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", stripped)
+        if md_heading:
+            current_area = md_heading.group(1).strip()
+        elif (
+            stripped and len(stripped) < 100 and not stripped.endswith((".", ";", ":"))
+            and not _HEADING_LED_STORY_RE.match(stripped)
+            and not stripped.lower().startswith("jira")
+            and not _HEADING_LED_FIELD_LABEL_RE.match(stripped)
+        ):
+            divider = _HEADING_LED_DIVIDER_RE.match(stripped)
+            if divider and not re.match(r"^[\s—–-]*$", divider.group(1)):
+                current_area = divider.group(1).strip()
+        area_by_line.append(current_area)
+
+    items: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, start in enumerate(heading_indices):
+        end = heading_indices[position + 1] if position + 1 < len(heading_indices) else len(lines)
+        heading_match = _HEADING_LED_STORY_RE.match(lines[start].strip())
+        heading_id = heading_match.group(1).upper()
+        inline_bracket_id = heading_match.group(2)
+        heading_title = heading_match.group(3).strip()
+
+        block_lines = lines[start + 1:end]
+        requirement_id = (
+            inline_bracket_id.upper() if inline_bracket_id
+            else (_preceding_bare_id(start) or heading_id)
+        )
+        story_parts: list[str] = []
+        acceptance_criteria: list[str] = []
+        what_it_is = what_it_uses = how_used = ""
+        for block_line in block_lines:
+            stripped = block_line.strip()
+            if not stripped:
+                continue
+            jira_match = _HEADING_LED_JIRA_ID_RE.search(stripped)
+            if jira_match:
+                requirement_id = jira_match.group(1).upper()
+                continue
+            if re.match(r"^As\s+an?\b", stripped, re.IGNORECASE) and not story_parts:
+                story_parts.append(stripped)
+                continue
+            ac_match = re.match(r"^acceptance\s+criteria\s*:\s*(.+)$", stripped, re.IGNORECASE)
+            if ac_match:
+                acceptance_criteria = [
+                    part.strip() for part in re.split(r"\s*;\s*", ac_match.group(1)) if part.strip()
+                ]
+                continue
+            wi_match = re.match(r"^what\s+it\s+is\s*:\s*(.+)$", stripped, re.IGNORECASE)
+            if wi_match and not what_it_is:
+                what_it_is = wi_match.group(1).strip()
+                continue
+            wu_match = re.match(r"^what\s+it\s+uses\s*:\s*(.+)$", stripped, re.IGNORECASE)
+            if wu_match and not what_it_uses:
+                what_it_uses = wu_match.group(1).strip()
+                continue
+            hu_match = re.match(r"^how\s+it'?s\s+used\s*:\s*(.+)$", stripped, re.IGNORECASE)
+            if hu_match and not how_used:
+                how_used = hu_match.group(1).strip()
+                continue
+
+        if requirement_id in seen_ids:
+            continue
+        seen_ids.add(requirement_id)
+
+        title = _HEADING_LED_STORY_PREFIX_RE.sub("", heading_title).strip() or heading_title
+        if what_it_is:
+            story_parts.append(what_it_is)
+        acceptance_criteria += [text for text in (what_it_uses, how_used) if text]
+
+        items.append({
+            "id": requirement_id,
+            "title": title,
+            "source_area": area_by_line[start],
+            "role": "",
+            "story_text": " ".join(story_parts),
+            "acceptance_criteria": acceptance_criteria,
+        })
+    return items
+
+
 def _extract_source_jira_requirements(source_text: str) -> list[dict]:
     """Extract authoritative Jira stories while preserving each source ID exactly.
 
@@ -1317,15 +1498,26 @@ def _extract_source_jira_requirements(source_text: str) -> list[dict]:
             story_parts: list[str] = []
             acceptance_criteria: list[str] = []
             in_acceptance_criteria = False
+            bullet_re = re.compile(r"^[•*\-–—]\s*|^\d{1,2}[.)]\s*")
             for block_line in block_lines:
                 stripped = block_line.strip()
                 if not stripped:
                     continue
+                # A markdown heading means we've run off the end of this document into
+                # an unrelated one (e.g. coverage_source concatenates the raw source with
+                # a separate clean_requirements.md) — stop, don't swallow the next doc.
+                if re.match(r"^#{1,6}\s", stripped):
+                    break
                 if re.match(r"^acceptance\s+criteria\s*:?\s*$", stripped, re.IGNORECASE):
                     in_acceptance_criteria = True
                     continue
                 if in_acceptance_criteria:
-                    criterion = re.sub(r"^[\s•*\-–—\d.)]+", "", stripped).strip()
+                    if not bullet_re.match(stripped):
+                        # Acceptance criteria are always bulleted/numbered in this format;
+                        # an unbulleted line means we've left this requirement's block
+                        # (e.g. trailing prose from a concatenated second document).
+                        break
+                    criterion = bullet_re.sub("", stripped).strip()
                     if criterion:
                         acceptance_criteria.append(criterion)
                 elif re.match(r"^As\s+an?\b", stripped, re.IGNORECASE) or story_parts:
@@ -1340,6 +1532,10 @@ def _extract_source_jira_requirements(source_text: str) -> list[dict]:
                 "acceptance_criteria": acceptance_criteria,
             })
         return detailed_items
+
+    heading_led_items = _extract_heading_led_requirements(lines)
+    if heading_led_items:
+        return heading_led_items
 
     source_items: list[dict] = []
     seen_ids: set[str] = set()
@@ -1458,22 +1654,134 @@ def reconcile_sprint_requirement_ids(source_text: str, sprint_plan_json: dict) -
     return reconciled
 
 
-_SEMANTIC_REQUIREMENT_RULES = [
-    ("job requisition", ("create requisition", "requisition creation", "requisition modal", "requisition list", "view requisition", "search requisition", "requisition search")),
-    ("ai requisition auto approval", ("ai auto approval", "auto approval", "auto approve", "auto approved requisition", "ai review of requisition")),
-    ("ai resume matching", ("resume matching", "ai match", "ranked candidate", "match score")),
-    ("candidate management", ("candidate management", "candidate profile", "add candidate", "view candidate")),
-    ("candidate submissions tracker", ("submissions tracker", "all submissions", "cross recruiter submission", "candidate submission")),
-    ("duplicate candidate detection", ("duplicate detection", "duplicate candidate", "merge candidate", "candidate merge")),
-    ("interview and progress tracking", ("interview tracking", "progress tracking", "interview schedule", "candidate progress")),
-    ("offer approval workflow", ("offer approval", "approve offer", "send back offer", "offer workflow")),
-    ("nda and document signature tracking", ("nda", "signature tracking", "document signature", "send reminder", "expired document")),
-    ("placement approval and automatic document handoff", ("placement approval", "approve placement", "placement closure", "document handoff", "automatic handoff")),
-    ("candidate document management", ("candidate document", "attach document", "required document", "document management")),
-    ("user and role management", ("user management", "role management", "manage user", "invite user", "users and roles")),
-    ("account profile management", ("account profile", "save changes", "reset profile", "profile management")),
-    ("appearance", ("appearance", "dark mode", "accent color", "accent theme", "theme customization", "color theme")),
-]
+_DOMAIN_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "dashboard": ("dashboard", "kpi", "summary cards", "metrics", "approval queue"),
+    "job_requisitions": (
+        "requisition", "req", "job", "role", "rate card", "required skills",
+        "create requisition", "search requisitions",
+    ),
+    "ai_requisition_approval": (
+        "ai approval", "auto approval", "auto-approval", "ai review", "ai approved",
+        "manual review", "override",
+    ),
+    "ai_resume_matching": (
+        "resume matching", "ai match", "match score", "candidate ranking",
+        "ranked candidates", "matched skills", "skill gaps",
+    ),
+    "candidate_management": (
+        "candidate profile", "new candidate", "add candidate", "view candidate",
+        "resume upload", "target role",
+    ),
+    "candidate_submissions": (
+        "submissions", "submissions tracker", "cross-recruiter", "all submissions",
+        "submission status",
+    ),
+    "duplicate_detection": (
+        "duplicate", "merge", "possible duplicates", "same phone", "same email",
+        "dismiss duplicate",
+    ),
+    "interview_progress": (
+        "interview", "progress tracking", "round", "feedback pending", "scheduled",
+        "completed",
+    ),
+    "offer_approval": (
+        "offer approval", "offers awaiting approval", "approve and send", "send back",
+        "offered amount",
+    ),
+    "nda_signatures": (
+        "nda", "signature", "signed", "expired", "send reminder", "resend document",
+        "consent form",
+    ),
+    "placements": (
+        "placement", "placement approval", "closure", "pay rate", "bill rate", "margin",
+        "document handoff",
+    ),
+    "documents": (
+        "document management", "required documents", "attach document", "offer letter",
+        "background check", "i-9", "checklist",
+    ),
+    "users_roles": (
+        "users", "roles", "invite user", "edit user", "role assignment",
+        "admin recruiter candidate", "last login",
+    ),
+    "settings_account": (
+        "account profile", "full name", "email", "title", "organisation", "phone",
+        "location", "save changes", "reset",
+    ),
+    "settings_appearance": (
+        "appearance", "dark mode", "accent colour", "accent color", "theme", "gold",
+        "steel blue", "sage", "terracotta", "plum",
+    ),
+    "candidate_portal": (
+        "candidate portal", "my applications", "my profile", "self-service", "self service",
+        "job seeker", "cover letter", "applicant dashboard", "sign documents", "in-portal",
+    ),
+    "job_board_integration": (
+        "ceipal", "syndicate", "syndication", "job board", "dice", "ziprecruiter", "indeed",
+        "auto-publish", "auto publish", "sync status", "synced", "sync failed",
+    ),
+    # Backend security/infrastructure hardening — authentication, encryption, tenancy,
+    # secrets, audit, and platform-level concerns. These must never default into a UI
+    # shell sprint (e.g. "Dashboard Shell") just because that sprint exists first.
+    "security_infrastructure": (
+        "authentication", "password storage", "password verification", "rbac",
+        "role-based access control", "role based access control", "multi-tenant",
+        "multi tenant", "tenant isolation", "data isolation", "tenantless query",
+        "sensitive field encryption", "encryption", "transport security",
+        "database transport security", "ssl", "tls", "secrets management", "secret management",
+        "cors policy", "cors", "webhook authentication", "audit logging", "audit log",
+        "request traceability", "traceability", "digital signature integrity",
+        "signature integrity", "workflow state integrity", "usage enforcement",
+        "entitlement enforcement", "rate limiting", "content compliance screening",
+        "platform hardening", "access control",
+        # Common reverse-engineered-security-doc jargon — these reinforce (not replace)
+        "jwt", "bearer token", "oauth", "sso", "verify caller identity",
+        "protected operation", "caller identity", "credentials", "hashed password",
+        "pbkdf2", "bcrypt", "tenant id", "cross-tenant", "ca bundle", "ssl mode",
+        "parameter store", "api keys out of code", "wildcard cors", "hmac signature",
+        "tamper-evident", "tamper evident", "ai guardrail", "release blocker",
+    ),
+}
+
+# Coverage-repair grouping: when a missing requirement has no existing sprint that
+# actually builds it, group it with other missing requirements in the same coarse
+# product area instead of creating one throwaway sprint per requirement (or, worse,
+# dumping it into Sprint 1 just because Sprint 1 exists). Mirrors the 8 grouping rules:
+# dashboard / requisitions+integrations / AI matching / candidate management /
+# candidate portal / offer+placement+document workflows / user+settings / security.
+_DOMAIN_TO_REPAIR_GROUP = {
+    "dashboard": "dashboard",
+    "job_requisitions": "requisitions",
+    "job_board_integration": "requisitions",
+    "ai_requisition_approval": "requisitions",
+    "ai_resume_matching": "ai_matching",
+    "candidate_management": "candidates",
+    "candidate_submissions": "candidates",
+    "duplicate_detection": "candidates",
+    "candidate_portal": "candidate_portal",
+    "interview_progress": "workflows",
+    "offer_approval": "workflows",
+    "nda_signatures": "workflows",
+    "placements": "workflows",
+    "documents": "workflows",
+    "users_roles": "settings",
+    "settings_account": "settings",
+    "settings_appearance": "settings",
+    "security_infrastructure": "security",
+}
+
+_REPAIR_GROUP_TITLES = {
+    "dashboard": "Dashboard and Approval Queue",
+    "requisitions": "Ceipal Publishing and Sync Status",
+    "ai_matching": "Candidate Matching and Resume Review",
+    "candidates": "Candidate Management and Duplicate Detection",
+    "candidate_portal": "Candidate Portal Experience",
+    "workflows": "Offer, Placement, and Document Workflows",
+    "settings": "User Settings and Appearance Preferences",
+    "security": "Security, Access Control, and Platform Hardening",
+}
+
+_SEMANTIC_MATCH_THRESHOLD = 12.0
 
 
 def _semantic_text(value: str) -> str:
@@ -1481,16 +1789,71 @@ def _semantic_text(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", text))
 
 
-def _sprint_semantic_texts(sprint: dict) -> tuple[str, str]:
+def _domain_areas_for_text(text: str) -> dict[str, float]:
+    """Weighted domain-area hits for a normalized text blob.
+
+    Weight is the squared word count of each matched phrase, so a specific multi-word
+    phrase (e.g. "auto approval" -> 4) heavily outweighs several incidental generic
+    single words (e.g. "email" + "phone" + "location" -> 1 each = 3 total) that happen
+    to also be synonyms for a different, unrelated domain (account settings fields vs.
+    candidate profile fields). Without this, a handful of coincidental generic-word hits
+    could outscore one genuinely specific, on-topic phrase.
+    """
+    areas: dict[str, float] = {}
+    for area, phrases in _DOMAIN_SYNONYMS.items():
+        weight = 0.0
+        seen_norms: set[str] = set()
+        for phrase in phrases:
+            norm = _semantic_text(phrase)
+            if not norm or norm in seen_norms:
+                continue
+            seen_norms.add(norm)
+            if f" {norm} " in f" {text} ":
+                weight += len(norm.split()) ** 2
+        if weight:
+            areas[area] = weight
+    return areas
+
+
+def _requirement_sprint_domain_conflict(requirement: dict, sprint: dict) -> bool:
+    """True only when both the requirement and the sprint have a clear, *different*
+    domain area — e.g. an appearance/theme story against a sprint that is demonstrably
+    about job requisitions. A sprint with no domain signal at all never conflicts.
+
+    Domain area is judged from the sprint's own definition (title/goal/build_items/
+    output/criteria) only — NOT from its current requirements_covered titles, since
+    those may include the very (possibly wrong) attachment being checked, which would
+    make the check trivially agree with itself.
+    """
+    req_areas = _domain_areas_for_text(_requirement_semantic_text(requirement))
+    if not req_areas:
+        return False
+    primary_text, _secondary_text = _sprint_semantic_texts(sprint)
+    sprint_areas = _domain_areas_for_text(primary_text)
+    if not sprint_areas:
+        return False
+    return not (set(req_areas) & set(sprint_areas))
+
+
+def _sprint_semantic_texts(sprint: dict, exclude_requirement_id: str = "") -> tuple[str, str]:
+    """(primary_text, secondary_text). `exclude_requirement_id` drops that one ID's own
+    title out of secondary_text so checking whether a requirement belongs in a sprint
+    never uses that requirement's own (possibly wrong) existing placement as evidence."""
     primary_values = [
         sprint.get("title", ""), sprint.get("goal", ""),
         *(_coerce_list(sprint.get("build_items"))),
         sprint.get("user_visible_result", ""),
         *(_coerce_list(sprint.get("completion_criteria"))),
     ]
+    exclude_id = (exclude_requirement_id or "").strip().upper()
     requirement_titles = [
         requirement.get("title", "") if isinstance(requirement, dict) else str(requirement)
         for requirement in sprint.get("requirements_covered") or []
+        if not (
+            isinstance(requirement, dict)
+            and exclude_id
+            and str(requirement.get("id") or "").strip().upper() == exclude_id
+        )
     ]
     return (
         _semantic_text(" ".join(str(value) for value in primary_values if value)),
@@ -1498,37 +1861,94 @@ def _sprint_semantic_texts(sprint: dict) -> tuple[str, str]:
     )
 
 
-def _requirement_sprint_semantic_score(requirement: dict, sprint: dict) -> tuple[float, bool]:
-    """Return (score, strong_primary_match) without trusting requirement IDs."""
-    source_text = _semantic_text(" ".join([
+def _requirement_semantic_text(requirement: dict) -> str:
+    return _semantic_text(" ".join([
         str(requirement.get("title") or ""), str(requirement.get("source_area") or ""),
         str(requirement.get("story_text") or ""),
         " ".join(str(v) for v in requirement.get("acceptance_criteria") or []),
     ]))
-    primary_text, secondary_titles = _sprint_semantic_texts(sprint)
+
+
+def score_requirement_sprint_match(requirement: dict, sprint: dict) -> float:
+    """Deterministic keyword/domain-synonym score for whether `sprint` is the right
+    place to build `requirement`.
+
+    Combines shared domain-area strength (job requisitions vs AI auto-approval vs AI
+    resume matching vs settings/appearance, etc. — see _DOMAIN_SYNONYMS) and title token
+    overlap. The domain-area contribution is weighted by how strongly BOTH the
+    requirement and the sprint signal that specific area (min of the two weights), not
+    just "some area overlaps" — otherwise a generic shared word (e.g. "requisition")
+    ties a basic CRUD sprint with a sprint that is also strongly, specifically about AI
+    auto-approval, instead of the latter clearly winning. A requirement whose domain area
+    conflicts with the sprint's domain area (e.g. an appearance/theme story against a
+    requisition CRUD sprint) is penalized rather than scored near zero, so it reliably
+    loses to a genuinely matching sprint or falls below _SEMANTIC_MATCH_THRESHOLD.
+    There is deliberately no bonus for "this ID is already attached here" — a wrong
+    existing placement must never get an edge over a sprint that is the better match.
+    """
+    requirement_id = str(requirement.get("id") or "").strip().upper()
+    req_text = _requirement_semantic_text(requirement)
+    # Exclude this requirement's own (possibly wrong) existing title from secondary_text
+    # so a misattached requirement can never use its own placement as evidence for itself.
+    primary_text, secondary_text = _sprint_semantic_texts(sprint, exclude_requirement_id=requirement_id)
+
+    req_areas = _domain_areas_for_text(req_text)
+    # Domain area is judged from the sprint's own definition only, not from titles of
+    # other requirements already (possibly wrongly) attached to it.
+    sprint_areas = _domain_areas_for_text(primary_text)
+
     score = 0.0
-    strong = False
+    if req_areas:
+        # Only the requirement's DOMINANT topic (its highest-weight domain area)
+        # qualifies for the full match bonus. A requirement can legitimately mention
+        # several areas in passing (e.g. a candidate-portal "dashboard" story also
+        # says the word "dashboard" — a generic, ubiquitous term across every portal
+        # in the product), but sharing only a secondary/incidental area with a sprint
+        # is much weaker evidence than sharing what the requirement is actually ABOUT.
+        # Without this distinction, any sprint that merely mentions a common word
+        # shared with one of a requirement's minor areas can out-rank, or wrongly
+        # qualify against, the sprint that matches its real topic.
+        top_weight = max(req_areas.values())
+        top_areas = {area for area, weight in req_areas.items() if weight == top_weight}
+        shared_top = top_areas & set(sprint_areas)
+        shared_other = (set(req_areas) - top_areas) & set(sprint_areas)
+        if shared_top:
+            # Capped so one area that happens to enumerate many incidental generic
+            # synonyms (e.g. a form listing "email, phone, location") can't swamp the
+            # title-overlap signal below — domain area mainly decides "plausible",
+            # title overlap decides "which specific plausible sprint wins".
+            mutual_strength = min(sum(min(req_areas[area], sprint_areas[area]) for area in shared_top), 4.0)
+            score += 14.0 + mutual_strength * 2.0
+        elif shared_other:
+            mutual_strength = min(sum(min(req_areas[area], sprint_areas[area]) for area in shared_other), 4.0)
+            score += mutual_strength * 1.5
+        elif sprint_areas:
+            # The sprint clearly belongs to a *different* domain area (e.g. job
+            # requisitions) than this requirement (e.g. appearance/theme) — penalize
+            # rather than treat a domain-bearing-but-wrong sprint as neutral. A sprint
+            # with no domain signal at all (sprint_areas empty) is left unpenalized
+            # since there's nothing in it to actually conflict with.
+            score -= 14.0
 
-    for source_phrase, sprint_phrases in _SEMANTIC_REQUIREMENT_RULES:
-        if source_phrase not in source_text:
-            continue
-        primary_hits = sum(phrase in primary_text for phrase in sprint_phrases)
-        secondary_hits = sum(phrase in secondary_titles for phrase in sprint_phrases)
-        if primary_hits:
-            score += 10.0 + primary_hits
-            strong = True
-        score += secondary_hits * 0.25
-        break
+    req_tokens = _requirement_title_tokens(requirement.get("title", ""))
+    sprint_tokens = _requirement_title_tokens(primary_text)
+    if req_tokens:
+        overlap_ratio = len(req_tokens & sprint_tokens) / len(req_tokens)
+        score += overlap_ratio * 20.0
 
-    source_tokens = _requirement_title_tokens(requirement.get("title", ""))
-    primary_tokens = _requirement_title_tokens(primary_text)
-    overlap = source_tokens & primary_tokens
-    if len(overlap) >= 2 and source_tokens:
-        overlap_ratio = len(overlap) / len(source_tokens)
-        score += overlap_ratio * 5.0
-        if overlap_ratio >= 0.45:
-            strong = True
-    return score, strong
+    # Small additional signal from titles of OTHER requirements already correctly
+    # attached to this sprint (e.g. several candidate-matching stories already here).
+    secondary_tokens = _requirement_title_tokens(secondary_text)
+    if req_tokens and secondary_tokens:
+        score += (len(req_tokens & secondary_tokens) / len(req_tokens)) * 2.0
+
+    return score
+
+
+def _requirement_sprint_semantic_score(requirement: dict, sprint: dict) -> tuple[float, bool]:
+    """Return (score, strong_match) — strong_match means score clears _SEMANTIC_MATCH_THRESHOLD."""
+    score = score_requirement_sprint_match(requirement, sprint)
+    return score, score >= _SEMANTIC_MATCH_THRESHOLD
 
 
 def reconcile_sprint_requirement_coverage(source_text: str, sprint_plan_json: dict) -> dict:
@@ -1556,7 +1976,7 @@ def reconcile_sprint_requirement_coverage(source_text: str, sprint_plan_json: di
             requirement_id = str(requirement.get("id") or "").strip().upper() if isinstance(requirement, dict) else ""
             if requirement_id in source_ids:
                 existing_assignments[requirement_id].append(sprint_index)
-                continue
+                continue  # rebuilt below from semantic assignment, not the model's raw placement
             parsed = _JIRA_REQUIREMENT_ID_RE.fullmatch(requirement_id)
             if parsed and requirement_id.rsplit("-", 1)[0] in source_prefixes:
                 continue  # never preserve invented same-project IDs
@@ -1572,40 +1992,42 @@ def reconcile_sprint_requirement_coverage(source_text: str, sprint_plan_json: di
         strong_matches = [entry for entry in scored if entry[1]]
         if strong_matches:
             best_score, _strong, best_index = max(strong_matches, key=lambda entry: (entry[0], -entry[2]))
-            if best_score > 0:
-                semantic_assignments[requirement["id"]] = best_index
+            semantic_assignments[requirement["id"]] = best_index
 
     for sprint_index, sprint in enumerate(sprints):
         sprint["requirements_covered"] = preserved_requirements[sprint_index]
 
+    covered_ids: set[str] = set()
     for requirement in source_items:
         requirement_id = requirement["id"]
         if requirement_id in semantic_assignments:
+            # A real semantic/domain match (score_requirement_sprint_match >=
+            # _SEMANTIC_MATCH_THRESHOLD) always wins over the model's raw placement.
             targets = [semantic_assignments[requirement_id]]
         else:
-            targets = existing_assignments[requirement_id]
+            # No sprint scores as a strong match. Keep the model's original placement
+            # ONLY if it isn't a confirmed domain conflict (e.g. an appearance/theme
+            # story attached to a sprint that is demonstrably about job requisitions).
+            # A conflicting placement is dropped here so repair_missing_sprint_requirement_
+            # coverage() finds a better sprint or creates a dedicated one, instead of
+            # keeping a fake "PASS" placement.
+            targets = [
+                sprint_index for sprint_index in existing_assignments[requirement_id]
+                if not _requirement_sprint_domain_conflict(requirement, sprints[sprint_index])
+            ]
         for sprint_index in targets:
             sprints[sprint_index]["requirements_covered"].append({
                 "id": requirement_id,
                 "title": requirement["title"],
             })
+            covered_ids.add(requirement_id)
 
-    semantically_covered = set(semantic_assignments)
     reconciled["deferred_requirements"] = [
         item for item in deferred
         if not isinstance(item, dict)
-        or str(item.get("id") or "").strip().upper() not in semantically_covered
+        or str(item.get("id") or "").strip().upper() not in covered_ids
     ]
     return reconciled
-
-
-_MISSING_REQUIREMENT_AFFINITIES = {
-    "candidate submissions tracker": ("candidate management", "candidate profile", "candidate workspace"),
-    "candidate document management": ("document handoff", "placement document", "document management"),
-    "user and role management": ("user management", "role management", "admin settings"),
-    "account profile management": ("settings", "account profile", "profile settings"),
-    "appearance": ("settings", "appearance", "theme"),
-}
 
 
 def _append_unique_text(target: list, values: list[str]):
@@ -1619,9 +2041,19 @@ def _append_unique_text(target: list, values: list[str]):
 
 
 def _requirement_repair_details(requirement: dict) -> tuple[list[str], list[str]]:
+    """Concrete build items/completion criteria pulled from the source story itself
+    (story_text + acceptance_criteria) so a repair-created sprint is never vague."""
     title = str(requirement.get("title") or requirement.get("id") or "Requirement").strip()
+    story = str(requirement.get("story_text") or "").strip()
     criteria = [str(value).strip() for value in requirement.get("acceptance_criteria") or [] if str(value).strip()]
-    build_items = [f"Implement {title}"]
+
+    build_items = [f"Build the {title} workflow end to end."]
+    if story:
+        build_items.append(story if story.endswith((".", "!", "?")) else f"{story}.")
+    build_items.extend(criteria)
+    if len(build_items) < 2:
+        build_items.append(f"Implement {title} per source requirement {requirement.get('id', '')}.".strip())
+
     completion_criteria = criteria or [f"{title} is available and works as described in the source story."]
     return build_items, completion_criteria
 
@@ -1640,6 +2072,9 @@ def _attach_requirement_to_sprint(sprint: dict, requirement: dict):
 
 
 def _best_existing_sprint_for_missing_requirement(requirement: dict, sprints: list[dict]) -> int | None:
+    """Best existing sprint for a missing requirement, or None if nothing actually
+    builds it (score_requirement_sprint_match below _SEMANTIC_MATCH_THRESHOLD for every
+    sprint) — callers must create a dedicated sprint rather than attach it randomly."""
     scored = [
         (*_requirement_sprint_semantic_score(requirement, sprint), index)
         for index, sprint in enumerate(sprints)
@@ -1647,36 +2082,67 @@ def _best_existing_sprint_for_missing_requirement(requirement: dict, sprints: li
     strong_matches = [entry for entry in scored if entry[1]]
     if strong_matches:
         return max(strong_matches, key=lambda entry: (entry[0], -entry[2]))[2]
-
-    requirement_text = _semantic_text(requirement.get("title", ""))
-    for source_phrase, affinities in _MISSING_REQUIREMENT_AFFINITIES.items():
-        if source_phrase not in requirement_text:
-            continue
-        affinity_matches = []
-        for index, sprint in enumerate(sprints):
-            primary_text, _secondary = _sprint_semantic_texts(sprint)
-            hits = sum(affinity in primary_text for affinity in affinities)
-            if hits:
-                affinity_matches.append((hits, index))
-        if affinity_matches:
-            return max(affinity_matches, key=lambda entry: (entry[0], -entry[1]))[1]
     return None
 
 
-def _new_requirement_sprint(requirement: dict, previous_sprint_number: int | None) -> dict:
-    build_items, completion_criteria = _requirement_repair_details(requirement)
-    area = str(requirement.get("source_area") or "Requirement").strip()
-    title = str(requirement.get("title") or requirement["id"]).strip()
+def _best_requirement_repair_group(requirement: dict) -> str:
+    """Coarse product-area group key for a requirement with no qualifying existing
+    sprint, used to GROUP related missing requirements into one coherent new sprint
+    instead of one throwaway sprint per requirement. Falls back to "general" when no
+    domain area is recognized at all."""
+    areas = _domain_areas_for_text(_requirement_semantic_text(requirement))
+    if not areas:
+        return "general"
+    best_area = max(areas, key=lambda area: areas[area])
+    return _DOMAIN_TO_REPAIR_GROUP.get(best_area, "general")
+
+
+def _clean_fallback_group_title(requirements: list[dict]) -> str:
+    """A non-vague title for a "general" group with no recognized domain area — never
+    the old 'General: Jira: ...' style (raw area + raw, possibly messy source title)."""
+    areas = {
+        str(requirement.get("source_area") or "").strip()
+        for requirement in requirements
+    }
+    areas.discard("")
+    areas.discard("General")
+    if len(areas) == 1:
+        return f"{next(iter(areas))} Requirements"
+    return "Additional Requirements"
+
+
+def _new_grouped_requirement_sprint(
+    group_key: str, requirements: list[dict], previous_sprint_number: int | None
+) -> dict:
+    """One repair-created sprint covering ALL requirements in `requirements`, grouped
+    by coarse product area (see _DOMAIN_TO_REPAIR_GROUP / _REPAIR_GROUP_TITLES) — e.g.
+    every omitted security/infrastructure requirement lands together in one
+    "Security, Access Control, and Platform Hardening" sprint, not scattered one-per-
+    sprint and never folded into an unrelated UI shell sprint like "Dashboard Shell"."""
+    title = _REPAIR_GROUP_TITLES.get(group_key) or _clean_fallback_group_title(requirements)
+    build_items: list[str] = []
+    completion_criteria: list[str] = []
+    for requirement in requirements:
+        items, criteria = _requirement_repair_details(requirement)
+        _append_unique_text(build_items, items)
+        _append_unique_text(completion_criteria, criteria)
+
+    requirement_titles = ", ".join(
+        str(requirement.get("title") or requirement["id"]).strip() for requirement in requirements
+    )
     return {
         "number": (previous_sprint_number or 0) + 1,
-        "title": f"{area}: {title}" if area.lower() not in title.lower() else title,
-        "goal": f"Build the complete {title} workflow from source requirement {requirement['id']}.",
-        "why_this_order": "Added deterministically because the generated roadmap omitted this source requirement.",
-        "requirements_covered": [{"id": requirement["id"], "title": title}],
+        "title": title,
+        "goal": f"Build {title.rstrip('.')}: {requirement_titles}.",
+        "why_this_order": "Added deterministically because the generated roadmap omitted these source requirements.",
+        "requirements_covered": [
+            {"id": requirement["id"], "title": requirement.get("title") or requirement["id"]}
+            for requirement in requirements
+        ],
         "build_items": build_items,
         "not_included": [],
         "files_modules_touched": [],
-        "user_visible_result": f"Users can complete the {title} workflow.",
+        "user_visible_result": f"{title} is fully implemented and demoable.",
         "completion_criteria": completion_criteria,
         "smoke_checks": completion_criteria[:],
         "dependencies": [previous_sprint_number] if previous_sprint_number else [],
@@ -1688,9 +2154,13 @@ def _new_requirement_sprint(requirement: dict, previous_sprint_number: int | Non
 def repair_missing_sprint_requirement_coverage(source_text: str, sprint_plan_json: dict) -> dict:
     """Guarantee every non-deferred canonical source Jira story appears in a sprint.
 
-    Missing stories attach only on a strong semantic/explicit area affinity. Otherwise a
-    requirement-specific sprint is appended. At the 12-sprint ceiling, remaining stories
-    attach to the closest existing/new sprint so coverage is never silently lost.
+    Missing stories attach only on a strong semantic/explicit area affinity. Requirements
+    that don't fit any existing sprint are GROUPED by coarse product area (dashboard,
+    requisitions/integrations, AI matching, candidate management, candidate portal,
+    offer/placement/document workflows, user/settings, security/infrastructure) into one
+    new sprint per group — never one sprint per requirement, and never dumped into an
+    unrelated existing sprint just because it exists. At the 12-sprint ceiling, remaining
+    stories attach to the closest existing/new sprint so coverage is never silently lost.
     """
     source_items = _extract_source_jira_requirements(source_text)
     if not source_items:
@@ -1709,6 +2179,7 @@ def repair_missing_sprint_requirement_coverage(source_text: str, sprint_plan_jso
         if isinstance(item, dict) and str(item.get("reason") or "").strip()
     }
 
+    still_missing: list[dict] = []
     for requirement in source_items:
         requirement_id = requirement["id"]
         if requirement_id in covered_ids or requirement_id in explicitly_deferred_ids:
@@ -1716,20 +2187,33 @@ def repair_missing_sprint_requirement_coverage(source_text: str, sprint_plan_jso
         target_index = _best_existing_sprint_for_missing_requirement(requirement, sprints)
         if target_index is not None:
             _attach_requirement_to_sprint(sprints[target_index], requirement)
-        elif len(sprints) < _MAX_SPRINT_COUNT:
-            previous_number = int(sprints[-1].get("number", len(sprints))) if sprints else None
-            sprints.append(_new_requirement_sprint(requirement, previous_number))
+            covered_ids.add(requirement_id)
         else:
-            # At the cap, choose the highest relaxed title/area token overlap rather than omit.
-            requirement_tokens = _requirement_title_tokens(
-                f"{requirement.get('title', '')} {requirement.get('source_area', '')}"
-            )
-            target_index = max(
-                range(len(sprints)),
-                key=lambda index: len(requirement_tokens & _requirement_title_tokens(_sprint_semantic_texts(sprints[index])[0])),
-            )
-            _attach_requirement_to_sprint(sprints[target_index], requirement)
-        covered_ids.add(requirement_id)
+            still_missing.append(requirement)
+
+    groups: dict[str, list[dict]] = {}
+    for requirement in still_missing:
+        groups.setdefault(_best_requirement_repair_group(requirement), []).append(requirement)
+
+    for requirements in groups.values():
+        if len(sprints) < _MAX_SPRINT_COUNT:
+            previous_number = int(sprints[-1].get("number", len(sprints))) if sprints else None
+            group_key = _best_requirement_repair_group(requirements[0])
+            sprints.append(_new_grouped_requirement_sprint(group_key, requirements, previous_number))
+            for requirement in requirements:
+                covered_ids.add(requirement["id"])
+        else:
+            # At the sprint cap, attach each remaining requirement individually to the
+            # least-bad existing sprint rather than omit coverage entirely — still picked
+            # by the same scoring function, just without requiring it to clear
+            # _SEMANTIC_MATCH_THRESHOLD.
+            for requirement in requirements:
+                target_index = max(
+                    range(len(sprints)),
+                    key=lambda index: score_requirement_sprint_match(requirement, sprints[index]),
+                )
+                _attach_requirement_to_sprint(sprints[target_index], requirement)
+                covered_ids.add(requirement["id"])
 
     old_to_new = {}
     for new_number, sprint in enumerate(sprints, start=1):
@@ -1794,10 +2278,12 @@ def build_requirement_coverage_map(source_text: str, sprint_plan_json: dict) -> 
     coverage_items = []
     for item in source_items:
         requirement_id = item["id"]
+        # Word-boundary match: "ATS-3" must not match inside "ATS-30".
+        id_pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(requirement_id.upper())}(?![0-9])")
         covered_by = []
         for sprint in sprint_plan_json.get("sprints", []):
             sprint_text = json.dumps(sprint, ensure_ascii=False).upper()
-            if requirement_id.upper() in sprint_text:
+            if id_pattern.search(sprint_text):
                 covered_by.append(int(sprint.get("number", 0)))
         deferred = deferred_by_id.get(requirement_id.upper())
         status = "covered" if covered_by else "deferred" if deferred else "uncovered"
@@ -1844,22 +2330,81 @@ def render_requirement_coverage_map_markdown(coverage_map: dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_sprint_coverage_check(source_text: str, *coverage_texts: str) -> tuple[bool, str]:
-    """Non-blocking Jira-ID coverage check used after sprint planning."""
-    detected = [item["id"] for item in _extract_source_jira_requirements(source_text)]
-    combined = "\n".join(coverage_texts).upper()
-    covered = [requirement_id for requirement_id in detected if requirement_id in combined]
-    missing = [requirement_id for requirement_id in detected if requirement_id not in combined]
+def render_sprint_coverage_check(source_text: str, sprint_plan_json: dict) -> tuple[bool, str]:
+    """Semantic sprint coverage check.
+
+    A plain ID-substring search (the old implementation) lets the plan PASS by attaching
+    a requirement to any unrelated sprint, as long as the ID string appears somewhere in
+    the output. This checks that every detected requirement is either explicitly deferred
+    with a reason, or attached to at least one sprint that does not have a confirmed
+    domain conflict with it (_requirement_sprint_domain_conflict) — e.g. an
+    appearance/theme story attached only to a sprint that is demonstrably about job
+    requisitions is reported as "Mismatched", not "Covered", and the overall result is
+    WARN, not PASS. A sprint with no domain signal at all (under-described, but not
+    *wrong*) is not flagged — this check targets obviously wrong placements, not vague
+    ones (repair_missing_sprint_requirement_coverage is what makes placements specific).
+    """
+    detected_items = _extract_source_jira_requirements(source_text)
+    detected_ids = [item["id"] for item in detected_items]
+    sprints = (sprint_plan_json or {}).get("sprints") or []
+
+    sprints_by_number: dict[int, dict] = {}
+    for sprint in sprints:
+        try:
+            sprints_by_number[int(sprint.get("number", 0))] = sprint
+        except (TypeError, ValueError):
+            continue
+
+    assignment: dict[str, list[int]] = {}
+    for number, sprint in sprints_by_number.items():
+        for requirement in sprint.get("requirements_covered") or []:
+            if not isinstance(requirement, dict):
+                continue
+            requirement_id = str(requirement.get("id") or "").strip().upper()
+            if requirement_id:
+                assignment.setdefault(requirement_id, []).append(number)
+
+    deferred_ids = {
+        str(item.get("id") or "").strip().upper()
+        for item in (sprint_plan_json or {}).get("deferred_requirements") or []
+        if isinstance(item, dict) and str(item.get("reason") or "").strip()
+    }
+
+    covered, missing, mismatched = [], [], []
+    for requirement in detected_items:
+        requirement_id = requirement["id"]
+        sprint_numbers = assignment.get(requirement_id) or []
+        assigned_sprints = [sprints_by_number[number] for number in sprint_numbers if number in sprints_by_number]
+        if assigned_sprints:
+            if all(_requirement_sprint_domain_conflict(requirement, sprint) for sprint in assigned_sprints):
+                mismatched.append((requirement_id, sprint_numbers))
+            else:
+                covered.append(requirement_id)
+        elif requirement_id in deferred_ids:
+            covered.append(requirement_id)
+        else:
+            missing.append(requirement_id)
+
+    passed = not missing and not mismatched
     lines = [
         "Sprint Coverage Check",
-        f"Detected requirement IDs: {', '.join(detected) if detected else 'none'}",
+        f"Detected requirement IDs: {', '.join(detected_ids) if detected_ids else 'none'}",
         f"Covered IDs: {', '.join(covered) if covered else 'none'}",
         f"Missing IDs: {', '.join(missing) if missing else 'none'}",
-        f"Result: {'WARN' if missing else 'PASS'}",
+        f"Mismatched IDs: {', '.join(rid for rid, _ in mismatched) if mismatched else 'none'}",
+        f"Result: {'PASS' if passed else 'WARN'}",
     ]
     if missing:
         lines += ["", "Missing IDs:", *[f"- {requirement_id}" for requirement_id in missing]]
-    return not missing, "\n".join(lines) + "\n"
+    if mismatched:
+        lines += [
+            "", "Mismatched IDs (attached to a sprint that does not build this requirement):",
+            *[
+                f"- {requirement_id} -> Sprint {', '.join(str(n) for n in sprint_numbers)}"
+                for requirement_id, sprint_numbers in mismatched
+            ],
+        ]
+    return passed, "\n".join(lines) + "\n"
 
 
 def render_sprint_plan_markdown(sprint_plan_json: dict) -> str:
@@ -2040,15 +2585,7 @@ def generate_sprint_plan(
     (run_dir / "requirement_coverage_map.json").write_text(coverage_map_json, encoding="utf-8")
     (run_dir / "requirement_coverage_map.md").write_text(coverage_map_md, encoding="utf-8")
 
-    # An ID listed only as uncovered in the map does not count as covered. Include mapped
-    # coverage only for items assigned to at least one sprint (or explicitly deferred).
-    mapped_coverage = json.dumps([
-        item for item in coverage_map["coverage_items"]
-        if item.get("coverage_status") in {"covered", "deferred"}
-    ], ensure_ascii=False)
-    _coverage_ok, coverage_report = render_sprint_coverage_check(
-        coverage_source, json.dumps(sprint_plan_json, ensure_ascii=False), sprint_plan_md, mapped_coverage,
-    )
+    _coverage_ok, coverage_report = render_sprint_coverage_check(coverage_source, sprint_plan_json)
     (run_dir / "sprint_coverage_check.txt").write_text(coverage_report, encoding="utf-8")
 
     return sprint_plan_json, sprint_plan_md

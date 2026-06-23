@@ -35,6 +35,7 @@ from pipeline_mvp_builder import (
     repair_missing_sprint_requirement_coverage,
     render_requirement_coverage_map_markdown,
     render_sprint_coverage_check,
+    score_requirement_sprint_match,
     _extract_source_jira_requirements,
     generate_selected_sprint_build_prompt,
     detect_negative_constraints,
@@ -551,7 +552,10 @@ def test_requirement_coverage_map_preserves_jira_ids_and_repairs_missing():
     assert by_id["ATS-39"]["coverage_status"] == "covered"
     markdown = render_requirement_coverage_map_markdown(coverage)
     assert "| ATS-29 | KPI Summary Cards | Dashboard | Sprint 1 | covered |" in markdown
-    ok, report = render_sprint_coverage_check(source, json.dumps(coverage))
+    repaired_plan = repair_missing_sprint_requirement_coverage(
+        source, reconcile_sprint_requirement_coverage(source, plan)
+    )
+    ok, report = render_sprint_coverage_check(source, repaired_plan)
     assert ok is True
     assert "Result: PASS" in report and "Missing IDs: none" in report
     print("PASS: coverage map preserves Jira IDs and deterministically repairs omissions")
@@ -605,7 +609,7 @@ def test_model_renumbered_ids_are_restored_to_source_ids_and_pass_coverage():
         assert f'"{invented_id}"' not in plan_json
         assert f"| {invented_id} |" not in coverage_md
 
-    ok, report = render_sprint_coverage_check(source, plan_json, plan_md, coverage_json)
+    ok, report = render_sprint_coverage_check(source, reconciled)
     assert ok is True
     assert "Covered IDs: ATS-29, ATS-30, ATS-31" in report
     assert "Missing IDs: none" in report
@@ -675,7 +679,7 @@ Acceptance Criteria:
     assert coverage["coverage_summary"] == {
         "total_items": 5, "covered_items": 5, "uncovered_items": 0, "deferred_items": 0,
     }
-    ok, report = render_sprint_coverage_check(source, json.dumps(plan), json.dumps(coverage))
+    ok, report = render_sprint_coverage_check(source, plan)
     assert ok is True
     assert "Covered IDs: ATS-29, ATS-30, ATS-42, ATS-43, ATS-44" in report
     assert "Missing IDs: none" in report
@@ -760,9 +764,7 @@ Acceptance Criteria:
     coverage = build_requirement_coverage_map(source, repaired)
     assert coverage["coverage_summary"]["covered_items"] == 6
     assert coverage["coverage_summary"]["uncovered_items"] == 0
-    plan_text = json.dumps(repaired)
-    coverage_text = json.dumps(coverage)
-    ok, report = render_sprint_coverage_check(source, plan_text, coverage_text)
+    ok, report = render_sprint_coverage_check(source, repaired)
     assert ok is True
     assert "Missing IDs: none" in report
     assert "Result: PASS" in report
@@ -835,7 +837,7 @@ Acceptance Criteria:
     for requirement_id in ("ATS-35", "ATS-37", "ATS-38", "ATS-40", "ATS-41"):
         assert requirement_id in plan_md
     coverage = build_requirement_coverage_map(source, repaired)
-    ok, report = render_sprint_coverage_check(source, json.dumps(repaired), json.dumps(coverage), plan_md)
+    ok, report = render_sprint_coverage_check(source, repaired)
     assert ok is True
     assert coverage["coverage_summary"]["uncovered_items"] == 0
     assert "Missing IDs: none" in report
@@ -860,6 +862,573 @@ def test_new_sprint_fields_are_normalized_and_rendered():
     assert "**What will be built:**" in markdown
     assert "**Completion criteria:**" in markdown
     print("PASS: new sprint specificity fields normalize and render without removing old fields")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Semantic sprint-assignment quality: a passing coverage check must mean the
+#  requirement is actually attached to the sprint that builds it, not just that
+#  the ID string appears somewhere in the plan. Regressions for the OneATS bug
+#  report: ATS-44 (Appearance) dumped into a Job Requisition sprint, ATS-32/33
+#  (AI features) dumped into basic requisition CRUD, omitted AI/placement
+#  stories not attached/created correctly.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_appearance_story_misattached_to_requisition_sprint_is_moved():
+    """ATS-44 (Appearance) incorrectly placed under a Job Requisition sprint must be
+    moved to the Settings/Appearance sprint that actually builds it."""
+    source = """1. Job Requisition – Create, View, and Search Requisitions
+Jira: ATS-31 | Feature: Requisitions | Role: Admin
+As an Admin, I want to create, view, and search job requisitions.
+Acceptance Criteria:
+- A requisition modal and searchable requisition list are available.
+
+2. Appearance / Dark Mode / Accent Themes
+Jira: ATS-44 | Feature: Settings | Role: User
+As a User, I want to configure appearance and dark mode.
+Acceptance Criteria:
+- Dark mode and accent colour themes can be selected.
+"""
+    bad_plan = normalize_sprint_plan({"sprints": [
+        {"number": 2, "title": "Job Requisition Management",
+         "goal": "Create, view, and search job requisitions.",
+         "requirements_covered": [
+             {"id": "ATS-31", "title": "Job Requisition"},
+             {"id": "ATS-44", "title": "Appearance"},
+         ],
+         "build_items": ["Requisition creation modal", "Searchable requisition list"]},
+        {"number": 6, "title": "Settings: Appearance",
+         "goal": "Let users choose dark mode and accent colour themes.",
+         "requirements_covered": [], "build_items": ["Dark mode toggle", "Accent theme picker"]},
+    ]})
+
+    reconciled = reconcile_sprint_requirement_coverage(source, bad_plan)
+    ids_by_sprint = {
+        sprint["number"]: [item["id"] for item in sprint["requirements_covered"]]
+        for sprint in reconciled["sprints"]
+    }
+    assert ids_by_sprint[2] == ["ATS-31"], f"ATS-44 must no longer be in the requisition sprint: {ids_by_sprint}"
+    assert ids_by_sprint[6] == ["ATS-44"], f"ATS-44 must move to the appearance sprint: {ids_by_sprint}"
+
+    ok, report = render_sprint_coverage_check(source, reconciled)
+    assert ok is True
+    assert "Mismatched IDs: none" in report
+    print("PASS: ATS-44 misattached to a Job Requisition sprint is moved to the Settings/Appearance sprint")
+
+
+def test_omitted_ai_resume_matching_story_attaches_to_its_own_empty_sprint():
+    """ATS-33 (AI Resume Matching) omitted from the model plan, but an AI Resume Matching
+    sprint with no requirements exists — repair must attach it there, not elsewhere."""
+    source = """1. AI Resume Matching
+Jira: ATS-33 | Feature: Candidates | Role: Recruiter
+As a Recruiter, I want ranked candidates and match scores from AI resume matching.
+Acceptance Criteria:
+- Resume matching displays a match score and matched skills.
+"""
+    bad_plan = normalize_sprint_plan({"sprints": [
+        {"number": 1, "title": "Candidate Management", "goal": "Add and view candidate profiles.",
+         "requirements_covered": [], "build_items": ["Candidate profile workspace"]},
+        {"number": 2, "title": "AI Resume Matching", "goal": "Rank candidates using AI resume matching.",
+         "requirements_covered": [], "build_items": ["Ranked candidates", "Match score", "Skill gaps"]},
+    ]})
+
+    repaired = repair_missing_sprint_requirement_coverage(source, bad_plan)
+    ids_by_sprint = {
+        sprint["number"]: [item["id"] for item in sprint["requirements_covered"]]
+        for sprint in repaired["sprints"]
+    }
+    assert ids_by_sprint[2] == ["ATS-33"], f"ATS-33 must attach to the AI Resume Matching sprint: {ids_by_sprint}"
+    assert ids_by_sprint[1] == [], "ATS-33 must not attach to the unrelated Candidate Management sprint"
+    print("PASS: omitted ATS-33 attaches to the existing empty AI Resume Matching sprint")
+
+
+def test_omitted_placement_story_with_no_matching_sprint_creates_new_sprint():
+    """ATS-40 (Placement Approval) omitted with no placement/document sprint anywhere —
+    repair must create a new, specific sprint rather than attach it randomly."""
+    source = """1. Placement Approval and Automatic Document Handoff
+Jira: ATS-40 | Feature: Placements | Role: Admin
+As an Admin, I want placement approval and automatic document handoff.
+Acceptance Criteria:
+- Approved placements automatically hand off documents.
+- Pay rate, bill rate, and margin are shown before approval.
+"""
+    bad_plan = normalize_sprint_plan({"sprints": [
+        {"number": 1, "title": "Candidate Management", "goal": "Add and view candidate profiles.",
+         "requirements_covered": [], "build_items": ["Candidate profile workspace"]},
+        {"number": 2, "title": "Settings: Appearance", "goal": "Dark mode and accent colour themes.",
+         "requirements_covered": [], "build_items": ["Theme picker"]},
+    ]})
+
+    repaired = repair_missing_sprint_requirement_coverage(source, bad_plan)
+    assert len(repaired["sprints"]) == 3, "A dedicated new sprint must be created for ATS-40"
+    new_sprint = repaired["sprints"][-1]
+    assert any(
+        isinstance(item, dict) and item.get("id") == "ATS-40"
+        for item in new_sprint["requirements_covered"]
+    )
+    assert new_sprint["build_items"], "the new sprint must have concrete build items, not be vague"
+    assert new_sprint["completion_criteria"], "the new sprint must have concrete completion criteria"
+    print("PASS: omitted ATS-40 with no matching sprint creates a new, specific placement sprint")
+
+
+def test_coverage_check_fails_when_requirement_dumped_into_unrelated_sprint():
+    """The coverage check must WARN (not PASS) when a requirement's ID is technically
+    present but attached only to a sprint that is demonstrably about something else —
+    this is the exact 'fake PASS' bug: dumping missing IDs into unrelated sprints."""
+    source = """1. Appearance / Dark Mode / Accent Themes
+Jira: ATS-44 | Feature: Settings | Role: User
+As a User, I want to configure appearance and dark mode.
+Acceptance Criteria:
+- Dark mode and accent colour themes can be selected.
+"""
+    fake_pass_plan = normalize_sprint_plan({"sprints": [
+        {"number": 1, "title": "Job Requisition Management",
+         "goal": "Create, view, and search job requisitions.",
+         "requirements_covered": [{"id": "ATS-44", "title": "Appearance"}],
+         "build_items": ["Requisition creation modal", "Searchable requisition list"]},
+    ]})
+    ok, report = render_sprint_coverage_check(source, fake_pass_plan)
+    assert ok is False, f"Expected WARN for a requirement dumped into an unrelated sprint, got:\n{report}"
+    assert "Result: WARN" in report
+    assert "ATS-44" in report
+    print("PASS: coverage check WARNs (does not fake-PASS) when a requirement is dumped into an unrelated sprint")
+
+    deferred_plan = normalize_sprint_plan({
+        "deferred_requirements": [{"id": "ATS-44", "title": "Appearance", "reason": "Post-MVP polish."}],
+        "sprints": [{"number": 1, "title": "Job Requisition Management", "requirements_covered": []}],
+    })
+    ok, report = render_sprint_coverage_check(source, deferred_plan)
+    assert ok is True, f"Expected PASS for an explicitly deferred requirement, got:\n{report}"
+    print("PASS: coverage check PASSes when a requirement is explicitly deferred with a reason")
+
+
+_ONEATS_FULL_SOURCE = """OneATS User Stories
+Stories: ATS-29 to ATS-44
+
+1. Dashboard KPI Summary Cards
+Jira: ATS-29 | Feature: Dashboard | Role: Admin
+As an Admin, I want KPI summary cards so that I can see recruiting metrics at a glance.
+Acceptance Criteria:
+- Four KPI cards are visible on the dashboard.
+
+2. Approval Queue with Inline Actions
+Jira: ATS-30 | Feature: Dashboard | Role: Admin
+As an Admin, I want an approval queue with inline actions on the dashboard.
+Acceptance Criteria:
+- The approval queue supports inline approve/reject actions.
+
+3. Job Requisition – Create, View, and Search
+Jira: ATS-31 | Feature: Requisitions | Role: Admin
+As an Admin, I want to create, view, and search job requisitions.
+Acceptance Criteria:
+- A requisition modal and searchable requisition list are available.
+- Rate card and required skills are captured per requisition.
+
+4. AI Requisition Auto-Approval
+Jira: ATS-32 | Feature: Requisitions | Role: Admin
+As an Admin, I want AI review and auto-approval of requisitions.
+Acceptance Criteria:
+- Requisitions can be auto-approved or sent to manual review.
+
+5. AI Resume Matching
+Jira: ATS-33 | Feature: Candidates | Role: Recruiter
+As a Recruiter, I want AI resume matching with ranked candidates and match scores.
+Acceptance Criteria:
+- Resume matching shows a match score and matched skills per candidate.
+
+6. Candidate Management
+Jira: ATS-34 | Feature: Candidates | Role: Recruiter
+As a Recruiter, I want to add and view candidate profiles.
+Acceptance Criteria:
+- A new candidate can be added with a target role and resume upload.
+
+7. Candidate Submissions Tracker
+Jira: ATS-35 | Feature: Candidates | Role: Recruiter
+As a Recruiter, I want a submissions tracker across all recruiters.
+Acceptance Criteria:
+- All submissions show a cross-recruiter submission status.
+
+8. Duplicate Candidate Detection
+Jira: ATS-36 | Feature: Candidates | Role: Recruiter
+As a Recruiter, I want duplicate candidate detection with merge support.
+Acceptance Criteria:
+- Possible duplicates with the same phone or email can be dismissed or merged.
+
+9. Interview & Progress Tracking
+Jira: ATS-37 | Feature: Progress | Role: Recruiter
+As a Recruiter, I want interview scheduling and progress tracking.
+Acceptance Criteria:
+- Interview rounds show scheduled, completed, or feedback pending status.
+
+10. Offer Approval Workflow
+Jira: ATS-38 | Feature: Approvals | Role: Admin
+As an Admin, I want to approve offers awaiting approval or send them back.
+Acceptance Criteria:
+- Offers awaiting approval can be approved and sent, or sent back with the offered amount shown.
+
+11. NDA & Document Signature Tracking
+Jira: ATS-39 | Feature: Compliance | Role: Admin
+As an Admin, I want NDA and signature tracking with reminders.
+Acceptance Criteria:
+- Signed, expired, and send-reminder states are tracked for each consent form.
+
+12. Placement Approval and Automatic Document Handoff
+Jira: ATS-40 | Feature: Placements | Role: Admin
+As an Admin, I want placement approval and automatic document handoff.
+Acceptance Criteria:
+- Placement approval shows pay rate, bill rate, and margin before closure.
+- Approved placements automatically hand off documents.
+
+13. Candidate Document Management
+Jira: ATS-41 | Feature: Documents | Role: Recruiter
+As a Recruiter, I want candidate document management with a checklist.
+Acceptance Criteria:
+- Required documents like offer letter, background check, and I-9 can be attached.
+
+14. User & Role Management
+Jira: ATS-42 | Feature: Users & Roles | Role: Admin
+As an Admin, I want to invite users and assign roles.
+Acceptance Criteria:
+- Users can be invited and have a role assignment with last login shown.
+
+15. Account Profile Management
+Jira: ATS-43 | Feature: Settings | Role: User
+As a User, I want to update my account profile.
+Acceptance Criteria:
+- Full name, email, title, and phone can be saved.
+
+16. Appearance / Dark Mode / Accent Themes
+Jira: ATS-44 | Feature: Settings | Role: User
+As a User, I want to configure appearance, dark mode, and accent colour themes.
+Acceptance Criteria:
+- Dark mode and accent colour themes (Gold, Steel Blue, Sage, Terracotta, Plum) can be selected.
+"""
+
+_ONEATS_BAD_MODEL_PLAN = normalize_sprint_plan({
+    "sprints": [
+        {"number": 1, "title": "Dashboard Shell", "goal": "Show KPI cards and an approval queue.",
+         "requirements_covered": [
+             {"id": "ATS-29", "title": "Dashboard KPI Summary Cards"},
+             {"id": "ATS-30", "title": "Approval Queue with Inline Actions"},
+         ],
+         "build_items": ["Four KPI cards", "Approval queue with inline actions"]},
+        # Bug-report scenario: AI features and Appearance dumped into requisition CRUD.
+        {"number": 2, "title": "Job Requisition Management",
+         "goal": "Create, view, and search job requisitions.",
+         "requirements_covered": [
+             {"id": "ATS-31", "title": "Job Requisition"},
+             {"id": "ATS-32", "title": "AI Requisition Auto-Approval"},
+             {"id": "ATS-33", "title": "AI Resume Matching"},
+             {"id": "ATS-44", "title": "Appearance"},
+         ],
+         "build_items": ["Requisition creation modal", "Searchable requisition list"]},
+        # Bug-report scenario: titled "AI Features" but covers nothing.
+        {"number": 3, "title": "Advanced AI Features Integration",
+         "goal": "AI-assisted requisition review and resume matching.",
+         "requirements_covered": [], "build_items": ["AI review pipeline"]},
+        {"number": 4, "title": "Candidate Workspace", "goal": "Add, submit, and de-duplicate candidates.",
+         "requirements_covered": [
+             {"id": "ATS-34", "title": "Candidate Management"},
+             {"id": "ATS-35", "title": "Candidate Submissions Tracker"},
+             {"id": "ATS-36", "title": "Duplicate Candidate Detection"},
+         ],
+         "build_items": ["Candidate profile", "Submissions tracker", "Duplicate detection"]},
+        {"number": 5, "title": "Interview, Offers & Compliance",
+         "goal": "Track interview progress, offer approval, and NDA signatures.",
+         "requirements_covered": [
+             {"id": "ATS-37", "title": "Interview & Progress Tracking"},
+             {"id": "ATS-38", "title": "Offer Approval Workflow"},
+             {"id": "ATS-39", "title": "NDA & Document Signature Tracking"},
+         ],
+         "build_items": ["Interview progress tracking", "Offer approval workflow", "NDA signature reminders"]},
+        {"number": 6, "title": "Placements & Document Handoff",
+         "goal": "Approve placements and hand off required documents.",
+         "requirements_covered": [
+             {"id": "ATS-40", "title": "Placement Approval and Automatic Document Handoff"},
+             {"id": "ATS-41", "title": "Candidate Document Management"},
+         ],
+         "build_items": ["Placement approval", "Document handoff checklist"]},
+        {"number": 7, "title": "Settings & Administration",
+         "goal": "Manage users, roles, and the account profile.",
+         "requirements_covered": [
+             {"id": "ATS-42", "title": "User & Role Management"},
+             {"id": "ATS-43", "title": "Account Profile Management"},
+         ],
+         "build_items": ["User invitations", "Role assignment", "Account profile form"]},
+    ],
+})
+
+
+def test_oneats_full_fixture_produces_no_missing_and_no_obviously_wrong_mapping():
+    """End-to-end OneATS-style fixture (ATS-29 through ATS-44) reproducing the exact bug
+    report: ATS-44/ATS-32/ATS-33 dumped into a Job Requisition sprint and an empty 'AI
+    Features' sprint. After reconciliation + repair, coverage must PASS with no missing
+    IDs and no obviously wrong mapping (ATS-44 must not stay under Job Requisition
+    Management; ATS-32/ATS-33 must not stay under basic requisition CRUD)."""
+    plan = reconcile_sprint_requirement_ids(_ONEATS_FULL_SOURCE, _ONEATS_BAD_MODEL_PLAN)
+    plan = reconcile_sprint_requirement_coverage(_ONEATS_FULL_SOURCE, plan)
+    plan = repair_missing_sprint_requirement_coverage(_ONEATS_FULL_SOURCE, plan)
+
+    location_by_id: dict[str, list[str]] = {}
+    for sprint in plan["sprints"]:
+        for requirement in sprint.get("requirements_covered") or []:
+            if isinstance(requirement, dict) and requirement.get("id"):
+                location_by_id.setdefault(requirement["id"], []).append(sprint.get("title", ""))
+
+    for expected_id in (f"ATS-{n}" for n in range(29, 45)):
+        assert expected_id in location_by_id, f"{expected_id} must be covered by some sprint"
+
+    assert "Job Requisition Management" not in location_by_id["ATS-44"], (
+        f"ATS-44 (Appearance) must not stay under Job Requisition Management: {location_by_id['ATS-44']}"
+    )
+    for ai_id in ("ATS-32", "ATS-33"):
+        assert "Job Requisition Management" not in location_by_id[ai_id], (
+            f"{ai_id} (AI feature) must not stay under basic requisition CRUD: {location_by_id[ai_id]}"
+        )
+
+    coverage_map = build_requirement_coverage_map(_ONEATS_FULL_SOURCE, plan)
+    assert coverage_map["coverage_summary"]["uncovered_items"] == 0
+    ok, report = render_sprint_coverage_check(_ONEATS_FULL_SOURCE, plan)
+    assert ok is True, f"Expected PASS, got:\n{report}"
+    assert "Missing IDs: none" in report
+    assert "Mismatched IDs: none" in report
+    print("PASS: OneATS-style ATS-29..ATS-44 fixture reconciles with no missing IDs and no obviously wrong mapping")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  no_database constraint detection must be phrase-based, not a bare "database"
+#  keyword scan. A requirements doc that talks about a "resume database", data
+#  "sourced from the database", "Transport Security to the Database", or an
+#  "application-to-database connection" is NOT prohibiting a database — those are
+#  normal positive database requirements. Only explicit prohibition phrases like
+#  "no database" / "without a database" / "must not use database" count.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_no_database_not_triggered_by_normal_database_mentions():
+    non_prohibitions = [
+        "database",
+        "resume database",
+        "candidate database",
+        "sourced from the database",
+        "database schema",
+        "database encryption",
+        "database access",
+        "database persistence",
+        "Transport Security to the Database",
+        "secure database connection",
+        "application-to-database connection",
+        "stored in the database",
+        "PostgreSQL",
+        "Encrypt the application-to-database connection",
+        "Scan every resume in the database",
+        "Store candidate records in the database",
+    ]
+    for text in non_prohibitions:
+        constraints = detect_negative_constraints(text)
+        assert constraints["no_database"] is False, (
+            f"'{text}' must NOT trigger no_database — it is not a prohibition"
+        )
+    print("PASS: normal positive database mentions never trigger no_database")
+
+
+def test_no_database_triggered_by_explicit_prohibition_phrases():
+    prohibitions = [
+        "no database",
+        "do not use a database",
+        "don't use a database",
+        "without a database",
+        "without database",
+        "no backend database",
+        "no database persistence",
+        "frontend only, no database",
+        "must not use database",
+        "avoid database",
+        "Do not use a database",
+        "Build this without a database",
+        "Frontend only, no database",
+        "Must not use database",
+    ]
+    for text in prohibitions:
+        constraints = detect_negative_constraints(text)
+        assert constraints["no_database"] is True, (
+            f"'{text}' must trigger no_database — it is an explicit prohibition"
+        )
+    print("PASS: explicit no-database prohibition phrases correctly trigger no_database")
+
+
+def test_database_mention_not_blocked_when_no_database_inactive():
+    """If no_database was never detected (e.g. the requirements only mention a normal,
+    positive database requirement), the consistency checker must not block a sprint
+    prompt just because it mentions 'database'."""
+    constraints = detect_negative_constraints(
+        "Scan every resume in the database and store candidate records in the database. "
+        "Encrypt the application-to-database connection with Transport Security to the Database."
+    )
+    assert constraints["no_database"] is False
+    ok, report = check_requirements_consistency(
+        constraints,
+        {"selected_sprint_build_prompt.txt": "Use PostgreSQL to store candidate records in the database."},
+    )
+    assert ok is True, f"Expected no block when no_database is inactive, got:\n{report}"
+    print("PASS: mentioning 'database' is not blocked when no_database was never detected")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Regression: run_064 still falsely detected no_database via the REAL pipeline
+#  path (detect_negative_constraints over raw_input + clean_requirements), because
+#  of an unrelated risk note — "No DB connection pooling (resource exhaustion
+#  risk)" — not a prohibition on using a database at all. Also: "Transport
+#  Security to the Database" / "Encrypt the application-to-database connection"
+#  must never trigger no_database through this same real detection path.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_no_database_not_triggered_through_real_pipeline_detection_path():
+    raw_input = (
+        "OneATS Admin Console — User Stories\n\n"
+        "US-3.1 — Automatically score every applicant against the requisition\n"
+        "As an admin, I want every resume — whether submitted internally or "
+        "sourced from the database — automatically scored.\n"
+        "Acceptance criteria: Scan every resume in the database; store candidate records in the database.\n"
+        "Jira: ON-49 — US-3.1 — Automatically score every applicant against the requisition\n\n"
+        "SR-7 — Transport Security to the Database\n"
+        "What it is: Encrypt the application-to-database connection.\n"
+        "What it uses: common/db.py with a configurable DB_SSL_MODE.\n"
+        "How it's used: Managed/production runtimes default to verify-full.\n\n"
+        "IB-5\n"
+        "No DB connection pooling (resource exhaustion risk)\n"
+    )
+    clean_requirements = "Candidate records are sourced from the database and stored in the database."
+    constraints = detect_negative_constraints(raw_input, "", clean_requirements)
+    assert constraints["no_database"] is False, (
+        "Real pipeline detection path must not flag no_database for risk notes or "
+        "normal database mentions"
+    )
+    print("PASS: real pipeline detection path (raw_input + clean_requirements) never falsely triggers no_database")
+
+
+def test_transport_security_to_database_never_triggers_no_database():
+    for text in (
+        "Transport Security to the Database",
+        "SR-7 — Transport Security to the Database",
+        "Encrypt the application-to-database connection.",
+        "What it uses: common/db.py with a configurable DB_SSL_MODE: disable, require, verify-full.",
+    ):
+        constraints = detect_negative_constraints(text)
+        assert constraints["no_database"] is False, f"'{text}' must never trigger no_database"
+    print("PASS: 'Transport Security to the Database' and related security text never trigger no_database")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Sprint repair quality: security/infrastructure requirements must be grouped
+#  into a dedicated Security/Infrastructure sprint, never dumped into Dashboard
+#  Shell just because it's the only sprint that exists. Repair-created sprints
+#  must have clean, descriptive titles — never "General: Jira: ...".
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SECURITY_REQUIREMENTS_SOURCE = """US-1.1 — View organization-wide performance at a glance
+As an admin, I want a dashboard summarizing open requisitions and pending approvals.
+Acceptance criteria: Dashboard loads by default on login; each stat tile shows a current value.
+Jira: ON-42 — US-1.1 — View organization-wide performance at a glance
+
+SR-1 — Authentication
+What it is: Verify caller identity before any protected operation.
+What it uses: Bearer JWTs signed with JWT_SECRET; pluggable via AUTH_METHOD.
+How it's used: get_current_user() decodes the bearer credential and returns role and permissions.
+
+SR-2 — Password Storage & Verification
+What it is: Credentials must never be stored or compared in plaintext.
+What it uses: PBKDF2-HMAC-SHA256 with a random salt; bcrypt supported for legacy hashes.
+How it's used: hash_password() and verify_password() are called during login.
+
+SR-7 — Transport Security to the Database
+What it is: Encrypt the application-to-database connection.
+What it uses: A configurable DB_SSL_MODE: disable, require, verify-full.
+How it's used: Managed/production runtimes default to verify-full and force SSL on the connection.
+"""
+
+
+def test_security_requirements_grouped_into_dedicated_sprint_not_dashboard_shell():
+    bad_plan = normalize_sprint_plan({"sprints": [
+        {"number": 1, "title": "Dashboard Shell",
+         "goal": "Show KPI summary cards and an approval queue.",
+         "requirements_covered": [],
+         "build_items": ["KPI summary cards", "Approval queue with inline actions"]},
+    ]})
+    plan = reconcile_sprint_requirement_ids(_SECURITY_REQUIREMENTS_SOURCE, bad_plan)
+    plan = reconcile_sprint_requirement_coverage(_SECURITY_REQUIREMENTS_SOURCE, plan)
+    plan = repair_missing_sprint_requirement_coverage(_SECURITY_REQUIREMENTS_SOURCE, plan)
+
+    ids_by_sprint = {
+        sprint["number"]: {
+            "title": sprint["title"],
+            "ids": [r.get("id") for r in sprint.get("requirements_covered") or []],
+        }
+        for sprint in plan["sprints"]
+    }
+    dashboard_sprint = ids_by_sprint[1]
+    assert dashboard_sprint["title"] == "Dashboard Shell"
+    assert dashboard_sprint["ids"] == ["ON-42"], (
+        f"Dashboard Shell must contain only the dashboard requirement, got: {dashboard_sprint['ids']}"
+    )
+
+    security_sprints = [s for s in ids_by_sprint.values() if {"SR-1", "SR-2", "SR-7"} & set(s["ids"])]
+    assert len(security_sprints) == 1, f"Security requirements must land in exactly one sprint: {security_sprints}"
+    security_sprint = security_sprints[0]
+    assert set(security_sprint["ids"]) == {"SR-1", "SR-2", "SR-7"}
+    assert "Dashboard" not in security_sprint["title"]
+    assert "Security" in security_sprint["title"]
+    print("PASS: security/infrastructure requirements group into a dedicated Security sprint, not Dashboard Shell")
+
+
+def test_repair_created_sprints_never_titled_general_jira():
+    source = """Jira: ON-45 — US-2.2 — Auto-publish new requisitions to Ceipal
+US-2.2 — Auto-publish new requisitions to Ceipal
+As an admin, I want every newly created requisition automatically posted to Ceipal.
+Acceptance criteria: On save, the system calls the Ceipal API to create the requisition.
+Jira: ON-45 — US-2.2 — Auto-publish new requisitions to Ceipal
+"""
+    # A messier, ambiguous source line shaped like the original bug report — a Jira
+    # anchor with no clean preceding title at all — must still never produce a
+    # "General: Jira: ..." sprint title.
+    messy_source = "Jira: ON-45 — US-2.2 — Auto-publish new requisitions to Ceipal\n"
+    for text in (source, messy_source):
+        plan = normalize_sprint_plan({"sprints": []})
+        repaired = repair_missing_sprint_requirement_coverage(text, plan)
+        for sprint in repaired["sprints"]:
+            assert not sprint["title"].startswith("General: Jira:"), (
+                f"Repair-created sprint must never be titled 'General: Jira: ...', got: {sprint['title']!r}"
+            )
+            assert "Jira:" not in sprint["title"], f"Sprint title leaked raw 'Jira:' text: {sprint['title']!r}"
+    print("PASS: repair-created sprints are never titled 'General: Jira: ...'")
+
+
+def test_coverage_pass_requires_no_infrastructure_dumped_into_ui_shell_sprint():
+    """End-to-end quality gate: coverage PASS must require not just zero missing/
+    mismatched IDs, but also that no obvious infrastructure requirement ended up in
+    an unrelated UI shell sprint (score_requirement_sprint_match would flag the
+    domain conflict if it had)."""
+    bad_plan = normalize_sprint_plan({"sprints": [
+        {"number": 1, "title": "Dashboard Shell",
+         "goal": "Show KPI summary cards and an approval queue.",
+         "requirements_covered": [],
+         "build_items": ["KPI summary cards", "Approval queue with inline actions"]},
+    ]})
+    plan = reconcile_sprint_requirement_ids(_SECURITY_REQUIREMENTS_SOURCE, bad_plan)
+    plan = reconcile_sprint_requirement_coverage(_SECURITY_REQUIREMENTS_SOURCE, plan)
+    plan = repair_missing_sprint_requirement_coverage(_SECURITY_REQUIREMENTS_SOURCE, plan)
+
+    coverage = build_requirement_coverage_map(_SECURITY_REQUIREMENTS_SOURCE, plan)
+    assert coverage["coverage_summary"]["uncovered_items"] == 0
+    ok, report = render_sprint_coverage_check(_SECURITY_REQUIREMENTS_SOURCE, plan)
+    assert ok is True, f"Expected PASS, got:\n{report}"
+    assert "Missing IDs: none" in report
+    assert "Mismatched IDs: none" in report
+
+    dashboard_sprint = next(s for s in plan["sprints"] if s["title"] == "Dashboard Shell")
+    dashboard_ids = {r.get("id") for r in dashboard_sprint.get("requirements_covered") or []}
+    assert not ({"SR-1", "SR-2", "SR-7"} & dashboard_ids), (
+        "Coverage PASS must not be achieved by dumping security requirements into Dashboard Shell"
+    )
+    print("PASS: coverage PASS requires no infrastructure requirements dumped into the UI shell sprint")
 
 
 if __name__ == "__main__":
@@ -918,5 +1487,24 @@ if __name__ == "__main__":
     test_semantic_reconciliation_repairs_shifted_missing_and_deferred_coverage()
     test_missing_requirement_repair_attaches_or_creates_sprints_and_passes_coverage()
     test_new_sprint_fields_are_normalized_and_rendered()
+
+    # Semantic sprint-assignment quality (OneATS bug report regressions)
+    test_appearance_story_misattached_to_requisition_sprint_is_moved()
+    test_omitted_ai_resume_matching_story_attaches_to_its_own_empty_sprint()
+    test_omitted_placement_story_with_no_matching_sprint_creates_new_sprint()
+    test_coverage_check_fails_when_requirement_dumped_into_unrelated_sprint()
+    test_oneats_full_fixture_produces_no_missing_and_no_obviously_wrong_mapping()
+
+    # no_database constraint detection: phrase-based, not a bare keyword scan
+    test_no_database_not_triggered_by_normal_database_mentions()
+    test_no_database_triggered_by_explicit_prohibition_phrases()
+    test_database_mention_not_blocked_when_no_database_inactive()
+    test_no_database_not_triggered_through_real_pipeline_detection_path()
+    test_transport_security_to_database_never_triggers_no_database()
+
+    # Sprint repair quality: security grouping, no "General: Jira:" fallback titles
+    test_security_requirements_grouped_into_dedicated_sprint_not_dashboard_shell()
+    test_repair_created_sprints_never_titled_general_jira()
+    test_coverage_pass_requires_no_infrastructure_dumped_into_ui_shell_sprint()
 
     print("\nALL TESTS PASSED")
