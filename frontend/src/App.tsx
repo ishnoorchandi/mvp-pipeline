@@ -1170,7 +1170,14 @@ interface FeatureSprintEntry {
   status?: string;
   buildable?: boolean;
   must_not_modify?: string[];
+  overlap_warnings?: string[];
+  overlap_matched_files?: string[];
 }
+
+// A sprint in either of these statuses must never expose a normal, active "Build" button —
+// it overlaps with functionality the Existing Feature Overlap Check found already exists
+// (fully or partially), so building it as scoped risks creating duplicate features.
+const OVERLAP_BLOCKING_STATUSES = new Set(["needs_revision", "blocked_overlap"]);
 
 interface FeatureSprintPlan {
   mode?: string;
@@ -1211,24 +1218,48 @@ function FeatureSprintRoadmap({ plan, onBuild, launching }: {
         <div className="upgrade-sprint-title">Sprint 0 — {plan.baseline?.title ?? "Baseline Existing App"}</div>
         <div className="upgrade-sprint-meta">Not buildable — regression target only</div>
       </div>
-      {sprints.map(s => (
-        <div
-          key={s.sprint_number}
-          className={`upgrade-sprint-card${s.sprint_number === selected ? " upgrade-sprint-selected" : ""}`}
-        >
-          <div className="upgrade-sprint-title">
-            Sprint {s.sprint_number} — {s.title}
-            {s.sprint_number === selected && <span className="upgrade-sprint-pill">SELECTED</span>}
+      {sprints.map(s => {
+        const status = s.status ?? "ready";
+        const hasOverlap = OVERLAP_BLOCKING_STATUSES.has(status) || (s.overlap_warnings?.length ?? 0) > 0;
+        return (
+          <div
+            key={s.sprint_number}
+            className={`upgrade-sprint-card${s.sprint_number === selected ? " upgrade-sprint-selected" : ""}${hasOverlap ? " upgrade-sprint-overlap" : ""}`}
+          >
+            <div className="upgrade-sprint-title">
+              Sprint {s.sprint_number} — {s.title}
+              {s.sprint_number === selected && <span className="upgrade-sprint-pill">SELECTED</span>}
+              {hasOverlap && <span className="upgrade-sprint-pill upgrade-sprint-pill-warning">OVERLAP</span>}
+            </div>
+            <div className="upgrade-sprint-goal">{s.goal}</div>
+            <div className="upgrade-sprint-meta">
+              Depends on: {(s.depends_on ?? [0]).map(d => `Sprint ${d}`).join(", ")} · Status: {status}
+            </div>
+            {hasOverlap && (
+              <div className="upgrade-sprint-overlap-warning">
+                ⚠️ This feature appears partially/already implemented. Extend matched existing files
+                instead of creating duplicate files.
+                {(s.overlap_matched_files?.length ?? 0) > 0 && (
+                  <ul>
+                    {s.overlap_matched_files!.map(f => <li key={f}>{f}</li>)}
+                  </ul>
+                )}
+              </div>
+            )}
+            {onBuild && (
+              hasOverlap ? (
+                <button className="submit-btn submit-btn-disabled" disabled title="This sprint needs roadmap revision before it can be safely built.">
+                  Needs roadmap revision before build
+                </button>
+              ) : (
+                <button className="submit-btn" onClick={() => onBuild(s.sprint_number)} disabled={launching !== null}>
+                  {launching === s.sprint_number ? "Starting…" : `Build Feature Sprint ${s.sprint_number}`}
+                </button>
+              )
+            )}
           </div>
-          <div className="upgrade-sprint-goal">{s.goal}</div>
-          <div className="upgrade-sprint-meta">
-            Depends on: {(s.depends_on ?? [0]).map(d => `Sprint ${d}`).join(", ")} · Status: {s.status ?? "ready"}
-          </div>
-          {onBuild && <button className="submit-btn" onClick={() => onBuild(s.sprint_number)} disabled={launching !== null}>
-            {launching === s.sprint_number ? "Starting…" : `Build Feature Sprint ${s.sprint_number}`}
-          </button>}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

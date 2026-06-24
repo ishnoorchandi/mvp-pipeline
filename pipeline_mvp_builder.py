@@ -3802,7 +3802,8 @@ _REQUIREMENT_AREA_KEYWORDS: dict[str, list[str]] = {
     "Approval Queue / Offer Approvals": ["approval queue", "offer approval", "approval workflow",
                                           "approve", "approval"],
     "Placement Closure Workflow": ["placement closure", "closure workflow", "placement", "closure approval"],
-    "Reporting / Analytics": ["report", "reporting", "analytics"],
+    "Reporting / Analytics": ["report", "reporting", "analytics", "dashboard", "metrics",
+                              "performance dashboard"],
     "Security / RBAC / Permissions": ["security", "rbac", "role-based access", "permission", "access control"],
     "Audit / Compliance / Logs": ["audit", "compliance", "audit log", "audit trail"],
     "Ceipal Integration": ["ceipal"],
@@ -3854,7 +3855,166 @@ def _detected_requirement_areas(text: str) -> list[str]:
             if any(kw in lowered for kw in keywords)]
 
 
-def generate_feature_gap_matrix(scan: dict, new_feature_requirements: str, run_dir) -> str:
+# ── Existing Feature Overlap Check ──────────────────────────────────────────────
+# Runs before the feature gap matrix and feature sprint planning. The feature gap matrix's
+# own evidence search (frontend_routes/components/api_files) only covers a few conventional
+# folder names, so a feature module living somewhere else (e.g. OneHR-UI/src/modules/oneats/)
+# can be invisible to it even though it clearly implements the requested area. This check
+# searches the FULL file list instead, so existing work is never silently overlooked.
+
+def _prefer_module_files(files: list[str]) -> list[str]:
+    """Stable-sort so files under a feature module folder (".../modules/<x>/...") rank above
+    generic catch-all folders like src/components when both match the same area's keywords —
+    a dedicated module is stronger evidence of a purpose-built existing feature."""
+    def _rank(path: str) -> int:
+        lowered = path.lower()
+        if "/modules/" in lowered or lowered.startswith("modules/"):
+            return 0
+        if "/components/" in lowered or lowered.startswith("components/"):
+            return 2
+        return 1
+    return sorted(files, key=_rank)
+
+
+_OVERLAP_EVIDENCE_FILE_LIMIT = 6
+_OVERLAP_SNIPPET_FILE_LIMIT = 3
+_OVERLAP_SNIPPET_MAX_CHARS = 1500
+_OVERLAP_STATUS_RECOMMENDED_ACTION = {
+    "already_implemented": "skip",
+    "partially_implemented": "extend existing",
+    "missing": "create new",
+    "uncertain": "investigate manually",
+}
+
+
+def _read_repo_text(scan: dict, rel_path: str, max_chars: int = _OVERLAP_SNIPPET_MAX_CHARS) -> str:
+    root = scan.get("root")
+    if not root:
+        return ""
+    return _safe_read_text(Path(root) / rel_path, max_chars=max_chars)
+
+
+def _area_evidence_snippets(scan: dict, files: list[str], keywords: list[str]) -> list[str]:
+    snippets = []
+    for rel_path in files[:_OVERLAP_SNIPPET_FILE_LIMIT]:
+        text = _read_repo_text(scan, rel_path)
+        if not text:
+            continue
+        for line in text.splitlines():
+            if any(kw in line.lower() for kw in keywords):
+                stripped = line.strip()
+                if stripped:
+                    snippets.append(f"{rel_path}: {stripped[:160]}")
+                    break
+    return snippets[:_OVERLAP_SNIPPET_FILE_LIMIT]
+
+
+def classify_existing_feature_overlap(scan: dict, new_feature_requirements: str) -> dict:
+    """Deterministic — no GPT call. For every requirement area mentioned in the feature
+    request, scans the ENTIRE repo file list (not just the feature gap matrix's narrower
+    conventional-folder buckets) for filename/route/test evidence, and classifies overlap so
+    the sprint planner does not propose rebuilding something that already exists."""
+    all_files = scan.get("all_files") or []
+    confidence = scan.get("stack_confidence", "low")
+    areas = _detected_requirement_areas(new_feature_requirements)
+    results: dict[str, dict] = {}
+    for area in areas:
+        keywords = _REQUIREMENT_AREA_KEYWORDS[area]
+        matched_files = _prefer_module_files(
+            [f for f in all_files if any(kw in f.lower() for kw in keywords)]
+        )[:_OVERLAP_EVIDENCE_FILE_LIMIT]
+        matched_routes = [
+            r for r in (scan.get("frontend_routes") or []) + (scan.get("backend_routes") or [])
+            if any(kw in r.lower() for kw in keywords)
+        ][:_OVERLAP_EVIDENCE_FILE_LIMIT]
+        matched_tests = [f for f in (scan.get("test_files") or []) if any(kw in f.lower() for kw in keywords)]
+        snippets = _area_evidence_snippets(scan, matched_files, keywords)
+
+        evidence_strength = len(matched_files) + len(matched_routes) + len(matched_tests)
+        if confidence == "low" and evidence_strength == 0:
+            status = "uncertain"
+        elif evidence_strength == 0:
+            status = "missing"
+        elif evidence_strength >= 3 or (matched_files and matched_routes):
+            status = "already_implemented"
+        else:
+            status = "partially_implemented"
+
+        likely_missing_gaps = []
+        if status == "partially_implemented":
+            if not matched_routes:
+                likely_missing_gaps.append("No backend route/endpoint evidence found — persistence "
+                                            "or live data wiring may still be needed.")
+            if not matched_tests:
+                likely_missing_gaps.append("No test coverage found for this area.")
+        elif status == "missing":
+            likely_missing_gaps.append("No existing files, routes, or tests found for this area.")
+        elif status == "uncertain":
+            likely_missing_gaps.append("Low scan confidence — verify manually before assuming this "
+                                        "area is missing or already implemented.")
+
+        results[area] = {
+            "status": status,
+            "matched_files": matched_files,
+            "matched_routes": matched_routes,
+            "matched_tests": matched_tests,
+            "evidence_snippets": snippets,
+            "likely_missing_gaps": likely_missing_gaps,
+            "recommended_action": _OVERLAP_STATUS_RECOMMENDED_ACTION[status],
+        }
+    return results
+
+
+def render_existing_feature_overlap_check_markdown(overlap: dict, confidence: str) -> str:
+    """Deterministic — existing_feature_overlap_check.md. No GPT call."""
+    lines = ["# Existing Feature Overlap Check", "", f"**Stack detection confidence:** {confidence}", ""]
+    if confidence == "low":
+        lines.append("⚠️ Low confidence scan — statuses below favor \"uncertain\" over a confident "
+                      "already-implemented/missing call.")
+        lines.append("")
+    if not overlap:
+        lines.append("(no recognized requirement areas detected in the feature request text)")
+        return "\n".join(lines) + "\n"
+    for area, info in overlap.items():
+        lines.append(f"## {area}")
+        lines.append(f"**Status:** {info['status']}")
+        lines.append(f"**Recommended action:** {info['recommended_action']}")
+        lines.append("")
+        lines.append("**Matched existing files:**")
+        for f in info["matched_files"] or ["(none found)"]:
+            lines.append(f"- {f}")
+        lines.append("")
+        lines.append("**Matched existing routes/endpoints:**")
+        for r in info["matched_routes"] or ["(none found)"]:
+            lines.append(f"- {r}")
+        lines.append("")
+        lines.append("**Evidence snippets / keyword matches:**")
+        for s in info["evidence_snippets"] or ["(none captured)"]:
+            lines.append(f"- {s}")
+        lines.append("")
+        lines.append("**Likely missing gaps:**")
+        for g in info["likely_missing_gaps"] or ["(none identified)"]:
+            lines.append(f"- {g}")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def generate_existing_feature_overlap_check(scan: dict, new_feature_requirements: str, run_dir) -> tuple[dict, str]:
+    """Writes existing_feature_overlap_check.json and existing_feature_overlap_check.md. No GPT call."""
+    overlap = classify_existing_feature_overlap(scan, new_feature_requirements)
+    confidence = scan.get("stack_confidence", "low")
+    md = render_existing_feature_overlap_check_markdown(overlap, confidence)
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "existing_feature_overlap_check.json").write_text(json.dumps(overlap, indent=2), encoding="utf-8")
+    (run_dir / "existing_feature_overlap_check.md").write_text(md, encoding="utf-8")
+    return overlap, md
+
+
+def generate_feature_gap_matrix(scan: dict, new_feature_requirements: str, run_dir,
+                                 overlap_check: dict | None = None) -> str:
     """Deterministic — feature_gap_matrix.md. No GPT call.
 
     Maps each requirement area mentioned in the feature request to its evidence-based
@@ -3862,9 +4022,11 @@ def generate_feature_gap_matrix(scan: dict, new_feature_requirements: str, run_d
     feature sprint planner has a grounded gap analysis instead of guessing per-area status.
     """
     confidence = scan.get("stack_confidence", "low")
-    frontend_evidence = " ".join(
-        (scan.get("frontend_routes") or []) + (scan.get("components") or []) + (scan.get("api_files") or [])
-    ).lower()
+    overlap_check = overlap_check or {}
+    # Search the FULL file list (not just the narrow frontend_routes/components/api_files
+    # buckets) so a feature living in a dedicated module folder — e.g.
+    # OneHR-UI/src/modules/oneats/ — is never invisible to evidence detection here.
+    all_files = scan.get("all_files") or []
     backend_evidence = " ".join(
         (scan.get("backend_routes") or []) + (scan.get("api_files") or [])
     ).lower()
@@ -3888,12 +4050,16 @@ def generate_feature_gap_matrix(scan: dict, new_feature_requirements: str, run_d
         return content
 
     lines.append("| Requirement Area | Status | Likely Frontend | Likely Backend | Data Model Impact | "
-                 "Integration Impact | Security/RBAC Impact | Suggested Sprint Grouping |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+                 "Integration Impact | Security/RBAC Impact | Overlap Status | Recommended Action | "
+                 "Suggested Sprint Grouping |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
     for area in areas:
         keywords = _REQUIREMENT_AREA_KEYWORDS[area]
-        frontend_hit = any(kw in frontend_evidence for kw in keywords)
-        backend_hit = any(kw in backend_evidence for kw in keywords)
+        overlap_info = overlap_check.get(area)
+        matched_files = _prefer_module_files([f for f in all_files if any(kw in f.lower() for kw in keywords)])
+        frontend_hit = any(Path(f).suffix.lower() in (".ts", ".tsx", ".js", ".jsx") for f in matched_files)
+        backend_hit = any(kw in backend_evidence for kw in keywords) or \
+            any(Path(f).suffix.lower() == ".py" for f in matched_files)
         if confidence == "low" and not (frontend_hit or backend_hit):
             status = "unknown"
         elif frontend_hit and backend_hit:
@@ -3902,19 +4068,23 @@ def generate_feature_gap_matrix(scan: dict, new_feature_requirements: str, run_d
             status = "partially implemented"
         else:
             status = "missing"
-        likely_frontend = [f for f in (scan.get("frontend_routes") or []) + (scan.get("components") or [])
-                            if any(kw in f.lower() for kw in keywords)][:5] or ["(none found)"]
-        likely_backend = [f for f in (scan.get("backend_routes") or []) + (scan.get("api_files") or [])
-                           if any(kw in f.lower() for kw in keywords)][:5] or ["(none found)"]
+        likely_frontend = [f for f in matched_files
+                            if Path(f).suffix.lower() in (".ts", ".tsx", ".js", ".jsx")][:5] or ["(none found)"]
+        likely_backend = [f for f in matched_files if Path(f).suffix.lower() == ".py"][:5] or \
+            ([f for f in (scan.get("backend_routes") or []) if any(kw in f.lower() for kw in keywords)][:5]
+             or ["(none found)"])
         data_model_impact = "yes" if (area in _REQUIREMENT_AREA_HAS_DATA_MODEL_IMPACT
                                        or any(kw in data_evidence for kw in keywords)) else "no"
         integration_impact = "yes" if (area in _REQUIREMENT_AREA_HAS_INTEGRATION_IMPACT
                                         or any(kw in integration_evidence for kw in keywords)) else "no"
         security_impact = "yes" if area in _REQUIREMENT_AREA_HAS_SECURITY_IMPACT else "no"
         grouping = _REQUIREMENT_AREA_SPRINT_GROUPING.get(area, "Ungrouped")
+        overlap_status = overlap_info["status"] if overlap_info else "not_checked"
+        recommended_action = overlap_info["recommended_action"] if overlap_info else "investigate manually"
         lines.append(
             f"| {area} | {status} | {'; '.join(likely_frontend)} | {'; '.join(likely_backend)} | "
-            f"{data_model_impact} | {integration_impact} | {security_impact} | {grouping} |"
+            f"{data_model_impact} | {integration_impact} | {security_impact} | {overlap_status} | "
+            f"{recommended_action} | {grouping} |"
         )
     lines.append("")
     content = "\n".join(lines) + "\n"
@@ -4136,10 +4306,28 @@ Sizing guidance (pick the smallest plan that genuinely fits the request):
   "Approval Queue") is a planning failure, not efficiency, even if those two sprints are individually fine.
 
 Consume the EXISTING APP DEEP AUDIT context you are given (app structure map, frontend/backend route maps,
-data model map, integration map, feature gap matrix) to ground likely_files_created/likely_files_modified,
-must_not_modify, and requirements_covered/deferred_requirements in real evidence instead of guessing. If the
-audit's stack confidence is LOW, do not invent precise file paths or a confident roadmap — use general
-language (e.g. "the frontend app", "the backend service") and flag uncertainty explicitly.
+data model map, integration map, feature gap matrix, existing feature overlap check) to ground
+likely_files_created/likely_files_modified, must_not_modify, and requirements_covered/deferred_requirements
+in real evidence instead of guessing. If the audit's stack confidence is LOW, do not invent precise file
+paths or a confident roadmap — use general language (e.g. "the frontend app", "the backend service") and
+flag uncertainty explicitly.
+
+Existing feature overlap rules — the existing feature overlap check classifies each requested requirement
+area as already_implemented, partially_implemented, missing, or uncertain, based on a full-repo scan
+(including dedicated feature module folders, not just generic component folders):
+- If an area is already_implemented, do NOT propose a sprint that "creates" or "builds" it from scratch.
+  Either skip it (if nothing further is needed) or scope a small enhancement sprint if the request asks
+  for something genuinely new on top of it.
+- If an area is partially_implemented, the sprint that addresses it must be worded as enhancing, extending,
+  or completing the existing implementation (e.g. "Enhance existing OneATS reports/dashboard metrics",
+  "Extend the existing candidate portal with X") — never "Create a new admin dashboard" or similar
+  from-scratch language when matched existing files are listed for that area.
+- Prefer the overlap check's matched_files when filling in likely_files_modified for that sprint, and prefer
+  files inside a dedicated feature module folder (e.g. .../modules/<feature>/) over generic catch-all
+  folders (e.g. src/components/) when both exist for the same area.
+- If an area is missing, it is safe to propose creating it from scratch.
+- If an area is uncertain (usually because stack confidence is low), say so explicitly and recommend manual
+  investigation rather than confidently creating or skipping it.
 
 Mock/frontend-only wording: if the existing app has no backend, or the feature request says the data should
 be mock/local/in-memory only, every sprint's smoke_checks and manual_qa_checklist must describe checks against
@@ -4732,6 +4920,13 @@ def render_feature_sprint_plan_markdown(plan_json: dict) -> str:
             "See feature_roadmap_coverage_check.md before treating this plan as complete."
         )
         lines.append("")
+    overlap_warnings = plan_json.get("overlap_warnings") or []
+    if overlap_warnings:
+        lines.append(f"⚠️ **Existing feature overlap warning(s):** this plan proposes building "
+                      "something that may already exist — see existing_feature_overlap_check.md.")
+        for w in overlap_warnings:
+            lines.append(f"- {w}")
+        lines.append("")
     if plan_json.get("reason_for_split"):
         lines.append(f"**Reason for split:** {plan_json['reason_for_split']}")
         lines.append("")
@@ -4768,8 +4963,26 @@ def render_feature_sprint_plan_markdown(plan_json: dict) -> str:
         deps = s.get("depends_on") or [0]
         lines.append(f"**Depends on:** {', '.join('Sprint ' + str(d) for d in deps)}")
         lines.append("")
-        lines.append(f"**Status:** {s.get('status', 'ready')}")
+        sprint_status = s.get("status", "ready")
+        status_suffix = " (due to overlap — see below)" if sprint_status in (
+            "needs_revision", "blocked_overlap") else ""
+        lines.append(f"**Status:** {sprint_status}{status_suffix}")
         lines.append("")
+        sprint_overlap_warnings = s.get("overlap_warnings") or []
+        if sprint_overlap_warnings:
+            lines.append(
+                "⚠️ Overlap warning: this feature appears partially/already implemented. "
+                "Extend matched existing files instead of creating duplicate files."
+            )
+            lines.append("")
+            lines.append("Matched existing files (from existing_feature_overlap_check.md):")
+            for f in s.get("overlap_matched_files") or ["(see existing_feature_overlap_check.md)"]:
+                lines.append(f"- {f}")
+            lines.append("")
+            lines.append("Details:")
+            for w in sprint_overlap_warnings:
+                lines.append(f"- {w}")
+            lines.append("")
         lines.append("**Likely files created:**")
         for f in s.get("likely_files_created") or ["(not specified)"]:
             lines.append(f"- {f}")
@@ -4819,11 +5032,19 @@ def render_feature_sprint_plan_terminal(plan_json: dict, selected_sprint_number:
         lines.append(f"⚠️  Roadmap coverage check: {coverage_result} — "
                       f"{len(uncovered)} requirement area(s) uncovered. See feature_roadmap_coverage_check.md")
         lines.append("")
+    overlap_warnings = plan_json.get("overlap_warnings") or []
+    if overlap_warnings:
+        lines.append(f"⚠️  Existing feature overlap warning(s): {len(overlap_warnings)} sprint(s) may "
+                      "duplicate existing work. See existing_feature_overlap_check.md")
+        lines.append("")
     lines.append("Sprint 0: Baseline Existing App (not buildable)")
     for s in sprints:
         n = s.get("sprint_number")
         marker = " <-- SELECTED" if n == selected_sprint_number else ""
-        lines.append(f"Sprint {n} of {total}: {s.get('title', '')}{marker}")
+        status = s.get("status", "ready")
+        status_suffix = f" — status: {status} due to overlap" if status in (
+            "needs_revision", "blocked_overlap") else ""
+        lines.append(f"Sprint {n} of {total}: {s.get('title', '')}{status_suffix}{marker}")
         lines.append(f"  Goal: {s.get('goal', '')}")
     lines.append("")
     if selected_sprint_number is not None:
@@ -4927,6 +5148,112 @@ def generate_feature_roadmap_coverage_check(
     return coverage, md
 
 
+_CREATE_FROM_SCRATCH_PHRASES = re.compile(
+    r"\b(create (?:a |the )?new|build (?:a |the )?new|add (?:a |the )?new|from scratch)\b",
+    re.IGNORECASE,
+)
+
+
+def _overlap_violations_detailed(plan_json: dict, overlap_check: dict | None) -> list[dict]:
+    """Deterministic — no GPT call. Flags any sprint that proposes (re)building something the
+    existing feature overlap check classifies as already implemented or partially
+    implemented — the exact OneATS failure mode: a sprint titled "Admin Dashboard with
+    Recruitment Metrics" when ATSReports.tsx/ATSStore.ts already implement reporting.
+
+    Two independent signals, either of which triggers a warning (titles get reworded in ways
+    a literal phrase regex alone would miss, so a structural file-reuse check is needed too):
+    1. Phrase signal: the title/goal literally says "create/build/add a new ..." or "from
+       scratch" for a topic-relevant, overlapping area.
+    2. Structural signal: the sprint proposes NEW files for a topic-relevant, overlapping
+       area without referencing (creating/modifying) any of that area's matched existing
+       files — i.e. it looks like a parallel rebuild rather than an extension.
+
+    Returns one dict per violation: {sprint_number, area, status, matched_files, message}.
+    """
+    if not overlap_check:
+        return []
+    violations = []
+    for sprint in plan_json.get("sprints") or []:
+        title = sprint.get("title", "")
+        goal = sprint.get("goal", "")
+        topic_text = " ".join(
+            str(v) for key in ("title", "goal", "features", "requirements_covered")
+            for v in ([sprint.get(key)] if isinstance(sprint.get(key), str) else sprint.get(key) or [])
+        ).lower()
+        phrase_hit = bool(_CREATE_FROM_SCRATCH_PHRASES.search(f"{title} {goal}".lower()))
+        created_files = sprint.get("likely_files_created") or []
+        modified_files = sprint.get("likely_files_modified") or []
+        touched_files = {str(f).lower() for f in created_files} | {str(f).lower() for f in modified_files}
+
+        for area, info in overlap_check.items():
+            if info.get("status") not in ("already_implemented", "partially_implemented"):
+                continue
+            if not any(kw in topic_text for kw in _REQUIREMENT_AREA_KEYWORDS[area]):
+                continue
+            matched_files = info.get("matched_files") or []
+            reuses_existing = any(str(mf).lower() in touched_files for mf in matched_files)
+            if reuses_existing:
+                continue  # sprint actually touches the matched file — a legitimate extension
+            if not (phrase_hit or created_files):
+                continue
+            violations.append({
+                "sprint_number": sprint.get("sprint_number"),
+                "area": area,
+                "status": info["status"],
+                "matched_files": matched_files,
+                "message": (
+                    f"Sprint {sprint.get('sprint_number')} ('{title}') proposes work on {area} "
+                    f"but existing_feature_overlap_check.md classifies it as {info['status']} and it "
+                    f"does not reuse the matched existing files ({', '.join(matched_files[:3]) or 'see report'}) "
+                    "— prefer 'enhance/extend/complete' wording and extend those files instead of "
+                    "creating new ones."
+                ),
+            })
+    return violations
+
+
+def _detect_overlap_violations(plan_json: dict, overlap_check: dict | None) -> list[str]:
+    """Backward-compatible flat list of warning messages — see _overlap_violations_detailed."""
+    return [v["message"] for v in _overlap_violations_detailed(plan_json, overlap_check)]
+
+
+# A sprint with this status must never be presented as a plain "ready"/cleanly-buildable
+# sprint: "needs_revision" means partial overlap (extend, don't duplicate); "blocked_overlap"
+# means the area already fully exists (building as scoped risks pure duplicate work).
+_OVERLAP_SPRINT_STATUS_BY_AREA_STATUS = {
+    "already_implemented": "blocked_overlap",
+    "partially_implemented": "needs_revision",
+}
+_OVERLAP_SPRINT_STATUS_SEVERITY = {"needs_revision": 1, "blocked_overlap": 2}
+
+
+def _apply_overlap_status_to_sprints(sprints: list[dict], violations_detailed: list[dict]) -> None:
+    """Deterministic — no GPT call. Mutates each sprint in place: a sprint with overlap
+    violations is never left as plain "ready". Stores the per-sprint overlap messages and
+    matched existing files too, so markdown/terminal/build-prompt rendering can show them
+    without re-deriving anything."""
+    by_sprint: dict[int, list[dict]] = {}
+    for v in violations_detailed:
+        by_sprint.setdefault(v["sprint_number"], []).append(v)
+
+    for sprint in sprints:
+        sprint_violations = by_sprint.get(sprint.get("sprint_number"), [])
+        sprint["overlap_warnings"] = [v["message"] for v in sprint_violations]
+        matched_files: list[str] = []
+        for v in sprint_violations:
+            for f in v["matched_files"]:
+                if f not in matched_files:
+                    matched_files.append(f)
+        sprint["overlap_matched_files"] = matched_files
+        if not sprint_violations:
+            continue
+        overlap_status = max(
+            (_OVERLAP_SPRINT_STATUS_BY_AREA_STATUS[v["status"]] for v in sprint_violations),
+            key=lambda s: _OVERLAP_SPRINT_STATUS_SEVERITY[s],
+        )
+        sprint["status"] = overlap_status
+
+
 def generate_feature_sprint_plan(
     existing_app_summary: str,
     new_feature_requirements: str,
@@ -4937,6 +5264,7 @@ def generate_feature_sprint_plan(
     scan: dict | None = None,
     audit_artifacts: dict | None = None,
     raw_feature_request_text: str = "",
+    overlap_check: dict | None = None,
 ) -> tuple[dict, str]:
     """Uses GPT4O_MODEL (same model tier as the normal sprint architect). Writes
     feature_sprint_plan.json, feature_sprint_plan.md, feature_roadmap_coverage_check.json,
@@ -4950,7 +5278,10 @@ def generate_feature_sprint_plan(
     raw_feature_request_text (when supplied) is the ORIGINAL feature request before any GPT
     condensing — used for the large-request expansion safety net and the roadmap coverage
     check, since a condensed summary of an 82KB request can look small even when the real
-    request is large and multi-role."""
+    request is large and multi-role.
+
+    overlap_check (when supplied) is the existing_feature_overlap_check result — used to warn
+    when a sprint proposes creating something that already exists."""
     audit_artifacts = audit_artifacts or {}
     audit_context = "\n\n".join(
         f"## {name.replace('_', ' ').upper()}\n{_truncate_for_prompt(text)}"
@@ -4961,8 +5292,8 @@ def generate_feature_sprint_plan(
         f"## NEW FEATURE REQUIREMENTS\n{new_feature_requirements}\n\n"
         f"## CHANGE GAP ANALYSIS\n{gap_analysis}\n\n"
         f"## ADDITIVE ARCHITECTURE\n{additive_architecture}\n\n"
-        f"## EXISTING APP DEEP AUDIT (app structure, routes, data model, integrations, gap matrix)\n"
-        f"{audit_context}\n\n"
+        f"## EXISTING APP DEEP AUDIT (app structure, routes, data model, integrations, gap matrix, "
+        f"existing feature overlap check)\n{audit_context}\n\n"
         "Now produce the feature sprint decomposition. Output STRICT JSON ONLY — no markdown, "
         "no commentary, no code fences."
     )
@@ -4981,6 +5312,9 @@ def generate_feature_sprint_plan(
     )
     plan_json["roadmap_coverage_result"] = coverage["result"]
     plan_json["roadmap_coverage_uncovered_areas"] = coverage["uncovered_areas"]
+    violations_detailed = _overlap_violations_detailed(plan_json, overlap_check)
+    plan_json["overlap_warnings"] = [v["message"] for v in violations_detailed]
+    _apply_overlap_status_to_sprints(plan_json.get("sprints") or [], violations_detailed)
 
     plan_md = render_feature_sprint_plan_markdown(plan_json)
 
@@ -5069,6 +5403,38 @@ def generate_selected_feature_sprint_build_prompt(
     ]
     for f in selected_sprint.get("features") or ["(see goal above)"]:
         parts.append(f"- {f}")
+
+    sprint_status = selected_sprint.get("status", "ready")
+    overlap_warnings = selected_sprint.get("overlap_warnings") or []
+    overlap_matched_files = selected_sprint.get("overlap_matched_files") or []
+    if sprint_status == "blocked_overlap":
+        parts += [
+            "",
+            "## 🛑 BLOCKED_OVERLAP — ROADMAP REVISION REQUIRED BEFORE YOU BUILD",
+            "existing_feature_overlap_check.md classifies the area this sprint targets as "
+            "ALREADY IMPLEMENTED. Building this sprint as currently scoped risks creating a pure "
+            "duplicate of existing functionality. Do NOT proceed with a from-scratch build. Stop "
+            "and have a human revise this sprint's scope (or the roadmap) before any code is written. "
+            "If you build anyway, you MUST treat this as a revision task: inspect and extend the "
+            "matched existing files below — do not create new files that duplicate them.",
+        ]
+    if overlap_warnings or overlap_matched_files:
+        parts += [
+            "",
+            "## ⚠️ EXISTING FEATURE OVERLAP — INSPECT AND EXTEND FIRST",
+            "This sprint's scope overlaps with functionality that already exists in this app "
+            "(see existing_feature_overlap_check.md). Inspect the matched existing files below "
+            "BEFORE writing any code, and EXTEND them. Do not create a duplicate dashboard, "
+            "reports, candidate, or recruiter module under a new name or new file.",
+            "",
+            "Matched existing files (inspect and extend these, do not duplicate):",
+        ]
+        for f in overlap_matched_files or ["(see existing_feature_overlap_check.md)"]:
+            parts.append(f"- {f}")
+        if overlap_warnings:
+            parts += ["", "Overlap warning details:"]
+            for w in overlap_warnings:
+                parts.append(f"- {w}")
 
     if earlier_sprints:
         parts += ["", "## EARLIER FEATURE SPRINTS (assume already built)"]
@@ -5638,36 +6004,51 @@ def pipeline_existing_app_upgrade(
     feature_requirements = generate_new_feature_requirements(feature_request_text, existing_app_summary, rdir)
     record_step_time(run_id, "feature_requirements", t0)
 
-    print("▶ Step 6  Building feature gap matrix...")
+    print("▶ Step 6  Running Existing Feature Overlap Check...")
     t0 = time.time()
     # Use the ORIGINAL raw feature request, not the GPT-condensed feature_requirements, for
     # requirement-area detection — a condensed summary of an 82KB request can collapse well
-    # below the large-request gates even when the real request is large and multi-role.
-    feature_gap_matrix_md = generate_feature_gap_matrix(scan, feature_request_text, rdir)
+    # below the large-request gates even when the real request is large and multi-role. This
+    # check runs BEFORE the feature gap matrix and sprint planning so neither one proposes
+    # rebuilding a feature that already exists somewhere in the repo (e.g. a dedicated
+    # feature module folder that the narrower conventional-folder scan buckets miss).
+    overlap_check, overlap_check_md = generate_existing_feature_overlap_check(scan, feature_request_text, rdir)
+    record_step_time(run_id, "existing_feature_overlap_check", t0)
+
+    print("▶ Step 7  Building feature gap matrix...")
+    t0 = time.time()
+    feature_gap_matrix_md = generate_feature_gap_matrix(scan, feature_request_text, rdir, overlap_check)
     record_step_time(run_id, "feature_gap_matrix", t0)
 
-    print("▶ Step 7  Writing change gap analysis...")
+    print("▶ Step 8  Writing change gap analysis...")
     t0 = time.time()
     gap_analysis = generate_change_gap_analysis(existing_app_summary, feature_requirements, inventory_md, rdir)
     record_step_time(run_id, "gap_analysis", t0)
 
-    print("▶ Step 8  Creating additive architecture...")
+    print("▶ Step 9  Creating additive architecture...")
     t0 = time.time()
     additive_architecture = generate_additive_architecture(existing_app_summary, feature_requirements, gap_analysis, rdir)
     record_step_time(run_id, "additive_architecture", t0)
 
-    print("▶ Step 9  Creating feature sprint plan...")
+    print("▶ Step 10  Creating feature sprint plan...")
     t0 = time.time()
     plan_json, _plan_md = generate_feature_sprint_plan(
         existing_app_summary, feature_requirements, gap_analysis, additive_architecture,
         rdir, selected_sprint_number=None if feature_plan_only else selected_feature_sprint,
-        scan=scan, audit_artifacts={**audit_artifacts, "feature_gap_matrix": feature_gap_matrix_md},
-        raw_feature_request_text=feature_request_text,
+        scan=scan, audit_artifacts={
+            **audit_artifacts,
+            "feature_gap_matrix": feature_gap_matrix_md,
+            "existing_feature_overlap_check": overlap_check_md,
+        },
+        raw_feature_request_text=feature_request_text, overlap_check=overlap_check,
     )
     record_step_time(run_id, "feature_sprint_plan", t0)
     _update_state(run_id, {})
     print(f"\n{render_feature_sprint_plan_terminal(plan_json, None if feature_plan_only else selected_feature_sprint)}\n")
     print(f"  Roadmap coverage check: {plan_json.get('roadmap_coverage_result', 'PASS')}")
+    if plan_json.get("overlap_warnings"):
+        print(f"  ⚠️  Existing feature overlap warning(s): {len(plan_json['overlap_warnings'])} "
+              "sprint(s) may duplicate existing work — see existing_feature_overlap_check.md")
 
     if feature_plan_only:
         _update_state(run_id, {"status": "feature_plan_only_done", "current_step": "done"})
@@ -5687,7 +6068,7 @@ def pipeline_existing_app_upgrade(
     total = plan_json.get("total_sprints", len(plan_json.get("sprints", [])))
     print(f"Selected Feature Sprint: Sprint {selected_feature_sprint} of {total}")
 
-    print("▶ Step 10  Writing selected feature sprint scope + build prompt...")
+    print("▶ Step 11  Writing selected feature sprint scope + build prompt...")
     build_prompt_text = generate_selected_feature_sprint_build_prompt(
         existing_app_summary, scan, plan_json, selected_sprint, rdir, baseline_checklist,
     )
@@ -5697,14 +6078,14 @@ def pipeline_existing_app_upgrade(
     snapshot_protected_files(existing_app_path, must_not_modify, rdir)
     snapshot_existing_files(existing_app_path, rdir)
 
-    print(f"\n▶ Step 11  Claude Code — building Sprint {selected_feature_sprint} in place...")
+    print(f"\n▶ Step 12  Claude Code — building Sprint {selected_feature_sprint} in place...")
     t0 = time.time()
     _update_state(run_id, {"current_step": "building", "status": "building"})
     build_output = build_feature_sprint(run_id, existing_app_path, build_prompt_text)
     record_step_time(run_id, "built", t0)
     _update_state(run_id, {"status": "built"})
 
-    print("\n▶ Step 12  Regression check...")
+    print("\n▶ Step 13  Regression check...")
     smoke_log = ""
     try:
         smoke_log = run_smoke_checks(run_id, existing_app_path)
@@ -5721,7 +6102,7 @@ def pipeline_existing_app_upgrade(
         print("  ⚠️  WARNING: unexpected changes to protected files were detected.")
 
     if use_deepseek and DEEPSEEK_API_KEY:
-        print("\n▶ Step 13  DeepSeek review (optional)...")
+        print("\n▶ Step 14  DeepSeek review (optional)...")
         deepseek_report = deepseek_attack_review(existing_app_summary, existing_app_path, smoke_log + "\n\n" + regression_report)
         save_artifact(run_id, "deepseek_attack_report.md", deepseek_report)
         if not is_approved(deepseek_report):
@@ -5736,7 +6117,7 @@ def pipeline_existing_app_upgrade(
             )
             print(f"  Regression result after fix: {regression_status}")
 
-    print("\n▶ Step 14  Writing feature completion report...")
+    print("\n▶ Step 15  Writing feature completion report...")
     generate_feature_completion_report(
         existing_app_summary, plan_json, selected_sprint, build_output,
         regression_status, regression_report, smoke_log, rdir, changed_files_report,
