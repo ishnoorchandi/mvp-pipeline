@@ -20,6 +20,12 @@ export interface RunDetail {
   log: { time: string; event: string; detail: string }[];
   step_timings: Record<string, number>;
   pipeline_elapsed_s: number | null;
+  steps?: Record<string, {
+    status: "pending" | "running" | "complete" | "failed" | "skipped" | "not_run" | "blocked";
+    artifact?: string;
+    reason?: string;
+    result?: string;
+  }>;
   // Only present for dashboard-triggered runs (see backend/app.py create_run). CLI-triggered
   // runs won't have these — sprint-mode detection in the UI falls back to current_step /
   // artifact presence in that case.

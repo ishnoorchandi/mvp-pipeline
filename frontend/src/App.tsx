@@ -15,47 +15,39 @@ interface PipelineStep {
 }
 
 const PIPELINE_STEPS: PipelineStep[] = [
-  { id: "requirements", label: "Requirements",        sub: "Normalizing the raw input into clean, structured requirements",    agent: "gpt",        artifact: "clean_requirements.md" },
-  { id: "spec",         label: "MVP Spec",           sub: "Analyzing your idea and writing a detailed product spec",          agent: "gpt",        artifact: "mvp_spec.md" },
-  { id: "architecture", label: "Architecture",        sub: "Writing the architecture contract (ARCHITECTURE.md)",              agent: "gpt",        artifact: "ARCHITECTURE.md" },
-  { id: "build_prompt", label: "Build Prompt",        sub: "Writing precise Claude Code instructions to build the app",        agent: "gpt",        artifact: "claude_build_prompt.md" },
-  { id: "consistency",  label: "Requirements Check",  sub: "Verifying planning artifacts match the original requirements",      agent: "smoke",      artifact: "requirements_consistency_check.txt" },
-  { id: "built",        label: "Build MVP",           sub: "Building the full application from scratch",                       agent: "claude",     artifact: "claude_build_output.txt" },
-  { id: "smoke",        label: "Smoke Checks",        sub: "Running install, build, server start and architecture checks",     agent: "smoke",      artifact: "smoke_test_log.txt" },
-  { id: "deepseek",     label: "Attack Review",       sub: "Red-teaming the app for bugs, security gaps and failures",         agent: "deepseek",   artifact: "deepseek_attack_report.md" },
-  { id: "judge",        label: "Issue Judgment",      sub: "Classifying every finding as CRITICAL / MAJOR / MINOR / NOISE",   agent: "gpt",        artifact: "judged_issue_report.md" },
-  { id: "fix",          label: "Apply Fixes",         sub: "Patching CRITICAL and MAJOR issues found in the attack report",    agent: "claude",     artifact: "claude_fix_prompt_1.md" },
-  { id: "governance",   label: "Governance Review",   sub: "AppSec, Legal/Privacy and Infrastructure three-reviewer panel",    agent: "governance", artifact: "governance_meta_judgment.md" },
-  { id: "done",         label: "Final Report",        sub: "Writing the handoff summary and final status",                     agent: "gpt",        artifact: "final_mvp_report.md" },
+  { id: "requirements_normalization", label: "Requirements Normalization", sub: "Normalizing the raw input into clean requirements", agent: "gpt", artifact: "clean_requirements.md" },
+  { id: "mvp_spec", label: "MVP Spec", sub: "Writing the detailed product specification", agent: "gpt", artifact: "mvp_spec.md" },
+  { id: "sprint_architecture", label: "Sprint Architecture", sub: "Defining architecture and the dependency-aware sprint plan", agent: "architect", artifact: "sprint_plan.md" },
+  { id: "selected_sprint_prompt", label: "Selected Sprint Prompt", sub: "Writing the selected sprint scope and Claude Code prompt", agent: "gpt", artifact: "selected_sprint_build_prompt.txt" },
+  { id: "planning_consistency_check", label: "Planning Consistency Check", sub: "Checking planning artifacts against original requirements before build", agent: "smoke", artifact: "requirements_consistency_check.txt" },
+  { id: "claude_build", label: "Claude Build", sub: "Building only the selected sprint", agent: "claude", artifact: "claude_build_output.txt" },
+  { id: "smoke_checks", label: "Smoke Checks", sub: "Running initial build, runtime, and architecture checks", agent: "smoke", artifact: "smoke_test_log.txt" },
+  { id: "deepseek_red_team", label: "DeepSeek Red Team Review", sub: "Red-teaming the implementation for concrete failures", agent: "deepseek", artifact: "deepseek_attack_report.md" },
+  { id: "governance_review", label: "Governance Review", sub: "Reviewing AppSec, legal/privacy, and infrastructure risks", agent: "governance", artifact: "governance_meta_judgment.md" },
+  { id: "consolidated_fix_plan", label: "Consolidated Fix Plan", sub: "Combining smoke, red-team, and governance findings into one plan", agent: "gpt", artifact: "consolidated_fix_plan.md" },
+  { id: "claude_fix_pass", label: "Claude Fix Pass", sub: "Applying the consolidated blocker fixes once", agent: "claude", artifact: "claude_fix_output_1.txt" },
+  { id: "final_smoke_checks", label: "Final Smoke Checks", sub: "Re-running checks against the final implementation", agent: "smoke", artifact: "final_smoke_checks.txt" },
+  { id: "sprint_requirements_check", label: "Sprint Requirements Check", sub: "Checking the built sprint against selected_sprint_scope.md", agent: "smoke", artifact: "sprint_requirements_check.txt" },
+  { id: "sprint_report", label: "Sprint Report", sub: "Reporting what was actually planned, built, checked, and accepted", agent: "gpt", artifact: "sprint_report.md" },
 ];
 
 // Sprint-mode-only steps — spliced in right after "Build Prompt" whenever sprint mode
 // (--sprint-plan / --sprint-plan-only) is active for a run. Hidden otherwise.
-const SPRINT_ONLY_STEPS: PipelineStep[] = [
-  { id: "sprint_plan",                  label: "Sprint Plan",                  sub: "GPT-4o sprint architect — assessing complexity and decomposing into sprints", agent: "architect", artifact: "sprint_plan.md" },
-  { id: "selected_sprint_scope",        label: "Selected Sprint Scope",        sub: "Writing the detailed scope doc for the selected sprint",                       agent: "gpt", artifact: "selected_sprint_scope.md" },
-  { id: "selected_sprint_build_prompt", label: "Selected Sprint Build Prompt", sub: "Writing the Claude Code build prompt for the selected sprint only",            agent: "gpt", artifact: "selected_sprint_build_prompt.txt" },
-];
+const SPRINT_ONLY_STEPS: PipelineStep[] = [];
 
 // Builds the actual step list for a run: base steps, with the sprint-only steps spliced
 // in after "Build Prompt" when sprint mode is active, and the build step's label/sub
 // swapped to reflect "selected sprint only" build scope.
 function getStepsForRun(sprintModeActive: boolean, selectedSprintNum: number): PipelineStep[] {
-  const base = sprintModeActive
-    ? (() => {
-        const idx = PIPELINE_STEPS.findIndex(s => s.id === "build_prompt");
-        return [...PIPELINE_STEPS.slice(0, idx + 1), ...SPRINT_ONLY_STEPS, ...PIPELINE_STEPS.slice(idx + 1)];
-      })()
-    : PIPELINE_STEPS;
-  if (!sprintModeActive) return base;
-  return base.map(s => {
-    if (s.id === "built")
+  return PIPELINE_STEPS.map(s => {
+    if (s.id === "claude_build")
       return { ...s, label: "Build Selected Sprint", sub: `Building only Sprint ${selectedSprintNum} with Claude Code — future sprints are planned but not built` };
-    // Sprint mode presents architecture as the advanced architect role (same demo
-    // clarity treatment as the dedicated "Sprint Plan" step) rather than the routine
-    // GPT-4o mini "Architecture" step used in non-sprint runs.
-    if (s.id === "architecture")
-      return { ...s, label: "Sprint Architecture", sub: "GPT-4o — writing the architecture contract that the sprint plan builds on", agent: "architect" as const };
+    if (!sprintModeActive && s.id === "sprint_architecture")
+      return { ...s, label: "Architecture", artifact: "ARCHITECTURE.md" };
+    if (!sprintModeActive && s.id === "selected_sprint_prompt")
+      return { ...s, label: "Build Prompt", artifact: "build_prompt.txt" };
+    if (!sprintModeActive && s.id === "sprint_report")
+      return { ...s, label: "Final Report", artifact: "final_mvp_report.md" };
     return s;
   });
 }
@@ -73,19 +65,19 @@ const AGENTS = {
 } as const;
 
 const STEP_MAP: Record<string, string> = {
-  spec:          "spec",
-  sprint_plan:   "sprint_plan",
-  build_prompt:  "build_prompt",
-  blocked:       "consistency",
-  consistency:   "consistency",
-  building:      "built",   built:       "built",
-  smoke_1:       "smoke",   smoke_2:     "smoke",     smoke_3:   "smoke",
-  deepseek_1:    "deepseek", deepseek_2: "deepseek",  deepseek_3: "deepseek",
-  judge_1:       "judge",   judge_2:     "judge",     judge_3:   "judge",
-  fix_1:         "fix",     fix_2:       "fix",       fix_3:     "fix",
-  governance:    "governance",
-  gov_fix_1:     "governance", gov_fix_2: "governance",
-  report:        "done",    done:        "done",
+  spec: "mvp_spec",
+  sprint_plan: "sprint_architecture",
+  build_prompt: "selected_sprint_prompt",
+  blocked: "planning_consistency_check",
+  consistency: "planning_consistency_check",
+  building: "claude_build", built: "claude_build",
+  smoke_1: "smoke_checks", smoke_2: "smoke_checks", smoke_3: "smoke_checks",
+  deepseek_1: "deepseek_red_team", deepseek_2: "deepseek_red_team", deepseek_3: "deepseek_red_team",
+  governance: "governance_review",
+  judge_1: "consolidated_fix_plan", judge_2: "consolidated_fix_plan", judge_3: "consolidated_fix_plan",
+  fix_1: "claude_fix_pass", fix_2: "claude_fix_pass", fix_3: "claude_fix_pass",
+  final_smoke_checks: "final_smoke_checks",
+  report: "sprint_report", done: "sprint_report",
 };
 
 const TERMINAL = new Set([
@@ -103,6 +95,11 @@ const ARTIFACT_LABELS: Record<string, string> = {
   "requirement_coverage_map.md":       "Requirement Coverage Map",
   "requirement_coverage_map.json":     "Requirement Coverage Map JSON",
   "sprint_coverage_check.txt":         "Sprint Coverage Check",
+  "requirements_consistency_check.txt": "Planning Consistency Check",
+  "sprint_requirements_check.txt":     "Sprint Requirements Check",
+  "consolidated_fix_plan.md":          "Consolidated Fix Plan",
+  "final_smoke_checks.txt":            "Final Smoke Checks",
+  "sprint_report.md":                  "Sprint Report",
   "existing_app_inventory.md":         "Existing App Inventory",
   "baseline_health_check.md":          "Baseline Health Check",
   "baseline_behavior_checklist.md":    "Baseline Behavior Checklist",
@@ -156,6 +153,7 @@ const ARTIFACT_ORDER = [
   "sprint_1_scope.md",
   "sprint_1_build_prompt.txt",
   "requirements_consistency_check.txt",
+  "consolidated_fix_plan.md",
   "claude_build_prompt.md",
   "claude_build_output.txt",
   "smoke_test_log.txt",
@@ -183,6 +181,9 @@ const ARTIFACT_ORDER = [
   "governance_fix_prompt_2.md",
   "claude_fix_output_gov_2.txt",
   "governance_smoke_log_2.txt",
+  "final_smoke_checks.txt",
+  "sprint_requirements_check.txt",
+  "sprint_report.md",
   "final_mvp_report.md",
   "run_state.json",
 ];
@@ -203,13 +204,24 @@ function sortArtifacts(files: string[]): string[] {
   });
 }
 
-type StepStatus = "pending" | "running" | "done" | "skipped";
+type StepStatus = "pending" | "running" | "done" | "skipped" | "not_run" | "failed" | "blocked";
 
-function stepStatus(step: PipelineStep, artifacts: string[], currentStep: string, runStatus: string): StepStatus {
+function stepStatus(
+  step: PipelineStep,
+  artifacts: string[],
+  currentStep: string,
+  runStatus: string,
+  runSteps?: RunDetail["steps"],
+): StepStatus {
+  const stateStatus = runSteps?.[step.id]?.status;
+  if (stateStatus) {
+    if (stateStatus === "complete") return "done";
+    return stateStatus;
+  }
   const hasArtifact = artifacts.some(a => a === step.artifact || a.startsWith(step.artifact.replace(/\.[^.]+$/, "")));
   if (hasArtifact) return "done";
   // Terminal but this step never produced its artifact — it genuinely didn't run
-  // (e.g. everything after "Requirements Check" in a sprint-plan-only / plan-only run,
+  // (e.g. everything after "Planning Consistency Check" in a sprint-plan-only / plan-only run,
   // or everything after a consistency-violation block). Show that honestly instead of
   // the old behavior of marking every step "Finished" once the run reached a terminal
   // status.
@@ -474,7 +486,8 @@ function StepCard({ step, index, total, status, elapsed, cycle }: {
 
   const circleStyle: React.CSSProperties =
     status === "done"    ? { background: "linear-gradient(135deg, #22c55e, #15803d)" }
-    : status === "pending" || status === "skipped" ? { background: "#d1d5db" }
+    : status === "pending" || status === "skipped" || status === "not_run" ? { background: "#d1d5db" }
+    : status === "failed" || status === "blocked" ? { background: "#dc2626" }
     : { background: `linear-gradient(145deg, ${a.color}, ${a.color}cc)` };
 
   return (
@@ -502,7 +515,7 @@ function StepCard({ step, index, total, status, elapsed, cycle }: {
             <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.8" strokeLinecap="round">
               <polyline points="4,12 9,17 20,6"/>
             </svg>
-          ) : status === "skipped" ? (
+          ) : status === "skipped" || status === "not_run" ? (
             <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" strokeWidth="2.5" strokeLinecap="round">
               <line x1="5" y1="12" x2="19" y2="12"/>
             </svg>
@@ -514,7 +527,7 @@ function StepCard({ step, index, total, status, elapsed, cycle }: {
 
       {/* Info */}
       <div className="sc-info">
-        <div className="sc-agent" style={{ color: status === "pending" || status === "skipped" ? "#9ca3af" : a.color }}>
+        <div className="sc-agent" style={{ color: status === "pending" || status === "skipped" || status === "not_run" ? "#9ca3af" : a.color }}>
           {a.label}
         </div>
         <div className="sc-name">{step.label}</div>
@@ -529,6 +542,9 @@ function StepCard({ step, index, total, status, elapsed, cycle }: {
           {status === "done" && elapsed === null && "Finished"}
           {status === "pending" && "Waiting to run"}
           {status === "skipped" && "Not being run"}
+          {status === "not_run" && "Not run"}
+          {status === "failed" && "Failed"}
+          {status === "blocked" && "Blocked"}
         </div>
       </div>
     </div>
@@ -717,7 +733,7 @@ function NowBanner({ run, elapsed, sprintModeActive, selectedSprintNum }: {
     if (run.status === "max_iterations_reached") {
       title = "Max fix cycles reached — review output";
     } else if (run.status === "blocked_consistency_violation") {
-      title = "Blocked: requirements consistency violation";
+      title = "Blocked: planning consistency violation";
     } else if (run.status === "plan_only_done") {
       title = "Plan Complete";
       sub = "Requirements, spec, architecture and build prompt were generated. No build was run.";
@@ -953,7 +969,7 @@ function SprintCompletionReport({ sprintModeActive, sprintPlanOnlyActive, built,
         <div className="sprint-completion-line">No sprint was built in this run.</div>
         <div className="sprint-completion-line sprint-completion-muted">
           {sprintPlanOnlyActive
-            ? "This was a sprint-plan-only run — Claude Code was not invoked."
+            ? "This was a sprint-plan-only run — Claude Code was not invoked and Sprint Requirements Check was not run."
             : "No build artifact (claude_build_output.txt) was produced, so no sprint build can be confirmed."}
         </div>
       </div>
@@ -1030,7 +1046,8 @@ function rollupStatus(substeps: SectionSubstep[], applicable: boolean): SectionS
   if (!applicable) return "not_running";
   const active = substeps.filter(s => s.status !== "disabled");
   if (!active.length) return "not_running";
-  if (active.every(s => s.status === "skipped")) return "not_running";
+  if (active.every(s => s.status === "skipped" || s.status === "not_run")) return "not_running";
+  if (active.some(s => s.status === "failed" || s.status === "blocked")) return "done";
   if (active.some(s => s.status === "running")) return "active";
   if (active.some(s => s.status === "pending")) return "upcoming";
   // No substep left pending or running: every remaining one is either "done" or
@@ -1041,40 +1058,20 @@ function rollupStatus(substeps: SectionSubstep[], applicable: boolean): SectionS
 function buildSections(opts: {
   statusById: Record<string, StepStatus>;
   runArtifacts: string[];
-  isTerminal: boolean;
   sprintModeActive: boolean;
-  reviewFixApplicable: boolean; // false for plan-only / sprint-plan-only runs
-  sprintInfo: SprintInfo | null;
-  selectedSprintNum: number;
 }): SectionDef[] {
-  const { statusById, runArtifacts, isTerminal, sprintModeActive, reviewFixApplicable, sprintInfo, selectedSprintNum } = opts;
+  const { statusById, runArtifacts, sprintModeActive } = opts;
   const get = (id: string): StepStatus => statusById[id] ?? "pending";
   const hasRawInput = runArtifacts.includes("raw_input.md");
-
-  // Per-artifact substep status, for stages whose substeps map to individual files
-  // rather than one coarse pipeline step (e.g. each governance reviewer's own report).
-  const byArtifact = (name: string, applicable: boolean): StepStatus => {
-    if (!applicable) return "skipped";
-    if (runArtifacts.includes(name)) return "done";
-    return isTerminal ? "skipped" : "pending";
-  };
 
   // 1. Product Planning
   const planningSubsteps: SectionSubstep[] = [
     { label: "Raw Input",                                            status: hasRawInput ? "done" : "pending" },
-    { label: "Clean Requirements",                                   status: get("requirements") },
-    { label: "MVP Spec",                                             status: get("spec") },
-    { label: sprintModeActive ? "Sprint Architecture" : "Architecture", status: get("architecture") },
-    { label: "Architecture Contract Check",                          status: get("consistency") },
-  ];
-
-  // 2. Sprint Roadmap — structurally not part of non-sprint runs
-  const roadmapSubsteps: SectionSubstep[] = [
-    { label: "Sprint Plan",                  status: sprintModeActive ? get("sprint_plan") : "disabled" },
-    { label: "Recommended Build Order",      status: sprintModeActive ? get("sprint_plan") : "disabled" },
-    { label: "Sprint Dependencies",          status: sprintModeActive ? get("sprint_plan") : "disabled" },
-    { label: "Selected Sprint Scope",        status: sprintModeActive ? get("selected_sprint_scope") : "disabled" },
-    { label: "Selected Sprint Build Prompt", status: sprintModeActive ? get("selected_sprint_build_prompt") : "disabled" },
+    { label: "Requirements Normalization", status: get("requirements_normalization") },
+    { label: "MVP Spec", status: get("mvp_spec") },
+    { label: sprintModeActive ? "Sprint Architecture" : "Architecture", status: get("sprint_architecture") },
+    { label: sprintModeActive ? "Selected Sprint Prompt" : "Build Prompt", status: get("selected_sprint_prompt") },
+    { label: "Planning Consistency Check", status: get("planning_consistency_check") },
   ];
 
   // 3. Sprint Build — "Generated MVP Folder" has no tracked artifact of its own
@@ -1082,55 +1079,37 @@ function buildSections(opts: {
   // the evidence we do have: claude_build_output.txt is only written from inside that
   // folder once Claude Code has run.
   const buildSubsteps: SectionSubstep[] = [
-    { label: sprintModeActive ? "Build Selected Sprint" : "Build MVP", status: get("built") },
-    { label: "Generated MVP Folder",                                   status: get("built") },
-    { label: "Smoke Checks",                                           status: get("smoke") },
+    { label: sprintModeActive ? "Build Selected Sprint" : "Build MVP", status: get("claude_build") },
   ];
 
   // 4. Review & Fix — not run at all in plan-only / sprint-plan-only modes
   const reviewSubsteps: SectionSubstep[] = [
-    { label: "DeepSeek Attack Review",  status: reviewFixApplicable ? get("deepseek") : "disabled" },
-    { label: "GPT Issue Judgment",      status: reviewFixApplicable ? get("judge") : "disabled" },
-    { label: "Claude Fix Loop",         status: reviewFixApplicable ? get("fix") : "disabled" },
-    { label: "Re-run Smoke Checks",     status: reviewFixApplicable ? get("smoke") : "disabled" },
+    { label: "Smoke Checks", status: get("smoke_checks") },
+    { label: "DeepSeek Red Team Review", status: get("deepseek_red_team") },
+    { label: "Governance Review", status: get("governance_review") },
   ];
 
   // 5. Governance — each reviewer's report is its own artifact, checked directly so a
   // partially-run governance panel never reads as fully "done" or fully "not run".
   const governanceSubsteps: SectionSubstep[] = [
-    { label: "AppSec Review",           status: byArtifact("governance_appsec_report.md", reviewFixApplicable) },
-    { label: "Legal/Privacy Review",    status: byArtifact("governance_legal_privacy_report.md", reviewFixApplicable) },
-    { label: "Infrastructure Review",   status: byArtifact("governance_infra_report.md", reviewFixApplicable) },
-    { label: "Governance Meta-Judge",   status: byArtifact("governance_meta_judgment.md", reviewFixApplicable) },
-    { label: "Governance Fix Loop",     status: reviewFixApplicable
-        ? (runArtifacts.includes("governance_fix_prompt.md") ? "done" : (isTerminal ? "skipped" : "pending"))
-        : "disabled" },
+    { label: "Consolidated Fix Plan", status: get("consolidated_fix_plan") },
+    { label: "Claude Fix Pass", status: get("claude_fix_pass") },
   ];
 
   // 6. Report & Deploy — Deploy to AWS is a permanently disabled placeholder; it is
   // never wired to any real evidence and must never read as "done" or "active".
-  const nextSprint = sprintInfo?.sprints?.find(s => s.dependencies?.includes(selectedSprintNum)) ??
-    sprintInfo?.sprints?.find(s => s.number === selectedSprintNum + 1);
-  const nextSprintStatus: StepStatus | "disabled" = !sprintModeActive
-    ? "disabled"
-    : nextSprint
-    ? "done"
-    : isTerminal
-    ? "skipped" // this was the last sprint in the plan — settled, not a thing left to do
-    : "pending";
   const reportSubsteps: SectionSubstep[] = [
-    { label: sprintModeActive ? "Sprint Completion Report" : "Final Report", status: get("done") },
-    { label: "Next Recommended Sprint", status: nextSprintStatus },
-    { label: "Deploy to AWS — Coming later", status: "disabled" },
+    { label: "Final Smoke Checks", status: get("final_smoke_checks") },
+    { label: "Sprint Requirements Check", status: get("sprint_requirements_check") },
+    { label: sprintModeActive ? "Sprint Report" : "Final Report", status: get("sprint_report") },
   ];
 
   return [
-    { id: "planning",   title: "Product Planning", blurb: "Turning the raw idea into a structured, agreed-upon spec.",        status: rollupStatus(planningSubsteps, true),              substeps: planningSubsteps },
-    { id: "roadmap",    title: "Sprint Roadmap",   blurb: "Decomposing the spec into an ordered, dependency-aware sprint plan.", status: rollupStatus(roadmapSubsteps, sprintModeActive),  substeps: roadmapSubsteps },
-    { id: "build",      title: "Sprint Build",     blurb: "Generating the actual application code with Claude Code.",        status: rollupStatus(buildSubsteps, true),                 substeps: buildSubsteps },
-    { id: "review",     title: "Review & Fix",     blurb: "Red-teaming the build and patching what breaks.",                  status: rollupStatus(reviewSubsteps, reviewFixApplicable), substeps: reviewSubsteps },
-    { id: "governance", title: "Governance",       blurb: "AppSec, legal/privacy and infrastructure sign-off.",               status: rollupStatus(governanceSubsteps, reviewFixApplicable), substeps: governanceSubsteps },
-    { id: "report",     title: "Report & Deploy",  blurb: "Summarizing what shipped and what's recommended next.",            status: rollupStatus(reportSubsteps, true),                substeps: reportSubsteps },
+    { id: "planning", title: "Phase 1 — Planning", blurb: "Creating and validating the selected sprint plan before any build.", status: rollupStatus(planningSubsteps, true), substeps: planningSubsteps },
+    { id: "build", title: "Phase 2 — Build", blurb: "Building the selected sprint with Claude Code.", status: rollupStatus(buildSubsteps, true), substeps: buildSubsteps },
+    { id: "review", title: "Phase 3 — Verification / Review", blurb: "Running smoke, red-team, and governance reviews in order.", status: rollupStatus(reviewSubsteps, true), substeps: reviewSubsteps },
+    { id: "governance", title: "Phase 4 — Consolidated Fix", blurb: "Combining confirmed findings into one minimal fix pass.", status: rollupStatus(governanceSubsteps, true), substeps: governanceSubsteps },
+    { id: "report", title: "Phase 5 — Final Acceptance", blurb: "Separately checking final smoke evidence and sprint requirements.", status: rollupStatus(reportSubsteps, true), substeps: reportSubsteps },
   ];
 }
 
@@ -1667,29 +1646,23 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
   const timeline = buildTimeline(run);
 
   const statuses = steps.map(step =>
-    stepStatus(step, run?.artifacts ?? [], run?.current_step ?? "", run?.status ?? "")
+    stepStatus(step, run?.artifacts ?? [], run?.current_step ?? "", run?.status ?? "", run?.steps)
   );
   // Sprint numbers this run has direct evidence were actually built (claude_build_output.txt
   // exists, i.e. the "Build Selected Sprint" step is genuinely "done") — only the currently
   // selected sprint can ever be in this set for a single run, but it's what gates dependency
   // locks on the sprint cards below.
-  const builtStepIdx = steps.findIndex(s => s.id === "built");
+  const builtStepIdx = steps.findIndex(s => s.id === "claude_build");
   const builtSprints = builtStepIdx >= 0 && statuses[builtStepIdx] === "done" ? [selectedSprintNum] : [];
 
   // Six-section overview: same underlying step/artifact evidence as the detailed
   // carousel below, grouped into the stages a person actually thinks in.
-  const planOnlyActive = !!run?.plan_only || run?.status === "plan_only_done";
-  const reviewFixApplicable = !planOnlyActive && !sprintPlanOnlyActive;
   const statusById: Record<string, StepStatus> = {};
   steps.forEach((step, i) => { statusById[step.id] = statuses[i]; });
   const sections = buildSections({
     statusById,
     runArtifacts: run?.artifacts ?? [],
-    isTerminal,
     sprintModeActive,
-    reviewFixApplicable,
-    sprintInfo,
-    selectedSprintNum,
   });
 
   // Existing App Upgrade mode has a different artifact shape (existing_app_summary.md,

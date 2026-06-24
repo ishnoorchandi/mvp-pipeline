@@ -170,6 +170,18 @@ STEP_KEYS = [
     "sprint_requirements_check", "sprint_report",
 ]
 STEP_STATUSES = {"pending", "running", "complete", "failed", "skipped", "not_run", "blocked"}
+STEP_PHASES = {
+    "planning": STEP_KEYS[0:5],
+    "build": STEP_KEYS[5:6],
+    "verification_review": STEP_KEYS[6:9],
+    "consolidated_fix": STEP_KEYS[9:11],
+    "final_acceptance": STEP_KEYS[11:14],
+}
+PLAN_ONLY_NOT_RUN_STEPS = [
+    "claude_build", "smoke_checks", "deepseek_red_team", "governance_review",
+    "consolidated_fix_plan", "claude_fix_pass", "final_smoke_checks",
+    "sprint_requirements_check",
+]
 
 
 def _set_step(run_id: str, key: str, status: str, **extra):
@@ -187,6 +199,34 @@ def _set_step(run_id: str, key: str, status: str, **extra):
 def _set_steps_not_run(run_id: str, keys: list[str]):
     for key in keys:
         _set_step(run_id, key, "not_run")
+
+
+def write_plan_only_sprint_report(run_id: str, selected_sprint: int) -> str:
+    """Write an honest planning handoff. This is never an implementation report."""
+    report = (
+        "# Sprint Report — Planning Only\n\n"
+        f"## Selected Sprint\nSprint {selected_sprint} was planned, but no sprint was built.\n\n"
+        "## Build Status\n"
+        "- No sprint was built.\n"
+        "- Claude Code was not invoked.\n"
+        "- No implementation files were created or changed by this run.\n\n"
+        "## Acceptance Status\n"
+        "- Sprint Requirements Check was not run.\n"
+        "- Implementation acceptance is `not_run`; this report only confirms planning completed.\n"
+    )
+    save_artifact(run_id, "sprint_report.md", report)
+    return report
+
+
+def finalize_plan_only_step_state(run_id: str, selected_sprint: int, sprint_plan_only: bool) -> None:
+    """Set terminal step truth for plan-only modes without inventing build evidence."""
+    _set_steps_not_run(run_id, PLAN_ONLY_NOT_RUN_STEPS)
+    if sprint_plan_only:
+        _set_step(run_id, "sprint_report", "running")
+        write_plan_only_sprint_report(run_id, selected_sprint)
+        _set_step(run_id, "sprint_report", "complete", artifact="sprint_report.md")
+    else:
+        _set_step(run_id, "sprint_report", "not_run")
 
 
 def init_run(run_id: str, raw_input: str):
@@ -5928,6 +5968,31 @@ def generate_fix_prompt(
     return "\n".join(parts)
 
 
+def generate_consolidated_fix_plan(
+    spec: str,
+    mvp_dir: Path,
+    smoke_log: str,
+    deepseek_report: str,
+    judged_report: str,
+    governance_report: str,
+    consistency_report: str,
+    fix_iteration: int,
+) -> str:
+    """One fix prompt combining verification, red-team, and governance evidence."""
+    base = generate_fix_prompt(
+        spec, mvp_dir, deepseek_report, fix_iteration,
+        judged_report=judged_report, consistency_report=consistency_report,
+    )
+    return "\n\n".join([
+        f"# Consolidated Fix Plan — Iteration {fix_iteration}",
+        "Apply one minimal fix pass for confirmed blockers across all review sources below. "
+        "Do not run separate smoke, red-team, and governance fix loops.",
+        f"## Smoke / Architecture Evidence\n{smoke_log}",
+        f"## Governance Evidence\n{governance_report or 'Governance review was skipped.'}",
+        base,
+    ])
+
+
 def apply_fixes(run_id: str, mvp_dir: Path, fix_prompt: str, fix_iteration: int) -> str:
     output = _stream_subprocess(
         CLAUDE_CODE_CMD + [fix_prompt],
@@ -5984,6 +6049,66 @@ def generate_final_report(spec: str, mvp_dir: Path, fix_iterations_done: int, de
             "Write the final MVP build report."
         )},
     ])
+
+
+def generate_sprint_requirements_check(
+    selected_sprint: dict,
+    mvp_dir: Path,
+    final_smoke_log: str,
+) -> tuple[str, str]:
+    """Post-build acceptance evidence against selected_sprint_scope.md.
+
+    This function must only be called after a real build and final smoke phase.
+    It deliberately marks behavioral criteria for manual verification unless the
+    available file/smoke evidence proves them.
+    """
+    expected = list(dict.fromkeys(
+        (selected_sprint.get("expected_files") or []) +
+        (selected_sprint.get("files_to_create") or []) +
+        (selected_sprint.get("likely_files_created") or [])
+    ))
+    exact_expected = [p for p in expected if p and not any(ch in p for ch in "*?[")]
+    present = [p for p in exact_expected if (mvp_dir / p).exists()]
+    missing = [p for p in exact_expected if not (mvp_dir / p).exists()]
+    smoke_failed = bool(re.search(r"\[FAIL\]|RESULT:\s*.*FAILED|TRACEBACK", final_smoke_log, re.I))
+    status = "FAIL" if smoke_failed or missing else "WARN"
+    lines = [
+        "# Sprint Requirements Check", "",
+        f"**Status:** {status}", "",
+        "This is a post-build acceptance check against `selected_sprint_scope.md`. "
+        "It does not reuse the pre-build Planning Consistency Check as implementation proof.", "",
+        "## Selected Sprint", f"- Sprint {selected_sprint.get('number', selected_sprint.get('sprint_number', '?'))}: "
+        f"{selected_sprint.get('title', '')}", "",
+        "## Expected File Evidence",
+        f"- Present: {len(present)}/{len(exact_expected)}",
+    ]
+    lines.extend(f"- PRESENT: {p}" for p in present)
+    lines.extend(f"- MISSING: {p}" for p in missing)
+    lines += ["", "## Acceptance Criteria"]
+    criteria = (selected_sprint.get("acceptance_criteria") or
+                selected_sprint.get("completion_criteria") or ["No explicit criteria recorded"])
+    lines.extend(f"- [ ] {item} — manual verification required unless directly evidenced by final smoke checks"
+                 for item in criteria)
+    lines += ["", "## Final Smoke Evidence", "```", final_smoke_log[:4000], "```", ""]
+    return status, "\n".join(lines) + "\n"
+
+
+def write_built_sprint_report(
+    run_id: str,
+    selected_sprint: dict,
+    requirements_status: str,
+    final_report: str,
+) -> str:
+    report = (
+        "# Sprint Report\n\n"
+        f"## Sprint Built\nSprint {selected_sprint.get('number', '?')}: {selected_sprint.get('title', '')}\n\n"
+        "## Build Status\n- A real Claude Code build was completed for this sprint.\n\n"
+        f"## Sprint Requirements Check\n- Status: {requirements_status}\n"
+        "- See `sprint_requirements_check.txt` for acceptance evidence and manual checks.\n\n"
+        f"## Build Handoff\n{final_report}\n"
+    )
+    save_artifact(run_id, "sprint_report.md", report)
+    return report
 
 
 # ── Approval check ────────────────────────────────────────────────────────────
@@ -6643,11 +6768,13 @@ def pipeline(
 
     print("▶ Step 0c  GPT-mini — normalizing clean requirements")
     t0 = time.time()
+    _set_step(run_id, "requirements_normalization", "running")
     progress.start("GPT-mini", "normalizing requirements")
     clean_requirements = normalize_requirements(requirements_source)
     save_artifact(run_id, "clean_requirements.md", clean_requirements)
     record_step_time(run_id, "clean_requirements", t0)
     progress.done("Clean requirements written")
+    _set_step(run_id, "requirements_normalization", "complete", artifact="clean_requirements.md")
 
     constraints = detect_negative_constraints(
         raw_input,
@@ -6662,6 +6789,7 @@ def pipeline(
     # ── Step 1: MVP Spec ─────────────────────────────────────────────────────
     print("▶ Step 1/8  GPT-mini — writing MVP spec")
     t0 = time.time()
+    _set_step(run_id, "mvp_spec", "running")
     _update_state(run_id, {"current_step": "spec"})
     progress.start("GPT-mini", "writing MVP spec")
     spec = generate_mvp_spec(clean_requirements, constraints)
@@ -6669,11 +6797,13 @@ def pipeline(
     record_step_time(run_id, "spec", t0)
     log_event(run_id, "spec_ready")
     progress.done("MVP spec written")
+    _set_step(run_id, "mvp_spec", "complete", artifact="mvp_spec.md")
     print(f"\n{spec[:400]}{'...' if len(spec) > 400 else ''}\n")
 
     # ── Step 1d: Architecture contract ───────────────────────────────────────
     print("▶ Step 1d  GPT-mini — writing ARCHITECTURE.md")
     t0 = time.time()
+    _set_step(run_id, "sprint_architecture", "running")
     progress.start("GPT-mini", "writing architecture contract")
     architecture_text = generate_architecture(spec, constraints)
     save_artifact(run_id, "ARCHITECTURE.md", architecture_text)
@@ -6737,8 +6867,13 @@ def pipeline(
         _update_state(run_id, {})  # refresh artifacts list
         log_event(run_id, "selected_sprint_build_prompt_ready", f"sprint={selected_sprint}")
 
-    # ── Step 2b: Requirements consistency check ──────────────────────────────
-    print("▶ Step 2b  Requirements consistency check (rule-based)")
+    _set_step(run_id, "sprint_architecture", "complete", artifact="sprint_plan.md" if sprint_mode_active else "ARCHITECTURE.md")
+    _set_step(run_id, "selected_sprint_prompt", "complete",
+              artifact="selected_sprint_build_prompt.txt" if sprint_mode_active else "build_prompt.txt")
+
+    # ── Phase 1.5: Planning Consistency Check (pre-build) ────────────────────
+    print("▶ Step 2b  Planning Consistency Check (rule-based, pre-build)")
+    _set_step(run_id, "planning_consistency_check", "running")
     consistency_artifacts = {
         "mvp_spec.md": spec,
         "ARCHITECTURE.md": architecture_text,
@@ -6753,6 +6888,10 @@ def pipeline(
     print(f"  {consistency_report}")
 
     if not consistency_ok:
+        _set_step(run_id, "planning_consistency_check", "failed",
+                  artifact="requirements_consistency_check.txt")
+        _set_step(run_id, "claude_build", "blocked")
+        _set_steps_not_run(run_id, STEP_KEYS[6:])
         _update_state(run_id, {"status": "blocked_consistency_violation", "current_step": "blocked"})
         print(f"\n{'='*60}")
         print(f"  BLOCKED — generated planning artifacts violate explicit requirements")
@@ -6761,8 +6900,12 @@ def pipeline(
         print(f"{'='*60}\n")
         raise RequirementsConsistencyError(consistency_report)
 
+    _set_step(run_id, "planning_consistency_check", "complete",
+              artifact="requirements_consistency_check.txt")
+
     if _is_plan_only_run(plan_only, sprint_plan_only):
         status = "sprint_plan_only_done" if sprint_plan_only else "plan_only_done"
+        finalize_plan_only_step_state(run_id, selected_sprint, sprint_plan_only)
         _update_state(run_id, {"status": status, "current_step": "done"})
         log_event(run_id, status)
         print(f"\n{'='*60}")
@@ -6784,16 +6927,44 @@ def pipeline(
     print(f"▶ Step 3/8  Claude Code — building MVP"
           f"{f' (Sprint {selected_sprint} only)' if sprint_mode_active else ''}")
     t0 = time.time()
+    _set_step(run_id, "claude_build", "running")
     _update_state(run_id, {"current_step": "building", "status": "building"})
     progress.start("Claude Code", "building MVP")
     mvp_dir = build_mvp(run_id, build_text_for_claude)
     record_step_time(run_id, "built", t0)
     _update_state(run_id, {"status": "built", "mvp_dir": str(mvp_dir)})
     progress.done("Initial MVP build complete")
+    _set_step(run_id, "claude_build", "complete", artifact="claude_build_output.txt")
 
     # ── Fix loop ─────────────────────────────────────────────────────────────
     fix_iteration = 0
     deepseek_report = "(DeepSeek review not yet run)"
+    gov_verdict = "SKIPPED"
+    gov_meta_report = ""
+
+    def _run_governance_review(g_iter: int, g_smoke: str, g_deepseek: str) -> tuple[str, str]:
+        """Run governance immediately after red-team review, before judgment/fixing."""
+        _set_step(run_id, "governance_review", "running")
+        _update_state(run_id, {"current_step": "governance"})
+        appsec = run_governance_appsec(
+            spec, architecture_text, build_prompt_text, consistency_report,
+            g_smoke, g_deepseek, "", mvp_dir, run_id, g_iter,
+        )
+        legal = run_governance_legal_privacy(
+            spec, architecture_text, build_prompt_text, consistency_report,
+            mvp_dir, run_id, g_iter,
+        )
+        infra = run_governance_infra(
+            spec, architecture_text, build_prompt_text, consistency_report,
+            mvp_dir, run_id, g_iter,
+        )
+        verdict, meta = judge_governance_reports(
+            appsec, legal, infra, spec, consistency_report, run_id, g_iter,
+        )
+        _set_step(run_id, "governance_review", "complete",
+                  artifact="governance_meta_judgment.md", verdict=verdict)
+        log_event(run_id, f"governance_review_{g_iter}", verdict)
+        return verdict, meta
 
     for cycle in range(MAX_FIX_ITERATIONS):
         cycle_label = f"{cycle + 1}/{MAX_FIX_ITERATIONS}"
@@ -6801,6 +6972,7 @@ def pipeline(
         # Step 4: Smoke Checks + Architecture Verification
         print(f"\n▶ Step 4  Smoke checks  [cycle {cycle_label}]")
         t0 = time.time()
+        _set_step(run_id, "smoke_checks", "running")
         _update_state(run_id, {"current_step": f"smoke_{cycle + 1}"})
         progress.start("Smoke checks", "running checks + architecture verification")
         smoke_log = run_smoke_checks(run_id, mvp_dir)
@@ -6810,13 +6982,20 @@ def pipeline(
         fname = f"smoke_test_log_{cycle + 1}.txt" if cycle > 0 else "smoke_test_log.txt"
         save_artifact(run_id, fname, combined_log)
         progress.done("Smoke checks + architecture verification complete")
+        _set_step(run_id, "smoke_checks", "complete", artifact=fname)
         print(f"  {arch_log[:400]}{'...' if len(arch_log) > 400 else ''}")
         smoke_log = combined_log  # pass full log to DeepSeek
+        smoke_has_failures = bool(re.search(
+            r"\[FAIL\]|RESULT:\s*.*(?:FAILED|VIOLATIONS)", smoke_log, re.IGNORECASE,
+        ))
+        if smoke_has_failures:
+            _set_step(run_id, "smoke_checks", "failed", artifact=fname)
 
         # Step 5: DeepSeek
         if use_deepseek:
             print(f"\n▶ Step 5  DeepSeek red-team review  [cycle {cycle_label}]")
             t0 = time.time()
+            _set_step(run_id, "deepseek_red_team", "running")
             _update_state(run_id, {"current_step": f"deepseek_{cycle + 1}"})
             progress.start("DeepSeek", "attacking the MVP")
             deepseek_report = deepseek_attack_review(spec, mvp_dir, smoke_log)
@@ -6824,8 +7003,21 @@ def pipeline(
             fname = f"deepseek_attack_report_{cycle + 1}.md" if cycle > 0 else "deepseek_attack_report.md"
             save_artifact(run_id, fname, deepseek_report)
             progress.done("DeepSeek review complete")
+            _set_step(run_id, "deepseek_red_team", "complete", artifact=fname)
         else:
             deepseek_report = "DeepSeek disabled."
+            _set_step(run_id, "deepseek_red_team", "skipped", reason="--no-deepseek")
+
+        # Governance intentionally runs here: after red-team evidence, before issue
+        # judgment and before a single consolidated fix plan/pass.
+        if _gov_active:
+            gov_verdict, gov_meta_report = _run_governance_review(
+                cycle + 1, smoke_log, deepseek_report,
+            )
+        else:
+            gov_verdict, gov_meta_report = "SKIPPED", "Governance review skipped."
+            _set_step(run_id, "governance_review", "skipped",
+                      reason="--no-deepseek" if not use_deepseek else "--skip-governance")
 
         # Step 5b: GPT-mini judges the DeepSeek criticism (Phase 3)
         # Only runs when DeepSeek actually produced a report (not disabled / key missing).
@@ -6850,7 +7042,8 @@ def pipeline(
         # Check approval
         deepseek_approved = is_approved(deepseek_report)
         gpt_judged_pass   = _ds_ran and judged_verdict == "PASS"
-        if deepseek_approved or gpt_judged_pass or (not use_deepseek):
+        governance_approved = gov_verdict in ("PASS", "SKIPPED")
+        if (deepseek_approved or gpt_judged_pass or (not use_deepseek)) and governance_approved and not smoke_has_failures:
             if deepseek_approved:
                 reason = "DeepSeek VERDICT: APPROVED"
             elif gpt_judged_pass:
@@ -6860,156 +7053,89 @@ def pipeline(
             print(f"\n  MVP approved on cycle {cycle + 1} — {reason}")
             _update_state(run_id, {"status": "approved"})
             log_event(run_id, "approved", f"cycle={cycle + 1}, reason={reason}")
+            _set_step(run_id, "consolidated_fix_plan", "skipped", reason="no confirmed blockers")
+            _set_step(run_id, "claude_fix_pass", "skipped", reason="no confirmed blockers")
             break
 
         if cycle == MAX_FIX_ITERATIONS - 1:
             print(f"\n  ⚠️  Max fix iterations ({MAX_FIX_ITERATIONS}) reached.")
+            _set_step(run_id, "consolidated_fix_plan", "blocked",
+                      reason="confirmed blockers remain after maximum review cycles")
+            _set_step(run_id, "claude_fix_pass", "not_run",
+                      reason="no additional fix pass allowed")
             _update_state(run_id, {"status": "max_iterations_reached"})
             log_event(run_id, "max_iterations_reached")
             break
 
-        # Step 6+7: Fix prompt + Claude Code fixes
+        # Phase 4: one consolidated fix plan/pass for smoke, red-team, and governance.
         fix_iteration += 1
-        print(f"\n▶ Step 6  Generating fix prompt  [fix {fix_iteration}]")
-        fix_prompt = generate_fix_prompt(
-            spec, mvp_dir, deepseek_report, fix_iteration,
-            judged_report=judged_report_text,
-            consistency_report=consistency_report,
+        print(f"\n▶ Step 6  Generating consolidated fix plan  [fix {fix_iteration}]")
+        _set_step(run_id, "consolidated_fix_plan", "running")
+        fix_prompt = generate_consolidated_fix_plan(
+            spec, mvp_dir, smoke_log, deepseek_report, judged_report_text,
+            gov_meta_report, consistency_report, fix_iteration,
         )
+        save_artifact(run_id, "consolidated_fix_plan.md", fix_prompt)
         save_artifact(run_id, f"claude_fix_prompt_{fix_iteration}.md", fix_prompt)
+        _set_step(run_id, "consolidated_fix_plan", "complete", artifact="consolidated_fix_plan.md")
 
         print(f"\n▶ Step 7  Claude Code — applying fixes  [fix {fix_iteration}]")
         t0 = time.time()
+        _set_step(run_id, "claude_fix_pass", "running")
         _update_state(run_id, {"fix_iteration": fix_iteration, "current_step": f"fix_{fix_iteration}"})
         progress.start("Claude Code", f"fixing issues (iteration {fix_iteration})")
         apply_fixes(run_id, mvp_dir, fix_prompt, fix_iteration)
         record_step_time(run_id, f"fix_{fix_iteration}", t0)
         progress.done(f"Fix {fix_iteration} applied")
+        _set_step(run_id, "claude_fix_pass", "complete",
+                  artifact=f"claude_fix_output_{fix_iteration}.txt")
 
-    # ── Governance Panel ─────────────────────────────────────────────────────
-    # Runs after the quality loop approves the build, before the final report.
-    # Skipped when --no-deepseek or --skip-governance is set (two of three
-    # reviewers call DeepSeek).
-    gov_verdict      = "PASS"
-    gov_meta_report  = ""
-    gov_fix_count    = 0
-    gov_smoke_log    = smoke_log  # start with the latest smoke log from quality loop
+    # ── Phase 5: Final Smoke / Sprint Acceptance / Report ───────────────────
+    print("\n▶ Final Acceptance  Final smoke checks")
+    _set_step(run_id, "final_smoke_checks", "running")
+    _update_state(run_id, {"current_step": "final_smoke_checks"})
+    final_smoke = run_smoke_checks(run_id, mvp_dir)
+    final_arch = verify_architecture(run_id, mvp_dir, spec, constraints)
+    final_smoke_log = final_smoke + "\n\n" + final_arch
+    save_artifact(run_id, "final_smoke_checks.txt", final_smoke_log)
+    final_smoke_failed = bool(re.search(
+        r"\[FAIL\]|RESULT:\s*.*(?:FAILED|VIOLATIONS)", final_smoke_log, re.IGNORECASE,
+    ))
+    _set_step(run_id, "final_smoke_checks", "failed" if final_smoke_failed else "complete",
+              artifact="final_smoke_checks.txt")
 
-    if _gov_active:
-        print(f"\n{'─'*60}")
-        print(f"  Governance Panel")
-        print(f"{'─'*60}")
-        _update_state(run_id, {"current_step": "governance"})
-
-        def _run_governance_cycle(g_iter: int, g_smoke: str) -> tuple[str, str, str, str, str]:
-            """Run all three reviewers + meta-judge for one governance cycle.
-            Returns (appsec, legal, infra, verdict, meta_report)."""
-            t0 = time.time()
-            print(f"\n▶ Governance G1  AppSec / OWASP review  [gov cycle {g_iter}]")
-            progress.start("DeepSeek", "AppSec / OWASP review")
-            _appsec = run_governance_appsec(
-                spec, architecture_text, build_prompt_text,
-                consistency_report, g_smoke,
-                deepseek_report, judged_report_text,
-                mvp_dir, run_id, g_iter,
-            )
-            record_step_time(run_id, f"gov_appsec_{g_iter}", t0)
-            progress.done("AppSec review complete")
-
-            t0 = time.time()
-            print(f"\n▶ Governance G2  Legal / privacy / licensing review  [gov cycle {g_iter}]")
-            progress.start("GPT-4o", "legal / privacy review")
-            _legal = run_governance_legal_privacy(
-                spec, architecture_text, build_prompt_text,
-                consistency_report, mvp_dir, run_id, g_iter,
-            )
-            record_step_time(run_id, f"gov_legal_{g_iter}", t0)
-            progress.done("Legal review complete")
-
-            t0 = time.time()
-            print(f"\n▶ Governance G3  Infrastructure / deployment risk review  [gov cycle {g_iter}]")
-            progress.start("DeepSeek", "infra risk review")
-            _infra = run_governance_infra(
-                spec, architecture_text, build_prompt_text,
-                consistency_report, mvp_dir, run_id, g_iter,
-            )
-            record_step_time(run_id, f"gov_infra_{g_iter}", t0)
-            progress.done("Infra review complete")
-
-            t0 = time.time()
-            print(f"\n▶ Governance G4  GPT-mini — governance meta-judgment  [gov cycle {g_iter}]")
-            progress.start("GPT-mini", "governance meta-judgment")
-            _verdict, _meta = judge_governance_reports(
-                _appsec, _legal, _infra,
-                spec, consistency_report, run_id, g_iter,
-            )
-            record_step_time(run_id, f"gov_meta_{g_iter}", t0)
-            progress.done(f"Governance verdict: {_verdict}")
-            log_event(run_id, f"gov_verdict_{g_iter}", _verdict)
-            print(f"  Governance verdict: {_verdict}")
-            return _appsec, _legal, _infra, _verdict, _meta
-
-        # Initial governance review (iteration 1)
-        _, _, _, gov_verdict, gov_meta_report = _run_governance_cycle(1, gov_smoke_log)
-
-        # Fix loop — capped at MAX_GOVERNANCE_ITERATIONS
-        while governance_requires_fix(gov_meta_report) and gov_fix_count < MAX_GOVERNANCE_ITERATIONS:
-            gov_fix_count += 1
-            suffix = _governance_suffix(gov_fix_count)
-
-            print(f"\n▶ Governance G5  Generating governance fix prompt  [fix {gov_fix_count}]")
-            gov_fix_prompt = generate_governance_fix_prompt(
-                spec, mvp_dir, gov_meta_report, consistency_report, gov_fix_count,
-            )
-            save_artifact(run_id, f"governance_fix_prompt{suffix}.md", gov_fix_prompt)
-
-            print(f"\n▶ Governance G6  Claude Code — applying governance fixes  [fix {gov_fix_count}]")
-            t0 = time.time()
-            _update_state(run_id, {"current_step": f"gov_fix_{gov_fix_count}"})
-            progress.start("Claude Code", f"governance fixes (iteration {gov_fix_count})")
-            apply_fixes(run_id, mvp_dir, gov_fix_prompt, f"gov_{gov_fix_count}")
-            record_step_time(run_id, f"gov_fix_{gov_fix_count}", t0)
-            progress.done(f"Governance fix {gov_fix_count} applied")
-
-            print(f"\n▶ Governance G7  Smoke checks after governance fix  [fix {gov_fix_count}]")
-            t0 = time.time()
-            progress.start("Smoke checks", "re-checking after governance fix")
-            _new_smoke = run_smoke_checks(run_id, mvp_dir)
-            _new_arch  = verify_architecture(run_id, mvp_dir, spec, constraints)
-            gov_smoke_log = _new_smoke + "\n\n" + _new_arch
-            save_artifact(run_id, f"governance_smoke_log{suffix}.txt", gov_smoke_log)
-            record_step_time(run_id, f"gov_smoke_{gov_fix_count}", t0)
-            progress.done("Smoke checks after governance fix complete")
-
-            # Re-run all three reviewers + meta-judge
-            _, _, _, gov_verdict, gov_meta_report = _run_governance_cycle(
-                gov_fix_count + 1, gov_smoke_log,
-            )
-
-        if gov_fix_count >= MAX_GOVERNANCE_ITERATIONS and governance_requires_fix(gov_meta_report):
-            print(f"\n  ⚠️  Max governance fix iterations ({MAX_GOVERNANCE_ITERATIONS}) reached — proceeding.")
-            log_event(run_id, "governance_max_iterations")
-        else:
-            print(f"\n  Governance PASS after {gov_fix_count} fix iteration(s).")
-
-        _update_state(run_id, {
-            "governance_verdict": gov_verdict,
-            "governance_fix_count": gov_fix_count,
-        })
-        log_event(run_id, "governance_done", gov_verdict)
+    sprint_requirements_status = "not_run"
+    if sprint_mode_active and selected_sprint_entry is not None:
+        print("▶ Final Acceptance  Sprint Requirements Check (post-build)")
+        _set_step(run_id, "sprint_requirements_check", "running")
+        sprint_requirements_status, sprint_requirements_report = generate_sprint_requirements_check(
+            selected_sprint_entry, mvp_dir, final_smoke_log,
+        )
+        save_artifact(run_id, "sprint_requirements_check.txt", sprint_requirements_report)
+        _set_step(
+            run_id, "sprint_requirements_check",
+            "failed" if sprint_requirements_status == "FAIL" else "complete",
+            artifact="sprint_requirements_check.txt", result=sprint_requirements_status,
+        )
     else:
-        reason = "--no-deepseek" if not use_deepseek else "--skip-governance"
-        print(f"\n  ⏭  Governance panel skipped ({reason})")
+        _set_step(run_id, "sprint_requirements_check", "not_run",
+                  reason="run did not build a selected sprint")
 
-    # ── Step 8: Final Report ─────────────────────────────────────────────────
     print("\n▶ Step 8/8  GPT-mini — writing final report")
     t0 = time.time()
+    _set_step(run_id, "sprint_report", "running")
     _update_state(run_id, {"current_step": "report"})
     progress.start("GPT-mini", "writing final report")
     final_report = generate_final_report(spec, mvp_dir, fix_iteration, deepseek_report)
     save_artifact(run_id, "final_mvp_report.md", final_report)
+    if sprint_mode_active and selected_sprint_entry is not None:
+        write_built_sprint_report(
+            run_id, selected_sprint_entry, sprint_requirements_status, final_report,
+        )
     record_step_time(run_id, "report", t0)
     progress.done("Final report written")
+    _set_step(run_id, "sprint_report", "complete",
+              artifact="sprint_report.md" if sprint_mode_active else "final_mvp_report.md")
 
     # ── Total time ────────────────────────────────────────────────────────────
     total_elapsed = int(time.time() - pipeline_start)
