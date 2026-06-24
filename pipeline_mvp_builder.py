@@ -2881,6 +2881,35 @@ def _safe_read_text(path: Path, max_chars: int = 4000) -> str:
         return ""
 
 
+def _truncate_for_prompt(text: str, limit: int = 3000) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + "\n...(truncated)"
+
+
+def _detect_frontend_framework(deps: dict) -> str | None:
+    if "next" in deps:
+        return "Next.js"
+    if "vite" in deps and "react" in deps:
+        return "React + Vite"
+    if "react-scripts" in deps:
+        return "React (Create React App)"
+    if "react" in deps:
+        return "React"
+    if "vue" in deps:
+        return "Vue"
+    return None
+
+
+def _detect_backend_framework(text: str) -> str | None:
+    if re.search(r"\bflask\b", text, re.IGNORECASE):
+        return "Flask"
+    if re.search(r"\bfastapi\b", text, re.IGNORECASE):
+        return "FastAPI"
+    if re.search(r"\bdjango\b", text, re.IGNORECASE):
+        return "Django"
+    return None
+
+
 def scan_existing_app(existing_app_path: Path) -> dict:
     """
     Deterministic static repo scanner — no GPT call. Walks the existing app
@@ -2888,6 +2917,12 @@ def scan_existing_app(existing_app_path: Path) -> dict:
     frameworks, folder structure, entry points, and likely routes/components/
     API/data files. A robust simple scan is enough for v1 — this is not meant
     to be a perfect AST-level analysis.
+
+    Monorepo-aware: package.json / requirements.txt / pyproject.toml are
+    discovered ANYWHERE in the tree (not just at conventional root/frontend/
+    backend paths), so a repo like `OneHR-UI/package.json` +
+    `OneHR-API-Backend/requirements.txt` is detected correctly instead of
+    falling back to "Unknown / undetected".
     """
     existing_app_path = Path(existing_app_path).resolve()
     all_files: list[Path] = []
@@ -2907,67 +2942,108 @@ def scan_existing_app(existing_app_path: Path) -> dict:
 
     rel_files = [str(f.relative_to(existing_app_path)) for f in all_files]
 
-    def _find(*candidates: str) -> Path | None:
-        for c in candidates:
-            p = existing_app_path / c
-            if p.exists():
-                return p
-        return None
+    def _rel_dir(path: Path) -> str:
+        rel = path.parent.relative_to(existing_app_path)
+        return "." if str(rel) == "." else str(rel)
 
-    package_json_path = _find("package.json", "frontend/package.json")
-    package_json = _safe_read_json(package_json_path) if package_json_path else {}
-    deps = {**package_json.get("dependencies", {}), **package_json.get("devDependencies", {})}
+    package_json_paths = sorted({f for f in all_files if f.name == "package.json"}, key=str)
+    requirements_paths = sorted({f for f in all_files if f.name == "requirements.txt"}, key=str)
+    pyproject_paths = sorted({f for f in all_files if f.name == "pyproject.toml"}, key=str)
+    lockfile_paths = [f for f in all_files if f.name in {"package-lock.json", "yarn.lock", "pnpm-lock.yaml"}]
 
-    requirements_txt_path = _find("requirements.txt", "backend/requirements.txt")
-    pyproject_path = _find("pyproject.toml", "backend/pyproject.toml")
-    py_deps_text = (_safe_read_text(requirements_txt_path) if requirements_txt_path else "") + \
-                   (_safe_read_text(pyproject_path) if pyproject_path else "")
+    apps: list[dict] = []
+    scripts_by_app: dict[str, dict] = {}
+    merged_scripts: dict[str, str] = {}
+    all_frontend_deps: dict[str, str] = {}
+    combined_py_text_parts: list[str] = []
+
+    for pkg_path in package_json_paths:
+        app_dir = _rel_dir(pkg_path)
+        package_json = _safe_read_json(pkg_path)
+        deps = {**package_json.get("dependencies", {}), **package_json.get("devDependencies", {})}
+        all_frontend_deps.update(deps)
+        framework = _detect_frontend_framework(deps)
+        scripts = package_json.get("scripts", {}) if isinstance(package_json, dict) else {}
+        if scripts:
+            scripts_by_app[app_dir] = scripts
+            merged_scripts.update(scripts)
+        has_ts = any(
+            f.parent == pkg_path.parent and f.suffix.lower() in (".ts", ".tsx")
+            for f in all_files
+        ) or any(f.name == "tsconfig.json" and f.parent == pkg_path.parent for f in all_files)
+        pm = "npm"
+        for lock in lockfile_paths:
+            if lock.parent in (pkg_path.parent, existing_app_path):
+                if lock.name == "pnpm-lock.yaml":
+                    pm = "pnpm"
+                elif lock.name == "yarn.lock":
+                    pm = "yarn"
+                break
+        apps.append({
+            "path": app_dir, "type": "frontend", "framework": framework,
+            "language": "TypeScript" if has_ts else "JavaScript",
+            "package_manager": pm, "scripts": scripts,
+        })
+
+    for req_path in requirements_paths + pyproject_paths:
+        app_dir = _rel_dir(req_path)
+        if any(a["path"] == app_dir and a["type"] == "backend" for a in apps):
+            continue
+        text = _safe_read_text(req_path)
+        combined_py_text_parts.append(text)
+        framework = _detect_backend_framework(text)
+        if not framework:
+            for f in all_files:
+                if f.parent == req_path.parent and f.suffix == ".py":
+                    file_text = _safe_read_text(f, max_chars=4000)
+                    framework = _detect_backend_framework(file_text)
+                    if not framework and re.search(r"from\s+flask\s+import", file_text):
+                        framework = "Flask"
+                    if not framework and re.search(r"from\s+fastapi\s+import", file_text):
+                        framework = "FastAPI"
+                    if framework:
+                        break
+        apps.append({
+            "path": app_dir, "type": "backend", "framework": framework,
+            "language": "Python", "package_manager": "pip", "scripts": {},
+        })
+
+    frontend_apps = [a for a in apps if a["type"] == "frontend"]
+    backend_apps = [a for a in apps if a["type"] == "backend"]
+    frontend_apps_with_framework = [a for a in frontend_apps if a["framework"]]
+    backend_apps_with_framework = [a for a in backend_apps if a["framework"]]
+
+    frontend_framework = frontend_apps_with_framework[0]["framework"] if frontend_apps_with_framework else None
+    backend_framework = backend_apps_with_framework[0]["framework"] if backend_apps_with_framework else None
+    package_manager = (
+        frontend_apps[0]["package_manager"] if frontend_apps
+        else ("pip" if backend_apps else None)
+    )
 
     tech_stack: list[str] = []
-    frontend_framework = None
-    backend_framework = None
-    package_manager = None
-
-    if package_json_path:
-        package_manager = "npm"
-        if _find("pnpm-lock.yaml"):
-            package_manager = "pnpm"
-        elif _find("yarn.lock"):
-            package_manager = "yarn"
-        if "next" in deps:
-            frontend_framework = "Next.js"
-        elif "vite" in deps and "react" in deps:
-            frontend_framework = "React + Vite"
-        elif "react-scripts" in deps:
-            frontend_framework = "React (Create React App)"
-        elif "react" in deps:
-            frontend_framework = "React"
-        elif "vue" in deps:
-            frontend_framework = "Vue"
-        if "express" in deps:
-            backend_framework = "Express / Node"
+    if frontend_apps:
         tech_stack.append("Node.js")
-        if frontend_framework:
-            tech_stack.append(frontend_framework)
-
-    if requirements_txt_path or pyproject_path:
-        package_manager = package_manager or "pip"
-        if re.search(r"\bflask\b", py_deps_text, re.IGNORECASE):
-            backend_framework = backend_framework or "Flask"
-        elif re.search(r"\bfastapi\b", py_deps_text, re.IGNORECASE):
-            backend_framework = backend_framework or "FastAPI"
-        elif re.search(r"\bdjango\b", py_deps_text, re.IGNORECASE):
-            backend_framework = backend_framework or "Django"
+    if frontend_framework:
+        tech_stack.append(frontend_framework)
+    if backend_apps:
         tech_stack.append("Python")
-        if backend_framework:
-            tech_stack.append(backend_framework)
-
+    if backend_framework:
+        tech_stack.append(backend_framework)
     if not tech_stack:
         tech_stack.append("Unknown / undetected")
 
+    package_json_path = package_json_paths[0] if package_json_paths else None
+    requirements_txt_path = requirements_paths[0] if requirements_paths else (pyproject_paths[0] if pyproject_paths else None)
+    py_deps_text = " ".join(combined_py_text_parts)
+
     database = None
     auth = None
-    combined_dep_text = " ".join(deps.keys()) + " " + py_deps_text
+    combined_dep_text = " ".join(all_frontend_deps.keys()) + " " + py_deps_text
+    migrations = [
+        f for f in rel_files
+        if re.search(r"(^|/)(migrations?|alembic[/_]versions)(/|$)", f, re.IGNORECASE)
+        or f.lower().endswith(".sql")
+    ][:60]
     if re.search(r"sqlite", combined_dep_text, re.IGNORECASE) or any(f.endswith(".db") for f in rel_files):
         database = "SQLite"
     elif re.search(r"\bpg\b|postgres|psycopg", combined_dep_text, re.IGNORECASE):
@@ -2976,8 +3052,22 @@ def scan_existing_app(existing_app_path: Path) -> dict:
         database = "MongoDB"
     elif re.search(r"sequelize|prisma|sqlalchemy", combined_dep_text, re.IGNORECASE):
         database = "SQL (ORM detected)"
-    if re.search(r"passport|next-auth|firebase|jsonwebtoken|jwt|flask-login|flask-jwt", combined_dep_text, re.IGNORECASE):
+    elif migrations:
+        database = "SQL (migrations detected)"
+    if re.search(r"jsonwebtoken|jwt|flask-jwt|pyjwt", combined_dep_text, re.IGNORECASE) or \
+            any("jwt" in f.lower() for f in rel_files):
+        auth = "JWT"
+    elif re.search(r"passport|next-auth|firebase|flask-login", combined_dep_text, re.IGNORECASE):
         auth = "Auth library detected (see dependencies)"
+
+    if tech_stack == ["Unknown / undetected"]:
+        stack_confidence = "low"
+    elif frontend_framework and backend_framework:
+        stack_confidence = "high"
+    elif frontend_framework or backend_framework:
+        stack_confidence = "medium"
+    else:
+        stack_confidence = "low"
 
     entry_points = [f for f in rel_files if Path(f).name in (
         "app.py", "main.py", "server.js", "index.js", "index.ts",
@@ -2986,14 +3076,16 @@ def scan_existing_app(existing_app_path: Path) -> dict:
 
     def _list_dir_files(*dirnames: str, limit: int = 40) -> list[str]:
         out = []
-        for d in dirnames:
-            base = existing_app_path / d
-            if base.exists():
-                for f in rel_files:
-                    if f.startswith(d.rstrip("/") + "/") or f.startswith(d.rstrip("/") + os.sep):
-                        out.append(f)
-                        if len(out) >= limit:
-                            return out
+        seen = set()
+        patterns = [re.compile(r"(^|/)" + re.escape(d.strip("/")) + r"(/|$)") for d in dirnames]
+        for f in rel_files:
+            if f in seen:
+                continue
+            if any(pattern.search(f) for pattern in patterns):
+                out.append(f)
+                seen.add(f)
+                if len(out) >= limit:
+                    break
         return out
 
     routes_pages = _list_dir_files("src/pages", "frontend/src/pages", "pages", "app")
@@ -3041,8 +3133,6 @@ def scan_existing_app(existing_app_path: Path) -> dict:
     for rel in route_source_files[:600]:
         env_requirements.update(env_pattern.findall(_safe_read_text(existing_app_path / rel, max_chars=30000)))
 
-    scripts = package_json.get("scripts", {}) if package_json else {}
-
     risky_files = [f for f in rel_files if Path(f).name in _SENSITIVE_FILENAMES | _LOCK_FILENAMES
                    or "migration" in f.lower() or "schema" in f.lower()
                    or f in entry_points]
@@ -3055,6 +3145,9 @@ def scan_existing_app(existing_app_path: Path) -> dict:
         "backend_framework": backend_framework,
         "database": database,
         "auth": auth,
+        "stack_confidence": stack_confidence,
+        "apps": apps,
+        "migrations": migrations,
         "top_level_dirs": top_level_dirs,
         "file_count": len(rel_files),
         "entry_points": entry_points,
@@ -3071,7 +3164,8 @@ def scan_existing_app(existing_app_path: Path) -> dict:
         "test_files": test_files,
         "config_files": config_files,
         "environment_requirements": sorted(env_requirements),
-        "scripts": scripts,
+        "scripts": merged_scripts,
+        "scripts_by_app": scripts_by_app,
         "risky_files": risky_files[:30],
         "all_files": rel_files,
         "package_json_path": str(package_json_path.relative_to(existing_app_path)) if package_json_path else None,
@@ -3088,8 +3182,25 @@ def write_existing_app_inventory(scan: dict, run_dir) -> str:
     lines.append(f"**Backend framework:** {scan['backend_framework'] or 'None detected'}")
     lines.append(f"**Database:** {scan['database'] or 'None detected'}")
     lines.append(f"**Auth:** {scan['auth'] or 'None detected'}")
+    lines.append(f"**Stack detection confidence:** {scan.get('stack_confidence', 'low')}")
     lines.append("")
+    if scan.get("stack_confidence") == "low":
+        lines.append("⚠️ **Low confidence scan.** The static scan could not confidently identify this "
+                      "app's frontend/backend frameworks. Treat any specific file paths below as "
+                      "unverified leads, not facts, until a human inspects the repo.")
+        lines.append("")
     lines.append(f"**Total files scanned:** {scan['file_count']}")
+    lines.append("")
+    lines.append("## Detected Apps (monorepo-aware)")
+    if scan.get("apps"):
+        for app in scan["apps"]:
+            framework = app.get("framework") or "framework not confidently detected"
+            lines.append(
+                f"- `{app['path']}` — {app['type']} ({app.get('language', '?')}, {framework}, "
+                f"package manager: {app.get('package_manager') or 'n/a'})"
+            )
+    else:
+        lines.append("(no package.json/requirements.txt/pyproject.toml found anywhere in the tree)")
     lines.append("")
     lines.append("## Folder Structure (top level)")
     for d in scan["top_level_dirs"] or ["(no subfolders)"]:
@@ -3138,11 +3249,16 @@ def write_existing_app_inventory(scan: dict, run_dir) -> str:
         lines.append(f"- `{name}`" if not name.startswith("(") else f"- {name}")
     lines.append("")
     lines.append("## Test / Build Scripts")
-    if scan["scripts"]:
+    if scan.get("scripts_by_app"):
+        for app_dir, scripts in scan["scripts_by_app"].items():
+            lines.append(f"**{app_dir}:**")
+            for k, v in scripts.items():
+                lines.append(f"- `{k}`: `{v}`")
+    elif scan["scripts"]:
         for k, v in scan["scripts"].items():
             lines.append(f"- `{k}`: `{v}`")
     else:
-        lines.append("(none detected — no package.json scripts found)")
+        lines.append("(none detected — no package.json scripts found anywhere in the tree)")
     lines.append("")
     lines.append("## Important Files")
     for f in [scan["package_json_path"], scan["requirements_txt_path"]]:
@@ -3170,6 +3286,179 @@ def write_existing_app_inventory(scan: dict, run_dir) -> str:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "existing_app_inventory.md").write_text(content, encoding="utf-8")
     return content
+
+
+# ── Existing App Deep Audit ─────────────────────────────────────────────────────
+# A second, more structural pass over the scan, run BEFORE feature planning. Each
+# function below is deterministic (no GPT call) and writes one focused artifact so
+# later GPT prompts (existing app summary, feature sprint plan) can be grounded in
+# concrete evidence instead of re-deriving it from a single dense inventory blob.
+
+def write_app_structure_map(scan: dict, run_dir) -> str:
+    """Deterministic — app_structure_map.md. No GPT call."""
+    lines = ["# App Structure Map", "", f"**Stack detection confidence:** {scan.get('stack_confidence', 'low')}", ""]
+    if scan.get("stack_confidence") == "low":
+        lines.append("⚠️ Low confidence — apps below may be incomplete or misidentified.")
+        lines.append("")
+    apps = scan.get("apps") or []
+    if not apps:
+        lines.append("(no package.json/requirements.txt/pyproject.toml found anywhere in the tree — "
+                      "this repo could not be decomposed into sub-apps)")
+    for app in apps:
+        lines.append(f"## `{app['path']}` ({app['type']})")
+        lines.append(f"- Language: {app.get('language', 'unknown')}")
+        lines.append(f"- Framework: {app.get('framework') or 'not confidently detected'}")
+        lines.append(f"- Package manager: {app.get('package_manager') or 'n/a'}")
+        if app.get("scripts"):
+            lines.append("- Scripts:")
+            for k, v in app["scripts"].items():
+                lines.append(f"  - `{k}`: `{v}`")
+        lines.append("")
+    lines.append("## Top-Level Folders")
+    for d in scan.get("top_level_dirs") or ["(none)"]:
+        lines.append(f"- {d}/")
+    lines.append("")
+    lines.append("## Entry Points")
+    for f in scan.get("entry_points") or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    content = "\n".join(lines) + "\n"
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "app_structure_map.md").write_text(content, encoding="utf-8")
+    return content
+
+
+def write_frontend_route_map(scan: dict, run_dir) -> str:
+    """Deterministic — frontend_route_map.md. No GPT call."""
+    lines = ["# Frontend Route Map", ""]
+    routes = scan.get("frontend_routes") or []
+    if routes:
+        for r in routes:
+            lines.append(f"- {r}")
+    else:
+        lines.append("(no frontend routes/pages detected statically)")
+    lines.append("")
+    lines.append("## Components")
+    for c in scan.get("components") or ["(none detected)"]:
+        lines.append(f"- {c}")
+    lines.append("")
+    lines.append("## State Management Files")
+    for f in scan.get("state_management_files") or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    content = "\n".join(lines) + "\n"
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "frontend_route_map.md").write_text(content, encoding="utf-8")
+    return content
+
+
+def write_backend_endpoint_map(scan: dict, run_dir) -> str:
+    """Deterministic — backend_endpoint_map.md. No GPT call."""
+    lines = ["# Backend Endpoint Map", ""]
+    routes = scan.get("backend_routes") or []
+    if routes:
+        for r in routes:
+            lines.append(f"- {r}")
+    else:
+        lines.append("(no backend endpoints detected statically — this may be a frontend-only app, "
+                      "or routes are defined in a way the static scan could not match)")
+    lines.append("")
+    lines.append("## API Files")
+    for f in scan.get("api_files") or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    content = "\n".join(lines) + "\n"
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "backend_endpoint_map.md").write_text(content, encoding="utf-8")
+    return content
+
+
+def write_data_model_map(scan: dict, run_dir) -> str:
+    """Deterministic — data_model_map.md. No GPT call."""
+    lines = ["# Data Model Map", "", f"**Database evidence:** {scan.get('database') or 'None detected'}", ""]
+    lines.append("## Migrations / SQL Files")
+    for f in scan.get("migrations") or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Database / Model Configuration Files")
+    for f in scan.get("database_config_files") or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    content = "\n".join(lines) + "\n"
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "data_model_map.md").write_text(content, encoding="utf-8")
+    return content
+
+
+def write_integration_map(scan: dict, run_dir) -> str:
+    """Deterministic — integration_map.md. No GPT call."""
+    lines = ["# Integration Map", "", f"**Auth evidence:** {scan.get('auth') or 'None detected'}", ""]
+    lines.append("## API Client Files")
+    for f in scan.get("api_client_files") or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Authentication-Related Files")
+    for f in scan.get("auth_files") or ["(none detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Environment / External Service Requirements")
+    for name in scan.get("environment_requirements") or ["(none detected from static references)"]:
+        lines.append(f"- `{name}`" if not name.startswith("(") else f"- {name}")
+    lines.append("")
+    content = "\n".join(lines) + "\n"
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "integration_map.md").write_text(content, encoding="utf-8")
+    return content
+
+
+def write_implementation_surface_area(scan: dict, run_dir) -> str:
+    """Deterministic — implementation_surface_area.md. No GPT call."""
+    lines = ["# Implementation Surface Area", "",
+             f"**Stack detection confidence:** {scan.get('stack_confidence', 'low')}", ""]
+    if scan.get("stack_confidence") == "low":
+        lines.append("⚠️ Low confidence scan — treat the file list below as a starting point for human "
+                      "inspection, not a guaranteed set of touch points.")
+        lines.append("")
+    likely = []
+    for key in ("components", "api_files", "state_management_files", "entry_points", "database_config_files"):
+        for f in scan.get(key) or []:
+            if f not in likely:
+                likely.append(f)
+    lines.append("## Likely Touch Points")
+    for f in likely[:60] or ["(requires human inspection; no conventional extension areas detected)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    lines.append("## Risky / Sensitive Files (avoid touching without explicit need)")
+    for f in scan.get("risky_files") or ["(none flagged)"]:
+        lines.append(f"- {f}")
+    lines.append("")
+    content = "\n".join(lines) + "\n"
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "implementation_surface_area.md").write_text(content, encoding="utf-8")
+    return content
+
+
+def run_existing_app_deep_audit(scan: dict, run_dir) -> dict:
+    """Deterministic — orchestrates the deep-audit artifact writers. No GPT call.
+
+    Runs between the raw scan and the baseline health check, per the Existing App
+    Upgrade flow: scan -> deep audit -> baseline health -> grounded summary ->
+    feature requirements -> feature gap matrix -> additive architecture -> sprint plan.
+    """
+    return {
+        "app_structure_map": write_app_structure_map(scan, run_dir),
+        "frontend_route_map": write_frontend_route_map(scan, run_dir),
+        "backend_endpoint_map": write_backend_endpoint_map(scan, run_dir),
+        "data_model_map": write_data_model_map(scan, run_dir),
+        "integration_map": write_integration_map(scan, run_dir),
+        "implementation_surface_area": write_implementation_surface_area(scan, run_dir),
+    }
 
 
 def run_baseline_health_check(existing_app_path: Path, scan: dict, run_dir) -> str:
@@ -3346,8 +3635,15 @@ def write_baseline_behavior_checklist(scan: dict, health_md: str, run_dir) -> st
 
 
 EXISTING_APP_SUMMARY_SYSTEM = """You are a senior engineer onboarding onto an existing codebase you did \
-not write. You are given a static repo scan and a baseline health check. Write a clear, honest, \
-human-readable summary of what this app appears to do and how it is built.
+not write. You are given a static repo scan, a deep audit (app structure map, frontend route map, \
+backend endpoint map, data model map, integration map), and a baseline health check. Write a clear, \
+honest, human-readable summary of what this app appears to do and how it is built.
+
+Ground every claim in the scan/audit evidence given to you. If the audit found backend endpoints, \
+frontend routes/modules, database migrations, auth/JWT files, or API client files, mention them \
+explicitly and concretely — do not write a vague generic summary when specific evidence exists. If the \
+scan stack-detection confidence is LOW, say so plainly and avoid asserting precise file paths or a \
+confident roadmap; describe what is uncertain instead of guessing.
 
 Write in this exact format:
 
@@ -3376,15 +3672,61 @@ Never say this is a "new MVP" — this is an existing app being inspected, not c
 """
 
 
-def generate_existing_app_summary(inventory_md: str, health_md: str, run_dir) -> str:
+def _existing_app_evidence_grounding(scan: dict) -> str:
+    """Deterministic facts pulled straight from the scan/audit — appended to the GPT summary
+    so it is always grounded in real evidence regardless of what the model chose to mention."""
+    apps = scan.get("apps") or []
+    lines = ["## Evidence Grounding (from scan, not the model)", ""]
+    if apps:
+        lines.append("**Detected apps:**")
+        for app in apps:
+            framework = app.get("framework") or "framework not confidently detected"
+            lines.append(f"- `{app['path']}` ({app['type']}, {app.get('language', '?')}, {framework})")
+    else:
+        lines.append("**Detected apps:** none — no package.json/requirements.txt/pyproject.toml found.")
+    lines.append(f"- Backend endpoints found: {len(scan.get('backend_routes') or [])}")
+    lines.append(f"- Frontend routes/modules found: {len(scan.get('frontend_routes') or [])}")
+    lines.append(f"- Database migrations/SQL files found: {len(scan.get('migrations') or [])}")
+    lines.append(f"- Auth/JWT-related files found: {len(scan.get('auth_files') or [])}")
+    lines.append(f"- API client files found: {len(scan.get('api_client_files') or [])}")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _stack_confidence_warning_block(scan: dict) -> str:
+    confidence = scan.get("stack_confidence", "low")
+    lines = [f"## Stack Confidence: {confidence}", ""]
+    if confidence == "low":
+        lines.append(
+            "⚠️ **Warning: low confidence scan.** The static scan could not confidently identify this "
+            "app's frontend/backend frameworks. Do not treat file paths elsewhere in this document as "
+            "verified facts, and do not make confident roadmap claims until a human inspects the repo."
+        )
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def generate_existing_app_summary(
+    inventory_md: str, health_md: str, run_dir,
+    scan: dict | None = None, audit_artifacts: dict | None = None,
+) -> str:
+    scan = scan or {}
+    audit_artifacts = audit_artifacts or {}
+    audit_context = "\n\n".join(
+        f"## {name.replace('_', ' ').upper()}\n{text}"
+        for name, text in audit_artifacts.items() if text
+    )
     summary = gpt([
         {"role": "system", "content": EXISTING_APP_SUMMARY_SYSTEM},
         {"role": "user", "content": (
             f"## EXISTING APP INVENTORY\n{inventory_md}\n\n"
+            f"## EXISTING APP DEEP AUDIT\n{audit_context}\n\n"
             f"## BASELINE HEALTH CHECK\n{health_md}\n\n"
             "Write the existing app summary."
         )},
     ])
+    summary = summary.rstrip() + "\n\n" + _stack_confidence_warning_block(scan) + \
+        "\n" + _existing_app_evidence_grounding(scan)
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "existing_app_summary.md").write_text(summary, encoding="utf-8")
@@ -3436,6 +3778,150 @@ def generate_new_feature_requirements(feature_request_text: str, existing_app_su
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "new_feature_requirements.md").write_text(requirements, encoding="utf-8")
     return requirements
+
+
+# Shared requirement-area taxonomy used by both the feature gap matrix (evidence-based status
+# per area) and the large-request sprint-plan expansion safety net (topic-coverage check).
+# Deliberately broad/ATS-flavored (OneHR/OneATS-scale) so a large multi-role requirements doc
+# detects many distinct areas instead of collapsing into a handful of generic buckets.
+_REQUIREMENT_AREA_KEYWORDS: dict[str, list[str]] = {
+    "Admin Dashboard": ["admin dashboard", "admin panel", "admin metrics", "admin"],
+    "Recruiter Workflow": ["recruiter"],
+    "Candidate Portal / Experience": ["candidate portal", "candidate experience", "candidate self-service",
+                                       "candidate self service", "candidate dashboard", "candidate login"],
+    "Requisition Management": ["requisition"],
+    "Candidate Submission / Resume Management": ["candidate submission", "resume management", "resume upload",
+                                                   "resume parsing", "submit candidate", "submission workflow"],
+    "AI Matching / Scoring / Tiering": ["ai matching", "resume matching", "matching algorithm", "scoring",
+                                         "candidate scoring", "tiering", "tier ranking", "ai-powered matching",
+                                         "ai score", "ai-powered"],
+    "Interview Scheduling": ["interview scheduling", "schedule interview", "interview slot", "interview calendar",
+                              "scheduling interview"],
+    "NDA / Document Signature Tracking": ["nda", "document signature", "e-signature", "esignature",
+                                           "signature tracking", "document workflow", "document upload"],
+    "Approval Queue / Offer Approvals": ["approval queue", "offer approval", "approval workflow",
+                                          "approve", "approval"],
+    "Placement Closure Workflow": ["placement closure", "closure workflow", "placement", "closure approval"],
+    "Reporting / Analytics": ["report", "reporting", "analytics"],
+    "Security / RBAC / Permissions": ["security", "rbac", "role-based access", "permission", "access control"],
+    "Audit / Compliance / Logs": ["audit", "compliance", "audit log", "audit trail"],
+    "Ceipal Integration": ["ceipal"],
+    "Job Board Syndication": ["job board", "syndication", "job posting distribution", "indeed posting",
+                              "linkedin posting", "ziprecruiter"],
+    "External Sync / Integration": ["external sync", "sync with", "data sync", "calendar sync",
+                                     "integration", "third-party", "webhook"],
+    "Notifications": ["notification", "email alert", "sms alert", "notify"],
+    "Data Model / Migrations": ["data model", "migration", "schema change", "database schema"],
+}
+
+_REQUIREMENT_AREA_SPRINT_GROUPING: dict[str, str] = {
+    "Admin Dashboard": "Admin Dashboard & Metrics Shell",
+    "Requisition Management": "Requisition Management",
+    "Ceipal Integration": "Ceipal Publishing & Job Board Syndication",
+    "Job Board Syndication": "Ceipal Publishing & Job Board Syndication",
+    "Recruiter Workflow": "Recruiter Candidate Submission Workflow",
+    "Candidate Submission / Resume Management": "Recruiter Candidate Submission Workflow",
+    "Candidate Portal / Experience": "Candidate Portal / Experience",
+    "AI Matching / Scoring / Tiering": "AI Matching / Scoring / Tiering",
+    "Interview Scheduling": "Interview Scheduling",
+    "NDA / Document Signature Tracking": "NDA / Document Signature Tracking",
+    "Approval Queue / Offer Approvals": "Approval Queue & Placement Closure Workflow",
+    "Placement Closure Workflow": "Approval Queue & Placement Closure Workflow",
+    "Reporting / Analytics": "Reporting & Analytics",
+    "Security / RBAC / Permissions": "Security / RBAC / Audit / Compliance",
+    "Audit / Compliance / Logs": "Security / RBAC / Audit / Compliance",
+    "External Sync / Integration": "Integration Hardening / External Sync",
+    "Notifications": "Integration Hardening / External Sync",
+    "Data Model / Migrations": "Data Model / Migrations",
+}
+
+_REQUIREMENT_AREA_HAS_SECURITY_IMPACT = {
+    "Security / RBAC / Permissions", "Approval Queue / Offer Approvals", "Audit / Compliance / Logs",
+}
+_REQUIREMENT_AREA_HAS_INTEGRATION_IMPACT = {
+    "Ceipal Integration", "Job Board Syndication", "External Sync / Integration", "Notifications",
+}
+_REQUIREMENT_AREA_HAS_DATA_MODEL_IMPACT = {
+    "Requisition Management", "Candidate Submission / Resume Management", "Reporting / Analytics",
+    "NDA / Document Signature Tracking", "Candidate Portal / Experience", "Audit / Compliance / Logs",
+    "Placement Closure Workflow", "Data Model / Migrations",
+}
+
+
+def _detected_requirement_areas(text: str) -> list[str]:
+    lowered = (text or "").lower()
+    return [name for name, keywords in _REQUIREMENT_AREA_KEYWORDS.items()
+            if any(kw in lowered for kw in keywords)]
+
+
+def generate_feature_gap_matrix(scan: dict, new_feature_requirements: str, run_dir) -> str:
+    """Deterministic — feature_gap_matrix.md. No GPT call.
+
+    Maps each requirement area mentioned in the feature request to its evidence-based
+    implementation status, likely frontend/backend touch points, and impact flags, so the
+    feature sprint planner has a grounded gap analysis instead of guessing per-area status.
+    """
+    confidence = scan.get("stack_confidence", "low")
+    frontend_evidence = " ".join(
+        (scan.get("frontend_routes") or []) + (scan.get("components") or []) + (scan.get("api_files") or [])
+    ).lower()
+    backend_evidence = " ".join(
+        (scan.get("backend_routes") or []) + (scan.get("api_files") or [])
+    ).lower()
+    data_evidence = " ".join((scan.get("migrations") or []) + (scan.get("database_config_files") or [])).lower()
+    integration_evidence = " ".join(
+        (scan.get("api_client_files") or []) + (scan.get("environment_requirements") or [])
+    ).lower()
+
+    areas = _detected_requirement_areas(new_feature_requirements)
+    lines = ["# Feature Gap Matrix", "", f"**Stack detection confidence:** {confidence}", ""]
+    if confidence == "low":
+        lines.append("⚠️ Low confidence scan — statuses below favor \"unknown\" over a confident "
+                      "\"missing\"/\"implemented\" call, and file paths are leads, not verified facts.")
+        lines.append("")
+    if not areas:
+        lines.append("(no recognized requirement areas detected in the feature request text)")
+        content = "\n".join(lines) + "\n"
+        run_dir = Path(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "feature_gap_matrix.md").write_text(content, encoding="utf-8")
+        return content
+
+    lines.append("| Requirement Area | Status | Likely Frontend | Likely Backend | Data Model Impact | "
+                 "Integration Impact | Security/RBAC Impact | Suggested Sprint Grouping |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for area in areas:
+        keywords = _REQUIREMENT_AREA_KEYWORDS[area]
+        frontend_hit = any(kw in frontend_evidence for kw in keywords)
+        backend_hit = any(kw in backend_evidence for kw in keywords)
+        if confidence == "low" and not (frontend_hit or backend_hit):
+            status = "unknown"
+        elif frontend_hit and backend_hit:
+            status = "implemented"
+        elif frontend_hit or backend_hit:
+            status = "partially implemented"
+        else:
+            status = "missing"
+        likely_frontend = [f for f in (scan.get("frontend_routes") or []) + (scan.get("components") or [])
+                            if any(kw in f.lower() for kw in keywords)][:5] or ["(none found)"]
+        likely_backend = [f for f in (scan.get("backend_routes") or []) + (scan.get("api_files") or [])
+                           if any(kw in f.lower() for kw in keywords)][:5] or ["(none found)"]
+        data_model_impact = "yes" if (area in _REQUIREMENT_AREA_HAS_DATA_MODEL_IMPACT
+                                       or any(kw in data_evidence for kw in keywords)) else "no"
+        integration_impact = "yes" if (area in _REQUIREMENT_AREA_HAS_INTEGRATION_IMPACT
+                                        or any(kw in integration_evidence for kw in keywords)) else "no"
+        security_impact = "yes" if area in _REQUIREMENT_AREA_HAS_SECURITY_IMPACT else "no"
+        grouping = _REQUIREMENT_AREA_SPRINT_GROUPING.get(area, "Ungrouped")
+        lines.append(
+            f"| {area} | {status} | {'; '.join(likely_frontend)} | {'; '.join(likely_backend)} | "
+            f"{data_model_impact} | {integration_impact} | {security_impact} | {grouping} |"
+        )
+    lines.append("")
+    content = "\n".join(lines) + "\n"
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "feature_gap_matrix.md").write_text(content, encoding="utf-8")
+    return content
 
 
 GAP_ANALYSIS_SYSTEM = """You are a staff engineer performing a change-impact / gap analysis before any \
@@ -3589,11 +4075,23 @@ Design rules:
   all of those pieces to use the requested feature.
 - Default to ONE complete vertical feature sprint for a small or medium additive UI feature. That sprint
   should include its route/page, navigation entry, components/content, states, and focused checks together.
+- A sprint that is only a service layer, data model, or plumbing change (with no user-visible demo shell in
+  that same sprint) is never acceptable on its own. If a sprint needs a service/data layer, that sprint must
+  also include enough UI for a user to see and exercise the new capability through it.
 - Never split route/page creation, sidebar or navigation wiring, and simple page content into separate
   sprints when they are all required for the same page. They are implementation tasks within one sprint,
   not meaningfully independent product increments.
+- Never split the SAME capability into multiple sprints just because it touches multiple entities, resources,
+  or pages (e.g. "Add Filter Configuration for Requisitions" and "Add Filter Configuration for Candidates" as
+  separate sprints). Cover all the entities the request asks for within the sprint(s) that deliver that
+  capability instead of duplicating a near-identical sprint per entity.
+- Never sequence a feature so the early sprint(s) only deliver setup/configuration while the actual value
+  capability (e.g. saving, applying, or reusing something) is pushed to a later sprint. The first buildable
+  sprint must already deliver real, useful behavior for the feature's main point — not just scaffolding.
 - Split only when there are meaningfully independent, independently demoable chunks, such as a backend
-  schema/API layer, a complex workflow, permissions/roles, an external integration, or multiple large pages.
+  schema/API layer, a complex multi-actor workflow, permissions/roles, an external integration, or multiple
+  large, substantively different pages. Splitting by sub-step of one capability or by entity/page repetition
+  of the same capability is NOT a meaningful split.
 - Before returning more than one sprint, explain in reason_for_split what a user can independently use or
   demo after EACH sprint. If that cannot be explained, merge the work into one sprint.
 - Order sprints by real dependency order (e.g. a persistence layer sprint before a feature that needs \
@@ -3602,13 +4100,77 @@ Design rules:
   it actually requires.
 - must_not_modify should name specific existing files/areas (from the additive architecture's "Files \
   That Should NOT Be Touched") that this sprint must leave alone.
-- Sprint count should match the actual number of distinct user capabilities — do not turn implementation
-  steps into sprints. One sprint is expected and preferred for a cohesive small/medium UI feature; use 2-6
-  only when the work has genuinely independent product increments.
+- Sprint count should match the actual number of distinct, genuinely independent user capabilities — do not
+  turn implementation steps, entities, or sub-bullets into sprints.
 
-Example — a request for a simple Reports page with a Reports route, sidebar link, and mock report cards
-must be ONE sprint such as "Add Usable Reports Page to Existing Dashboard." Its scope includes all three
-tasks and preserving existing dashboard behavior. Do not emit separate route, navigation, and cards sprints.
+Sizing guidance (pick the smallest plan that genuinely fits the request):
+- Small UI feature (a single page/section, no distinct sub-workflows): exactly ONE cohesive vertical sprint
+  covering its route/page, navigation entry, content, and checks together.
+- Medium mock/frontend-only feature (e.g. local/mock saved state, presets, filters, lightweight settings):
+  usually ONE sprint, or at most TWO when there is a genuine, independently useful seam (such as "shared
+  model + first integration" then "second integration + polish"). Never expand a medium feature into one
+  sprint per entity or per sub-step.
+- Complex workflow feature (multiple roles/actors, a multi-step state machine, scheduling/booking, or a
+  feature that needs an explicit mock service/data layer plus several distinct user-facing views): 3-6
+  meaningful sprints, each a real independent increment (e.g. core data/service layer + first usable view,
+  then the second role's view, then status/lifecycle handling, then conflict prevention and notifications/
+  audit trail). Even here, do not turn every sub-bullet of the request into its own sprint — group tightly
+  related capabilities that ship together.
+- Large, multi-role requirements document (the request spans many distinct functional areas — e.g. admin
+  dashboard, recruiter workflow, candidate portal/experience, requisition management, candidate submission/
+  resume management, AI matching/scoring/tiering, interview scheduling, NDA/document signature tracking,
+  approval queue/offer approvals, placement closure workflow, reporting/analytics, security/RBAC, audit/
+  compliance, Ceipal or similar ATS integration, job board syndication, external sync, notifications, data
+  model/migrations): the roadmap should generally have MANY more than 2-3 sprints. Specifically — if the
+  request is large (roughly 6000+ characters) AND the feature gap matrix detects 8 or more distinct
+  requirement areas AND at least 5 of those areas are missing/partially implemented, the roadmap should
+  usually land around 6-12 sprints, grouped by the feature gap matrix's "Suggested Sprint Grouping" column
+  (e.g. "Admin Dashboard & Metrics Shell", "Requisition Management", "Ceipal Publishing & Job Board
+  Syndication", "Recruiter Candidate Submission Workflow", "Candidate Portal / Experience", "AI Matching /
+  Scoring / Tiering", "Interview Scheduling", "NDA / Document Signature Tracking", "Approval Queue &
+  Placement Closure Workflow", "Reporting & Analytics", "Security / RBAC / Audit / Compliance", "Integration
+  Hardening / External Sync") — unless the request explicitly says to constrain scope. EVERY detected
+  requirement area must end up either covered by a sprint's requirements_covered/features, or explicitly
+  named in some sprint's deferred_requirements with a concrete reason — never just silently absent.
+  Compressing a large multi-role document into 2-3 generic sprints (e.g. only "Admin Dashboard" and
+  "Approval Queue") is a planning failure, not efficiency, even if those two sprints are individually fine.
+
+Consume the EXISTING APP DEEP AUDIT context you are given (app structure map, frontend/backend route maps,
+data model map, integration map, feature gap matrix) to ground likely_files_created/likely_files_modified,
+must_not_modify, and requirements_covered/deferred_requirements in real evidence instead of guessing. If the
+audit's stack confidence is LOW, do not invent precise file paths or a confident roadmap — use general
+language (e.g. "the frontend app", "the backend service") and flag uncertainty explicitly.
+
+Mock/frontend-only wording: if the existing app has no backend, or the feature request says the data should
+be mock/local/in-memory only, every sprint's smoke_checks and manual_qa_checklist must describe checks against
+a mock service/module or local/component state (e.g. "verify presets persist in local state after reload"),
+and must NEVER reference a real database, a real backend server, or a real API endpoint that does not exist
+in this app.
+
+Worked example 1 (small UI feature) — a request for a simple Reports page with a Reports route, sidebar link,
+and mock report cards must be ONE sprint such as "Add Usable Reports Page to Existing Dashboard." Its scope
+includes all three tasks and preserving existing dashboard behavior. Do not emit separate route, navigation,
+and cards sprints.
+
+Worked example 2 (medium mock/frontend-only feature) — a request for saved filters on a Requisitions page and
+a Candidates page (configure filters, save named presets, view/apply/delete presets, mock/local state only)
+should usually be ONE sprint, "Saved Filters for Requisitions and Candidates," covering configuring filters
+and saving/viewing/applying/deleting named presets for both pages, in local/mock state. It is acceptable to
+split into TWO sprints only if there is a real shared-model seam, e.g. Sprint 1 = "Shared Saved-Filter Model +
+Requisitions Integration" (including save/apply/delete, not just configuration) and Sprint 2 = "Candidate
+Integration + Preset Management Polish." Do NOT emit one sprint per entity for filter configuration plus a
+separate trailing "presets" sprint — that defers the feature's main value (saving/applying presets) and leaves
+early sprints with nothing useful to demo.
+
+Worked example 3 (complex workflow feature) — a request for interview scheduling across recruiter, candidate,
+and admin roles, with statuses, double-booking prevention, audit logging, and notification placeholders, on a
+frontend-only app, should be 3-6 sprints that together explicitly cover: recruiter slot creation, candidate
+slot selection, an admin scheduled-interview view, role-specific views for all three roles, interview statuses
+(available, booked, completed, canceled), double-booking prevention, a mock service/local-state layer (never a
+real backend/database), audit log entries for scheduling actions, email notification placeholders, and
+preservation of existing dashboard/candidates/requisitions/sidebar/navigation. Each sprint must still ship a
+user-visible demo (e.g. the sprint that introduces the mock scheduling service must also let a user create and
+see a slot through the UI, not just add a data layer).
 
 Output STRICT JSON ONLY — no markdown fences, no prose before or after — matching exactly this shape:
 
@@ -3623,6 +4185,7 @@ Output STRICT JSON ONLY — no markdown fences, no prose before or after — mat
       "user_visible_result": "<what a user can see or do after this sprint>",
       "features": ["<specific feature this sprint delivers>", "..."],
       "requirements_covered": ["<exact normalized requirement>", "..."],
+      "deferred_requirements": ["<exact normalized requirement>: deferred — <reason>", "..."],
       "depends_on": [0],
       "status": "ready",
       "buildable": true,
@@ -3644,8 +4207,22 @@ Field rules:
 - "status" is "ready" if depends_on are all satisfied by baseline + earlier sprints, else "locked".
 - "buildable" is true for every feature sprint (Sprint 0 is the only non-buildable sprint, and it is \
   not part of your output).
-- Every field is required for every sprint. Do not omit fields.
+- Every requested capability from the NEW FEATURE REQUIREMENTS must appear, worded exactly as normalized \
+  there, in EXACTLY ONE of: some sprint's "requirements_covered", OR some sprint's "deferred_requirements" \
+  with a concrete reason. A requirement must NEVER appear in both — never list something as deferred in \
+  the same sprint that already covers it; that is a contradiction.
+- If your plan has only one sprint, "deferred_requirements" must be "[]" unless the NEW FEATURE REQUIREMENTS \
+  or gap analysis explicitly says that piece of work is out of scope/non-goal — a single-sprint plan almost \
+  never has real deferred work.
+- Never write a deferred reason that refers to "the next sprint" unless a later sprint with a higher \
+  sprint_number actually exists in your own output and actually covers it. There is no sprint after the \
+  last one in your plan.
+- Every field is required for every sprint. Do not omit fields. Use an empty list "[]" for \
+  "deferred_requirements" when nothing is deferred.
 - Titles must name the actual user capability. Never use generic titles such as "Feature Sprint 1".
+- Refer to the ACTUAL frontend/backend framework named in the EXISTING APP SUMMARY (e.g. "React route", \
+  "Vue page", "frontend route"). Never use a generic example framework name like "Express" or "Flask" \
+  unless that framework is the app's real, detected backend.
 """
 
 
@@ -3655,6 +4232,7 @@ _FEATURE_SPRINT_FIELD_DEFAULTS = {
     "user_visible_result": "",
     "features": [],
     "requirements_covered": [],
+    "deferred_requirements": [],
     "depends_on": [0],
     "status": "ready",
     "buildable": True,
@@ -3734,9 +4312,9 @@ def _merge_fragmented_ui_feature_sprints(sprints: list[dict], existing_app_summa
         "buildable": True,
         "independently_demoable": True,
     })
-    for key in ("features", "requirements_covered", "likely_files_created", "likely_files_modified",
-                "must_not_modify", "non_goals", "regression_risks", "completion_criteria",
-                "smoke_checks", "manual_qa_checklist"):
+    for key in ("features", "requirements_covered", "deferred_requirements", "likely_files_created",
+                "likely_files_modified", "must_not_modify", "non_goals", "regression_risks",
+                "completion_criteria", "smoke_checks", "manual_qa_checklist"):
         merged[key] = _dedupe_sprint_values(sprints, key)
     preservation = "Preserve existing dashboard behavior"
     evidence = (existing_app_summary + " " + combined).lower()
@@ -3745,9 +4323,295 @@ def _merge_fragmented_ui_feature_sprints(sprints: list[dict], existing_app_summa
     return [merged], True
 
 
-def normalize_feature_sprint_plan(data: dict, existing_app_summary: str) -> dict:
+_GENERIC_SPRINT_TITLE_WORDS = {
+    "add", "adding", "create", "creating", "implement", "implementing", "build", "building",
+    "configure", "configuration", "configuring", "for", "the", "and", "with", "to", "of", "app",
+    "page", "pages", "feature", "features", "functionality", "support", "new", "existing", "users",
+}
+
+
+def _sprint_title_keywords(title: str) -> set[str]:
+    words = re.findall(r"[a-zA-Z]{4,}", str(title).lower())
+    return {w for w in words if w not in _GENERIC_SPRINT_TITLE_WORDS}
+
+
+def _merge_same_capability_entity_sprints(sprints: list[dict], existing_app_summary: str) -> tuple[list[dict], bool]:
+    """Repair the common "same capability split per entity / sub-step" micro-sprint failure,
+    e.g. saved filters fragmented into a per-resource configuration sprint per entity plus a
+    separate trailing "presets" sprint. Conservative: only merges when no sprint references a
+    genuine split boundary (API, backend, schema, roles, auth, integration, workflow, etc.) and
+    every sprint title shares a common, specific keyword — evidence it is the same capability
+    rather than independent product increments.
+    """
+    if not 2 <= len(sprints) <= 6:
+        return sprints, False
+    searchable = []
+    for sprint in sprints:
+        searchable.append(" ".join(str(v) for key in (
+            "title", "goal", "user_visible_result", "features", "requirements_covered",
+            "likely_files_created", "likely_files_modified", "completion_criteria",
+        ) for v in ([sprint.get(key)] if isinstance(sprint.get(key), str) else sprint.get(key) or [])))
+    combined = " ".join(searchable)
+    if _SPRINT_SPLIT_JUSTIFIERS.search(combined):
+        return sprints, False
+    title_keyword_sets = [_sprint_title_keywords(sprint.get("title", "")) for sprint in sprints]
+    if not all(title_keyword_sets):
+        return sprints, False
+    shared = set.intersection(*title_keyword_sets)
+    if not shared:
+        return sprints, False
+
+    merged = dict(_FEATURE_SPRINT_FIELD_DEFAULTS)
+    merged.update(sprints[0])
+    domain = sorted(shared)[0].capitalize()
+    merged.update({
+        "sprint_number": 1,
+        "title": f"Add Complete {domain} Experience to Existing App",
+        "goal": "Deliver the complete user-visible feature as one vertical increment, including its "
+                "core capability, supporting configuration, and regression protection.",
+        "user_visible_result": next((s.get("user_visible_result") for s in reversed(sprints)
+                                     if s.get("user_visible_result")),
+                                    f"Users can configure, save, and use {domain.lower()} across the app."),
+        "depends_on": [0],
+        "status": "ready",
+        "buildable": True,
+        "independently_demoable": True,
+    })
+    for key in ("features", "requirements_covered", "deferred_requirements", "likely_files_created",
+                "likely_files_modified", "must_not_modify", "non_goals", "regression_risks",
+                "completion_criteria", "smoke_checks", "manual_qa_checklist"):
+        merged[key] = _dedupe_sprint_values(sprints, key)
+    preservation = "Preserve existing page behavior"
+    evidence = (existing_app_summary + " " + combined).lower()
+    if "dashboard" in evidence and preservation.lower() not in [str(v).lower() for v in merged["regression_risks"]]:
+        merged["regression_risks"].append(preservation)
+    return [merged], True
+
+
+_BACKEND_SMOKE_TERMS = re.compile(
+    r"\b(database|db migration|postgres(?:ql)?|mysql|sqlite|mongodb|real api|api endpoint|"
+    r"backend server|backend persistence|rest endpoint|graphql endpoint|sql query|curl\s+https?://)\b",
+    re.IGNORECASE,
+)
+_MOCK_ONLY_REQUEST_TERMS = re.compile(
+    r"\b(mock(?:ed)?\s+(?:api|service|data|state)|local state|frontend-only|frontend only|"
+    r"client-side only|no backend)\b",
+    re.IGNORECASE,
+)
+
+
+def feature_request_is_mock_only(scan: dict | None, new_feature_requirements: str = "") -> bool:
+    """True when the existing app has no backend, or the feature request explicitly asks for
+    mock/local-only data — used to keep smoke checks honest about what actually exists."""
+    scan = scan or {}
+    app_has_no_backend = not (scan.get("backend_framework") or scan.get("database"))
+    request_is_mock_only = bool(_MOCK_ONLY_REQUEST_TERMS.search(new_feature_requirements or ""))
+    return app_has_no_backend or request_is_mock_only
+
+
+def _sanitize_mock_only_smoke_checks(sprints: list[dict]) -> None:
+    """Strip database/real-backend wording from smoke checks and QA steps, replacing it with
+    mock-service-appropriate wording when the removal empties a sprint's list."""
+    for sprint in sprints:
+        for key in ("smoke_checks", "manual_qa_checklist"):
+            original = sprint.get(key) or []
+            cleaned = [item for item in original if not _BACKEND_SMOKE_TERMS.search(str(item))]
+            if original and not cleaned:
+                fallback = ("Verify the mock/local state updates correctly in the UI"
+                            if key == "smoke_checks"
+                            else "Confirm behavior persists in mock/local state, not a real backend")
+                cleaned = [fallback]
+            sprint[key] = cleaned
+
+
+_DEFERRAL_STOPWORDS = {
+    "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "with", "will", "be",
+    "covered", "next", "sprint", "deferred", "this", "is", "are", "as", "it", "its", "not",
+}
+
+
+def _requirement_token_set(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", str(text).lower())
+    return {w for w in words if w not in _DEFERRAL_STOPWORDS and len(w) > 2}
+
+
+def _requirements_overlap_significantly(a: str, b: str, threshold: float = 0.6) -> bool:
+    set_a, set_b = _requirement_token_set(a), _requirement_token_set(b)
+    if not set_a or not set_b:
+        return False
+    overlap = len(set_a & set_b) / min(len(set_a), len(set_b))
+    return overlap >= threshold
+
+
+_NEXT_SPRINT_PHRASE = re.compile(r"\bwill be covered in (?:the |a )?next sprint\b", re.IGNORECASE)
+_NEXT_SPRINT_WORD = re.compile(r"\bnext sprint\b", re.IGNORECASE)
+
+
+def _repair_contradictory_deferred_requirements(sprints: list[dict]) -> None:
+    """A requirement must never be both covered and deferred in the same sprint, and a deferred
+    reason must never promise a "next sprint" that does not exist in this plan. Also: a single-
+    sprint plan should not defer requirements at all unless the sprint's own non_goals explicitly
+    say that work is out of scope."""
+    total = len(sprints)
+    for sprint in sprints:
+        covered = sprint.get("requirements_covered") or []
+        non_goals = sprint.get("non_goals") or []
+        deferred = sprint.get("deferred_requirements") or []
+        is_last_sprint = sprint.get("sprint_number") == total
+        cleaned = []
+        for item in deferred:
+            item_text = str(item)
+            if any(_requirements_overlap_significantly(item_text, c) for c in covered):
+                continue  # contradiction: this sprint already covers it
+            if total == 1 and not any(_requirements_overlap_significantly(item_text, ng) for ng in non_goals):
+                continue  # a single-sprint plan should not defer work unless explicitly out of scope
+            if total == 1 or is_last_sprint:
+                if _NEXT_SPRINT_PHRASE.search(item_text):
+                    item_text = _NEXT_SPRINT_PHRASE.sub(
+                        "out of scope for this plan and not yet scheduled", item_text)
+                elif _NEXT_SPRINT_WORD.search(item_text):
+                    item_text = _NEXT_SPRINT_WORD.sub("a future, unscheduled sprint", item_text)
+            cleaned.append(item_text)
+        sprint["deferred_requirements"] = cleaned
+
+
+_FRAMEWORK_MISMATCH_TERMS = re.compile(
+    r"\bExpress(?:\.js)?\s+(routes?|apps?|applications?|servers?|backends?|pages?)\b",
+    re.IGNORECASE,
+)
+
+
+def _correct_framework_wording(text: str, scan: dict | None) -> str:
+    """Rewrite generic/example backend-framework wording (e.g. "Express route") the model may
+    have echoed from a prompt example, when the scanned app actually has no such backend —
+    typically a React/Vue/Next.js frontend with no Express backend detected."""
+    if not text or not _FRAMEWORK_MISMATCH_TERMS.search(text):
+        return text
+    scan = scan or {}
+    if "express" in str(scan.get("backend_framework") or "").lower():
+        return text  # Express really is this app's backend — leave it alone
+    frontend = str(scan.get("frontend_framework") or "").lower()
+    if "react" in frontend:
+        noun = "React"
+    elif "vue" in frontend:
+        noun = "Vue"
+    elif "next" in frontend:
+        noun = "Next.js"
+    else:
+        noun = "frontend"
+
+    def _sub(match: re.Match) -> str:
+        kind = match.group(1).lower()
+        if kind.startswith("route"):
+            return f"{noun} {kind}"
+        if kind.startswith("page"):
+            return f"{noun} {kind}"
+        return f"{noun} app"
+
+    return _FRAMEWORK_MISMATCH_TERMS.sub(_sub, text)
+
+
+def _correct_sprint_framework_wording(sprints: list[dict], scan: dict | None) -> None:
+    for sprint in sprints:
+        for key in ("title", "goal", "user_visible_result"):
+            if sprint.get(key):
+                sprint[key] = _correct_framework_wording(sprint[key], scan)
+        for key in ("features", "requirements_covered", "deferred_requirements", "non_goals",
+                    "regression_risks", "completion_criteria", "smoke_checks", "manual_qa_checklist"):
+            sprint[key] = [_correct_framework_wording(item, scan) for item in sprint.get(key) or []]
+
+
+_LARGE_REQUEST_MIN_CHARS = 6000
+_LARGE_REQUEST_MIN_TOPICS = 6
+
+
+def _sprints_combined_text(sprints: list[dict], keys: tuple[str, ...]) -> str:
+    return " ".join(
+        " ".join(str(v) for key in keys
+                  for v in ([s.get(key)] if isinstance(s.get(key), str) else s.get(key) or []))
+        for s in sprints
+    ).lower()
+
+
+def _expand_plan_for_undercovered_topics(
+    sprints: list[dict], new_feature_requirements: str, raw_feature_request_text: str = "",
+) -> list[dict]:
+    """Safety net for large, multi-role requirement docs that the model compressed into too
+    few generic sprints (the reported OneATS failure: an ~82KB multi-role requirements doc
+    collapsed into just 2-3 sprints). Uses raw_feature_request_text (the original request,
+    before any GPT condensing) when available, since a GPT-normalized summary of an 82KB
+    document is often well under the size/topic gates below even though the real request is
+    large and multi-role — that gap was the actual root cause of under-expansion.
+
+    Uncovered areas are grouped by their feature-gap-matrix "suggested sprint grouping"
+    cluster (e.g. "Approval Queue & Placement Closure Workflow") and appended as ONE sprint
+    per cluster — not one thin placeholder per individual area — so the roadmap grows in
+    meaningful, demoable-sized chunks instead of a wall of near-duplicate sprints. These
+    appended sprints are explicitly marked as needing further breakdown — they are a floor,
+    not a substitute for real planning."""
+    req_text = raw_feature_request_text or new_feature_requirements or ""
+    if len(req_text) < _LARGE_REQUEST_MIN_CHARS:
+        return sprints
+    detected_areas = _detected_requirement_areas(req_text)
+    if len(detected_areas) < _LARGE_REQUEST_MIN_TOPICS:
+        return sprints
+
+    combined_text = _sprints_combined_text(
+        sprints, ("title", "goal", "features", "requirements_covered", "deferred_requirements")
+    )
+    uncovered = [
+        area for area in detected_areas
+        if not any(kw in combined_text for kw in _REQUIREMENT_AREA_KEYWORDS[area])
+    ]
+    if not uncovered:
+        return sprints
+
+    clusters: dict[str, list[str]] = {}
+    for area in uncovered:
+        cluster = _REQUIREMENT_AREA_SPRINT_GROUPING.get(area, area)
+        clusters.setdefault(cluster, []).append(area)
+
+    next_number = max((s.get("sprint_number", 0) for s in sprints), default=0) + 1
+    expanded = list(sprints)
+    for cluster, areas in clusters.items():
+        placeholder = dict(_FEATURE_SPRINT_FIELD_DEFAULTS)
+        area_list = ", ".join(areas)
+        placeholder.update({
+            "sprint_number": next_number,
+            "title": f"Add {cluster}",
+            "goal": f"Deliver the {area_list} capabilities requested in the feature request, grouped "
+                    f"under {cluster} per the feature gap matrix. This sprint was appended because the "
+                    "request was large/multi-role and these areas were not reflected in any planned "
+                    "sprint — it needs further decomposition into concrete build tasks before build.",
+            "user_visible_result": f"Users gain {area_list} functionality once this sprint is "
+                                    "decomposed into concrete buildable scope.",
+            "features": [f"{area} (needs further breakdown before build)" for area in areas],
+            "requirements_covered": list(areas),
+            "non_goals": ["Detailed scope still needs further sprint planning once these areas' "
+                          "requirements are fully decomposed."],
+            "completion_criteria": [f"{area} requirements are re-reviewed and broken into buildable "
+                                     "scope." for area in areas],
+            "depends_on": [0],
+            "status": "ready",
+            "buildable": True,
+            "independently_demoable": False,
+        })
+        expanded.append(placeholder)
+        next_number += 1
+    return expanded
+
+
+def normalize_feature_sprint_plan(
+    data: dict, existing_app_summary: str, scan: dict | None = None,
+    new_feature_requirements: str = "", raw_feature_request_text: str = "",
+) -> dict:
     """Deterministic — fills defaults, coerces types, prepends the immutable Sprint 0
-    baseline regardless of what the model produced. No GPT call."""
+    baseline regardless of what the model produced. No GPT call.
+
+    raw_feature_request_text (when supplied) is the ORIGINAL feature request before any GPT
+    condensing — used for the large-request size/topic gates below, since a GPT-normalized
+    summary of an 82KB request can be well under those gates even when the real request is
+    large and multi-role."""
     sprints_in = data.get("sprints") or []
     normalized = []
     for i, raw in enumerate(sprints_in):
@@ -3759,9 +4623,9 @@ def normalize_feature_sprint_plan(data: dict, existing_app_summary: str) -> dict
             entry["sprint_number"] = i + 1
         if entry["sprint_number"] <= 0:
             entry["sprint_number"] = i + 1
-        for k in ("features", "requirements_covered", "likely_files_created", "likely_files_modified",
-                  "must_not_modify", "non_goals", "regression_risks", "completion_criteria",
-                  "smoke_checks", "manual_qa_checklist"):
+        for k in ("features", "requirements_covered", "deferred_requirements", "likely_files_created",
+                  "likely_files_modified", "must_not_modify", "non_goals", "regression_risks",
+                  "completion_criteria", "smoke_checks", "manual_qa_checklist"):
             entry[k] = _coerce_list(entry[k])
         entry["depends_on"] = sorted(set(
             [0] + [int(d) for d in _coerce_list(entry["depends_on"]) if str(d).strip().lstrip("-").isdigit()]
@@ -3773,6 +4637,15 @@ def normalize_feature_sprint_plan(data: dict, existing_app_summary: str) -> dict
         normalized.append(entry)
     normalized.sort(key=lambda s: s["sprint_number"])
     normalized, cohesion_repaired = _merge_fragmented_ui_feature_sprints(normalized, existing_app_summary)
+    if not cohesion_repaired:
+        normalized, cohesion_repaired = _merge_same_capability_entity_sprints(normalized, existing_app_summary)
+    normalized = _expand_plan_for_undercovered_topics(
+        normalized, new_feature_requirements, raw_feature_request_text,
+    )
+    if feature_request_is_mock_only(scan, new_feature_requirements):
+        _sanitize_mock_only_smoke_checks(normalized)
+    _repair_contradictory_deferred_requirements(normalized)
+    _correct_sprint_framework_wording(normalized, scan)
 
     baseline = {
         "sprint_number": 0,
@@ -3783,6 +4656,7 @@ def normalize_feature_sprint_plan(data: dict, existing_app_summary: str) -> dict
                         "never rebuilt, never described as new.",
     }
 
+    stack_confidence = (scan or {}).get("stack_confidence", "low")
     return {
         "mode": "existing_app_upgrade",
         "product_name": data.get("product_name", ""),
@@ -3794,10 +4668,19 @@ def normalize_feature_sprint_plan(data: dict, existing_app_summary: str) -> dict
         "baseline": baseline,
         "sprints": normalized,
         "total_sprints": len(normalized),
+        "stack_confidence": stack_confidence,
+        "stack_confidence_warning": (
+            "Low confidence scan: the static scan could not confidently identify this app's "
+            "frontend/backend frameworks. Treat file paths and precise scope above as unverified "
+            "leads, not facts, until a human inspects the repo."
+        ) if stack_confidence == "low" else "",
     }
 
 
-def parse_feature_sprint_plan_json(raw_text: str, existing_app_summary: str) -> dict:
+def parse_feature_sprint_plan_json(
+    raw_text: str, existing_app_summary: str, scan: dict | None = None,
+    new_feature_requirements: str = "", raw_feature_request_text: str = "",
+) -> dict:
     candidate = _extract_json_object(raw_text)
     try:
         data = json.loads(candidate)
@@ -3810,7 +4693,9 @@ def parse_feature_sprint_plan_json(raw_text: str, existing_app_summary: str) -> 
             f"Feature sprint plan JSON is missing a non-empty 'sprints' list.\n\n"
             f"Raw model output:\n{raw_text[:1500]}"
         )
-    return normalize_feature_sprint_plan(data, existing_app_summary)
+    return normalize_feature_sprint_plan(
+        data, existing_app_summary, scan, new_feature_requirements, raw_feature_request_text,
+    )
 
 
 def select_feature_sprint(plan_json: dict, selected_sprint_number: int) -> dict:
@@ -3835,6 +4720,18 @@ def render_feature_sprint_plan_markdown(plan_json: dict) -> str:
     product = plan_json.get("product_name", "")
     baseline = plan_json.get("baseline", {})
     lines = [f"# Feature Sprint Plan{f': {product}' if product else ''}", ""]
+    if plan_json.get("stack_confidence_warning"):
+        lines.append(f"⚠️ **Warning:** {plan_json['stack_confidence_warning']}")
+        lines.append("")
+    coverage_result = plan_json.get("roadmap_coverage_result")
+    if coverage_result and coverage_result != "PASS":
+        uncovered = plan_json.get("roadmap_coverage_uncovered_areas") or []
+        lines.append(
+            f"⚠️ **Roadmap coverage check: {coverage_result}** — {len(uncovered)} requirement area(s) "
+            f"appear neither covered nor explicitly deferred: {', '.join(uncovered) or '(see report)'}. "
+            "See feature_roadmap_coverage_check.md before treating this plan as complete."
+        )
+        lines.append("")
     if plan_json.get("reason_for_split"):
         lines.append(f"**Reason for split:** {plan_json['reason_for_split']}")
         lines.append("")
@@ -3862,6 +4759,10 @@ def render_feature_sprint_plan_markdown(plan_json: dict) -> str:
         lines.append("")
         lines.append("**Exact requirements covered:**")
         for f in s.get("requirements_covered") or ["(not specified)"]:
+            lines.append(f"- {f}")
+        lines.append("")
+        lines.append("**Deferred requirements:**")
+        for f in s.get("deferred_requirements") or ["(none)"]:
             lines.append(f"- {f}")
         lines.append("")
         deps = s.get("depends_on") or [0]
@@ -3912,6 +4813,12 @@ def render_feature_sprint_plan_terminal(plan_json: dict, selected_sprint_number:
     sprints = sorted(plan_json.get("sprints", []), key=lambda s: s.get("sprint_number", 0))
     total = plan_json.get("total_sprints", len(sprints))
     lines = ["Existing App Upgrade — Feature Sprint Plan", ""]
+    coverage_result = plan_json.get("roadmap_coverage_result")
+    if coverage_result and coverage_result != "PASS":
+        uncovered = plan_json.get("roadmap_coverage_uncovered_areas") or []
+        lines.append(f"⚠️  Roadmap coverage check: {coverage_result} — "
+                      f"{len(uncovered)} requirement area(s) uncovered. See feature_roadmap_coverage_check.md")
+        lines.append("")
     lines.append("Sprint 0: Baseline Existing App (not buildable)")
     for s in sprints:
         n = s.get("sprint_number")
@@ -3926,6 +4833,100 @@ def render_feature_sprint_plan_terminal(plan_json: dict, selected_sprint_number:
     return "\n".join(lines)
 
 
+def compute_feature_roadmap_coverage(
+    new_feature_requirements: str, plan_json: dict, raw_feature_request_text: str = "",
+) -> dict:
+    """Deterministic — no GPT call. Final transparency check (after any safety-net
+    expansion already ran): for every requirement area detected in the request, is it
+    covered by a sprint, explicitly deferred with a reason, or silently uncovered? Also
+    flags a roadmap as "suspiciously compressed" when a large, multi-area request produced
+    very few sprints — the exact shape of the reported OneATS failure (2 sprints for an
+    82KB multi-role document)."""
+    req_text = raw_feature_request_text or new_feature_requirements or ""
+    detected_areas = _detected_requirement_areas(req_text)
+    sprints = plan_json.get("sprints") or []
+    total_sprints = plan_json.get("total_sprints", len(sprints))
+
+    covered_text = _sprints_combined_text(
+        sprints, ("title", "goal", "user_visible_result", "features", "requirements_covered")
+    )
+    deferred_text = _sprints_combined_text(sprints, ("deferred_requirements",))
+
+    covered_areas = [a for a in detected_areas if any(kw in covered_text for kw in _REQUIREMENT_AREA_KEYWORDS[a])]
+    deferred_areas = [a for a in detected_areas if a not in covered_areas
+                       and any(kw in deferred_text for kw in _REQUIREMENT_AREA_KEYWORDS[a])]
+    uncovered_areas = [a for a in detected_areas if a not in covered_areas and a not in deferred_areas]
+
+    is_large_request = len(req_text) >= _LARGE_REQUEST_MIN_CHARS
+    suspiciously_compressed = bool(
+        is_large_request and len(detected_areas) >= 8 and total_sprints <= 3
+    )
+
+    if uncovered_areas and suspiciously_compressed:
+        result = "FAIL"
+    elif uncovered_areas or suspiciously_compressed:
+        result = "WARN"
+    else:
+        result = "PASS"
+
+    return {
+        "detected_requirement_areas": detected_areas,
+        "covered_areas": covered_areas,
+        "deferred_areas": deferred_areas,
+        "uncovered_areas": uncovered_areas,
+        "total_sprints": total_sprints,
+        "is_large_request": is_large_request,
+        "suspiciously_compressed": suspiciously_compressed,
+        "result": result,
+    }
+
+
+def render_feature_roadmap_coverage_check_markdown(coverage: dict) -> str:
+    """Deterministic — feature_roadmap_coverage_check.md. No GPT call."""
+    lines = ["# Feature Roadmap Coverage Check", "", f"**Result:** {coverage['result']}", ""]
+    lines.append(f"**Suspiciously compressed roadmap:** {'yes' if coverage['suspiciously_compressed'] else 'no'}")
+    lines.append(f"**Total feature sprints:** {coverage['total_sprints']}")
+    lines.append(f"**Large request:** {'yes' if coverage['is_large_request'] else 'no'}")
+    lines.append("")
+    lines.append("## Detected Requirement Areas")
+    for a in coverage["detected_requirement_areas"] or ["(none detected)"]:
+        lines.append(f"- {a}")
+    lines.append("")
+    lines.append("## Covered By Sprint Plan")
+    for a in coverage["covered_areas"] or ["(none)"]:
+        lines.append(f"- {a}")
+    lines.append("")
+    lines.append("## Explicitly Deferred (named in deferred_requirements with a reason)")
+    for a in coverage["deferred_areas"] or ["(none)"]:
+        lines.append(f"- {a}")
+    lines.append("")
+    lines.append("## Uncovered — Neither Built Nor Deferred (planning gap)")
+    for a in coverage["uncovered_areas"] or ["(none)"]:
+        lines.append(f"- {a}")
+    lines.append("")
+    if coverage["result"] != "PASS":
+        lines.append(
+            "⚠️ **This roadmap may under-cover the feature request.** For each uncovered area above, "
+            "either add a sprint for it, or explicitly list it in some sprint's deferred_requirements "
+            "with a concrete reason — do not treat this plan as complete as-is."
+        )
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def generate_feature_roadmap_coverage_check(
+    new_feature_requirements: str, plan_json: dict, run_dir, raw_feature_request_text: str = "",
+) -> tuple[dict, str]:
+    """Writes feature_roadmap_coverage_check.json and feature_roadmap_coverage_check.md. No GPT call."""
+    coverage = compute_feature_roadmap_coverage(new_feature_requirements, plan_json, raw_feature_request_text)
+    md = render_feature_roadmap_coverage_check_markdown(coverage)
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "feature_roadmap_coverage_check.json").write_text(json.dumps(coverage, indent=2), encoding="utf-8")
+    (run_dir / "feature_roadmap_coverage_check.md").write_text(md, encoding="utf-8")
+    return coverage, md
+
+
 def generate_feature_sprint_plan(
     existing_app_summary: str,
     new_feature_requirements: str,
@@ -3933,14 +4934,35 @@ def generate_feature_sprint_plan(
     additive_architecture: str,
     run_dir,
     selected_sprint_number: int | None = None,
+    scan: dict | None = None,
+    audit_artifacts: dict | None = None,
+    raw_feature_request_text: str = "",
 ) -> tuple[dict, str]:
     """Uses GPT4O_MODEL (same model tier as the normal sprint architect). Writes
-    feature_sprint_plan.json and feature_sprint_plan.md into run_dir."""
+    feature_sprint_plan.json, feature_sprint_plan.md, feature_roadmap_coverage_check.json,
+    and feature_roadmap_coverage_check.md into run_dir.
+
+    audit_artifacts (when supplied) should contain the deep-audit maps — app_structure_map,
+    frontend_route_map, backend_endpoint_map, data_model_map, integration_map, and
+    feature_gap_matrix — so the planner grounds sprint scope in concrete scan evidence
+    instead of re-deriving it from the existing app summary alone.
+
+    raw_feature_request_text (when supplied) is the ORIGINAL feature request before any GPT
+    condensing — used for the large-request expansion safety net and the roadmap coverage
+    check, since a condensed summary of an 82KB request can look small even when the real
+    request is large and multi-role."""
+    audit_artifacts = audit_artifacts or {}
+    audit_context = "\n\n".join(
+        f"## {name.replace('_', ' ').upper()}\n{_truncate_for_prompt(text)}"
+        for name, text in audit_artifacts.items() if text
+    )
     user_msg = (
         f"## EXISTING APP SUMMARY\n{existing_app_summary}\n\n"
         f"## NEW FEATURE REQUIREMENTS\n{new_feature_requirements}\n\n"
         f"## CHANGE GAP ANALYSIS\n{gap_analysis}\n\n"
         f"## ADDITIVE ARCHITECTURE\n{additive_architecture}\n\n"
+        f"## EXISTING APP DEEP AUDIT (app structure, routes, data model, integrations, gap matrix)\n"
+        f"{audit_context}\n\n"
         "Now produce the feature sprint decomposition. Output STRICT JSON ONLY — no markdown, "
         "no commentary, no code fences."
     )
@@ -3948,9 +4970,18 @@ def generate_feature_sprint_plan(
         {"role": "system", "content": FEATURE_SPRINT_PLAN_SYSTEM},
         {"role": "user", "content": user_msg},
     ])
-    plan_json = parse_feature_sprint_plan_json(raw, existing_app_summary)
+    plan_json = parse_feature_sprint_plan_json(
+        raw, existing_app_summary, scan, new_feature_requirements, raw_feature_request_text,
+    )
     if selected_sprint_number is not None:
         plan_json["selected_feature_sprint"] = selected_sprint_number
+
+    coverage, _coverage_md = generate_feature_roadmap_coverage_check(
+        new_feature_requirements, plan_json, run_dir, raw_feature_request_text,
+    )
+    plan_json["roadmap_coverage_result"] = coverage["result"]
+    plan_json["roadmap_coverage_uncovered_areas"] = coverage["uncovered_areas"]
+
     plan_md = render_feature_sprint_plan_markdown(plan_json)
 
     run_dir = Path(run_dir)
@@ -4576,9 +5607,14 @@ def pipeline_existing_app_upgrade(
     scan = scan_existing_app(existing_app_path)
     inventory_md = write_existing_app_inventory(scan, rdir)
     record_step_time(run_id, "existing_app_scan", t0)
-    print(f"  Detected stack: {', '.join(scan['tech_stack'])}")
+    print(f"  Detected stack: {', '.join(scan['tech_stack'])} (confidence: {scan.get('stack_confidence', 'low')})")
 
-    print("▶ Step 2  Checking baseline health...")
+    print("▶ Step 2  Running Existing App Deep Audit...")
+    t0 = time.time()
+    audit_artifacts = run_existing_app_deep_audit(scan, rdir)
+    record_step_time(run_id, "existing_app_deep_audit", t0)
+
+    print("▶ Step 3  Checking baseline health...")
     t0 = time.time()
     health_md = run_baseline_health_check(existing_app_path, scan, rdir)
     baseline_checklist = write_baseline_behavior_checklist(scan, health_md, rdir)
@@ -4592,35 +5628,46 @@ def pipeline_existing_app_upgrade(
         print("  ⚠️  WARNING: the existing app appears to have pre-existing errors. "
               "Continuing — see baseline_health_check.md.")
 
-    print("▶ Step 3  Writing existing app summary...")
+    print("▶ Step 4  Writing existing app summary (grounded in scan + deep audit)...")
     t0 = time.time()
-    existing_app_summary = generate_existing_app_summary(inventory_md, health_md, rdir)
+    existing_app_summary = generate_existing_app_summary(inventory_md, health_md, rdir, scan, audit_artifacts)
     record_step_time(run_id, "existing_app_summary", t0)
 
-    print("▶ Step 4  Normalizing requested features...")
+    print("▶ Step 5  Normalizing requested features...")
     t0 = time.time()
     feature_requirements = generate_new_feature_requirements(feature_request_text, existing_app_summary, rdir)
     record_step_time(run_id, "feature_requirements", t0)
 
-    print("▶ Step 5  Writing change gap analysis...")
+    print("▶ Step 6  Building feature gap matrix...")
+    t0 = time.time()
+    # Use the ORIGINAL raw feature request, not the GPT-condensed feature_requirements, for
+    # requirement-area detection — a condensed summary of an 82KB request can collapse well
+    # below the large-request gates even when the real request is large and multi-role.
+    feature_gap_matrix_md = generate_feature_gap_matrix(scan, feature_request_text, rdir)
+    record_step_time(run_id, "feature_gap_matrix", t0)
+
+    print("▶ Step 7  Writing change gap analysis...")
     t0 = time.time()
     gap_analysis = generate_change_gap_analysis(existing_app_summary, feature_requirements, inventory_md, rdir)
     record_step_time(run_id, "gap_analysis", t0)
 
-    print("▶ Step 6  Creating additive architecture...")
+    print("▶ Step 8  Creating additive architecture...")
     t0 = time.time()
     additive_architecture = generate_additive_architecture(existing_app_summary, feature_requirements, gap_analysis, rdir)
     record_step_time(run_id, "additive_architecture", t0)
 
-    print("▶ Step 7  Creating feature sprint plan...")
+    print("▶ Step 9  Creating feature sprint plan...")
     t0 = time.time()
     plan_json, _plan_md = generate_feature_sprint_plan(
         existing_app_summary, feature_requirements, gap_analysis, additive_architecture,
         rdir, selected_sprint_number=None if feature_plan_only else selected_feature_sprint,
+        scan=scan, audit_artifacts={**audit_artifacts, "feature_gap_matrix": feature_gap_matrix_md},
+        raw_feature_request_text=feature_request_text,
     )
     record_step_time(run_id, "feature_sprint_plan", t0)
     _update_state(run_id, {})
     print(f"\n{render_feature_sprint_plan_terminal(plan_json, None if feature_plan_only else selected_feature_sprint)}\n")
+    print(f"  Roadmap coverage check: {plan_json.get('roadmap_coverage_result', 'PASS')}")
 
     if feature_plan_only:
         _update_state(run_id, {"status": "feature_plan_only_done", "current_step": "done"})
@@ -4640,7 +5687,7 @@ def pipeline_existing_app_upgrade(
     total = plan_json.get("total_sprints", len(plan_json.get("sprints", [])))
     print(f"Selected Feature Sprint: Sprint {selected_feature_sprint} of {total}")
 
-    print("▶ Step 8  Writing selected feature sprint scope + build prompt...")
+    print("▶ Step 10  Writing selected feature sprint scope + build prompt...")
     build_prompt_text = generate_selected_feature_sprint_build_prompt(
         existing_app_summary, scan, plan_json, selected_sprint, rdir, baseline_checklist,
     )
@@ -4650,14 +5697,14 @@ def pipeline_existing_app_upgrade(
     snapshot_protected_files(existing_app_path, must_not_modify, rdir)
     snapshot_existing_files(existing_app_path, rdir)
 
-    print(f"\n▶ Step 9  Claude Code — building Sprint {selected_feature_sprint} in place...")
+    print(f"\n▶ Step 11  Claude Code — building Sprint {selected_feature_sprint} in place...")
     t0 = time.time()
     _update_state(run_id, {"current_step": "building", "status": "building"})
     build_output = build_feature_sprint(run_id, existing_app_path, build_prompt_text)
     record_step_time(run_id, "built", t0)
     _update_state(run_id, {"status": "built"})
 
-    print("\n▶ Step 10  Regression check...")
+    print("\n▶ Step 12  Regression check...")
     smoke_log = ""
     try:
         smoke_log = run_smoke_checks(run_id, existing_app_path)
@@ -4674,7 +5721,7 @@ def pipeline_existing_app_upgrade(
         print("  ⚠️  WARNING: unexpected changes to protected files were detected.")
 
     if use_deepseek and DEEPSEEK_API_KEY:
-        print("\n▶ Step 11  DeepSeek review (optional)...")
+        print("\n▶ Step 13  DeepSeek review (optional)...")
         deepseek_report = deepseek_attack_review(existing_app_summary, existing_app_path, smoke_log + "\n\n" + regression_report)
         save_artifact(run_id, "deepseek_attack_report.md", deepseek_report)
         if not is_approved(deepseek_report):
@@ -4689,7 +5736,7 @@ def pipeline_existing_app_upgrade(
             )
             print(f"  Regression result after fix: {regression_status}")
 
-    print("\n▶ Step 12  Writing feature completion report...")
+    print("\n▶ Step 14  Writing feature completion report...")
     generate_feature_completion_report(
         existing_app_summary, plan_json, selected_sprint, build_output,
         regression_status, regression_report, smoke_log, rdir, changed_files_report,
