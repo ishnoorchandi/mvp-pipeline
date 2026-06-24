@@ -101,7 +101,8 @@ export interface UpgradeRunPayload {
 
 export interface ContinuationRunPayload {
   continue_run: string;
-  continue_sprint: number;
+  continue_sprint?: number;
+  continue_feature_sprint?: number;
   continue_plan_only: boolean;
   no_deepseek: boolean;
 }

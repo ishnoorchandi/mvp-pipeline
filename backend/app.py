@@ -181,13 +181,14 @@ def run_pipeline_continuation_async(
     continue_sprint: int,
     continue_plan_only: bool,
     no_deepseek: bool,
+    feature_sprint: bool = False,
 ):
     """Sprint Continuation mode — maps to --continue-run/--continue-sprint."""
     def _run():
         cmd = [
             sys.executable, str(PIPELINE_SCRIPT),
             "--continue-run", continue_run,
-            "--continue-sprint", str(continue_sprint),
+            "--continue-feature-sprint" if feature_sprint else "--continue-sprint", str(continue_sprint),
             "--run-id", run_id,
         ]
         if continue_plan_only:
@@ -336,8 +337,9 @@ def create_continuation_run(body: dict):
     continue_run = (body.get("continue_run") or "").strip()
     if not continue_run:
         abort(400, "continue_run is required")
+    feature_sprint = body.get("continue_feature_sprint") is not None
     try:
-        continue_sprint = int(body.get("continue_sprint", 2))
+        continue_sprint = int(body.get("continue_feature_sprint") if feature_sprint else body.get("continue_sprint", 2))
     except (TypeError, ValueError):
         continue_sprint = 2
     continue_plan_only = bool(body.get("continue_plan_only", True))
@@ -355,13 +357,14 @@ def create_continuation_run(body: dict):
         "artifacts": [],
         "continue_run": continue_run,
         "continue_sprint": continue_sprint,
+        "continue_feature_sprint": continue_sprint if feature_sprint else None,
         "continue_plan_only": continue_plan_only,
         "no_deepseek": no_deepseek,
     }
     (run_path / "run_state.json").write_text(json.dumps(state, indent=2))
 
     run_pipeline_continuation_async(
-        run_id, continue_run, continue_sprint, continue_plan_only, no_deepseek,
+        run_id, continue_run, continue_sprint, continue_plan_only, no_deepseek, feature_sprint,
     )
 
     return jsonify({"run_id": run_id, "status": "queued"}), 201

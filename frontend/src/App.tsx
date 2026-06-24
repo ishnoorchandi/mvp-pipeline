@@ -105,6 +105,7 @@ const ARTIFACT_LABELS: Record<string, string> = {
   "sprint_coverage_check.txt":         "Sprint Coverage Check",
   "existing_app_inventory.md":         "Existing App Inventory",
   "baseline_health_check.md":          "Baseline Health Check",
+  "baseline_behavior_checklist.md":    "Baseline Behavior Checklist",
   "existing_app_summary.md":           "Existing App Summary",
   "new_feature_requirements.md":       "New Feature Requirements",
   "change_gap_analysis.md":            "Change Gap Analysis",
@@ -113,6 +114,8 @@ const ARTIFACT_LABELS: Record<string, string> = {
   "feature_sprint_plan.json":          "Feature Sprint Plan JSON",
   "selected_feature_sprint_scope.md":  "Selected Feature Sprint Scope",
   "selected_feature_sprint_build_prompt.txt": "Selected Feature Sprint Build Prompt",
+  "changed_files_report.md":           "Changed Files Report",
+  "smoke_test_log.txt":                "Smoke Test Log",
   "regression_check.md":               "Regression Check",
   "feature_completion_report.md":      "Feature Completion Report",
   "continuation_source.md":            "Continuation Source",
@@ -1203,6 +1206,7 @@ interface FeatureSprintPlan {
 const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "existing_app_inventory.md", label: "Existing App Inventory" },
   { file: "baseline_health_check.md", label: "Baseline Health Check" },
+  { file: "baseline_behavior_checklist.md", label: "Baseline Behavior Checklist" },
   { file: "existing_app_summary.md", label: "Existing App Summary" },
   { file: "new_feature_requirements.md", label: "New Feature Requirements" },
   { file: "change_gap_analysis.md", label: "Gap Analysis" },
@@ -1211,11 +1215,15 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "feature_sprint_plan.json", label: "Feature Sprint Plan JSON" },
   { file: "selected_feature_sprint_scope.md", label: "Selected Feature Sprint Scope" },
   { file: "selected_feature_sprint_build_prompt.txt", label: "Selected Feature Sprint Build Prompt" },
+  { file: "changed_files_report.md", label: "Changed Files Report" },
+  { file: "smoke_test_log.txt", label: "Smoke Test Log" },
   { file: "regression_check.md", label: "Regression Check" },
   { file: "feature_completion_report.md", label: "Feature Completion Report" },
 ];
 
-function FeatureSprintRoadmap({ plan }: { plan: FeatureSprintPlan }) {
+function FeatureSprintRoadmap({ plan, onBuild, launching }: {
+  plan: FeatureSprintPlan; onBuild?: (n: number) => void; launching?: number | null;
+}) {
   const selected = plan.selected_feature_sprint;
   const sprints = [...(plan.sprints ?? [])].sort((a, b) => a.sprint_number - b.sprint_number);
   return (
@@ -1237,18 +1245,22 @@ function FeatureSprintRoadmap({ plan }: { plan: FeatureSprintPlan }) {
           <div className="upgrade-sprint-meta">
             Depends on: {(s.depends_on ?? [0]).map(d => `Sprint ${d}`).join(", ")} · Status: {s.status ?? "ready"}
           </div>
+          {onBuild && <button className="submit-btn" onClick={() => onBuild(s.sprint_number)} disabled={launching !== null}>
+            {launching === s.sprint_number ? "Starting…" : `Build Feature Sprint ${s.sprint_number}`}
+          </button>}
         </div>
       ))}
     </div>
   );
 }
 
-function ExistingAppUpgradeView({ runId, run, onBack }: {
-  runId: string; run: RunDetail | null; onBack: () => void;
+function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
+  runId: string; run: RunDetail | null; onBack: () => void; onNewRun: (id: string) => void;
 }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [content, setContent] = useState<string>("");
   const [plan, setPlan] = useState<FeatureSprintPlan | null>(null);
+  const [launching, setLaunching] = useState<number | null>(null);
   const artifacts = run?.artifacts ?? [];
 
   useEffect(() => {
@@ -1269,6 +1281,19 @@ function ExistingAppUpgradeView({ runId, run, onBack }: {
   })();
 
   const availablePanels = UPGRADE_ARTIFACT_PANELS.filter(p => artifacts.includes(p.file));
+  const planReady = run?.status === "feature_plan_only_done";
+  const buildFromPlan = async (n: number) => {
+    setLaunching(n);
+    try {
+      const created = await createContinuationRun({
+        continue_run: `runs/${runId}`, continue_feature_sprint: n,
+        continue_plan_only: false, no_deepseek: true,
+      });
+      onNewRun(created.run_id);
+    } finally {
+      setLaunching(null);
+    }
+  };
 
   return (
     <div className="pipeline-view upgrade-view">
@@ -1285,7 +1310,8 @@ function ExistingAppUpgradeView({ runId, run, onBack }: {
                 additive feature work on top of an existing app. Status: {run?.status ?? "running"}
               </span>
             </div>
-            {plan && <FeatureSprintRoadmap plan={plan} />}
+            {planReady && <div className="sprint-mode-banner">Review the plan, then build exactly one selected feature sprint.</div>}
+            {plan && <FeatureSprintRoadmap plan={plan} onBuild={planReady ? buildFromPlan : undefined} launching={launching} />}
           </div>
         </div>
         <div className="right-panel">
@@ -1674,7 +1700,7 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
   // sprint-mode runs, which fall through to the unchanged return below.
   if (upgradeModeActive) {
     return (
-      <ExistingAppUpgradeView runId={runId} run={run} onBack={onBack} />
+      <ExistingAppUpgradeView runId={runId} run={run} onBack={onBack} onNewRun={onNewRun} />
     );
   }
 
@@ -1882,12 +1908,12 @@ function UpgradePanel({ onCreated, onCancel }: { onCreated: (id: string) => void
           <textarea className="input-textarea expand-textarea" value={featureRequest} onChange={e => setFeatureRequest(e.target.value)}
             placeholder="Describe the features to add to this app..." rows={5} disabled={loading} />
         </label>
-        <label className="expand-field">
-          <span className="expand-field-label">Feature sprint to select</span>
+        {!planOnly && <label className="expand-field">
+          <span className="expand-field-label">Selected feature sprint</span>
           <input className="expand-input expand-input-num" type="number" min={1} max={12} value={selectedSprint}
             onChange={e => setSelectedSprint(Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)))} disabled={loading} />
-          <span className="expand-field-help">The pipeline scans the app and creates a feature sprint plan first. Leave this as 1 unless you already know you want a later feature sprint.</span>
-        </label>
+          <span className="expand-field-help">Build only after reviewing a generated Feature Sprint Plan. For a prior plan, use its continuation command.</span>
+        </label>}
         <div className="expand-checkboxes">
           <label className="expand-checkbox">
             <input type="checkbox" checked={planOnly} onChange={e => setPlanOnly(e.target.checked)} disabled={loading} />
@@ -1900,7 +1926,7 @@ function UpgradePanel({ onCreated, onCancel }: { onCreated: (id: string) => void
         </div>
         {error && <p className="input-error">{error}</p>}
         <button className="submit-btn" onClick={submit} disabled={loading || !canSubmit}>
-          {loading ? "Starting…" : planOnly ? "Generate Upgrade Sprint Plan →" : "Run Upgrade →"}
+          {loading ? "Starting…" : planOnly ? "Generate Feature Sprint Plan →" : "Build Feature Sprint →"}
         </button>
       </div>
     </div>
