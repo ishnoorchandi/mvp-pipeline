@@ -5539,9 +5539,34 @@ def generate_selected_feature_sprint_build_prompt(
 # selected_sprint_actionable findings ever reach a fix prompt), and the post-build /
 # post-fix boundary check that gates Local Delivery.
 
+def _normalize_repo_relative_path(path: str) -> str:
+    """Normalizes a sprint/plan/build-prompt-provided path to a repo-relative POSIX
+    path: 'delivery_test_note.md', './delivery_test_note.md', and
+    '/delivery_test_note.md' all normalize to 'delivery_test_note.md' — the same form
+    write_changed_files_report() produces for an actual on-disk file (which never
+    carries a leading slash, since it's always taken via Path.relative_to()). Strips
+    a leading '/' or repeated './', and drops any '..' segment so a boundary entry can
+    never resolve outside the repo root. Leaves glob characters (*, ?, [, ]) alone.
+    """
+    if not path:
+        return path
+    p = path.strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
+    segments = [seg for seg in p.split("/") if seg not in ("", ".", "..")]
+    return "/".join(segments)
+
+
 def _boundary_dirs_for(paths: list[str]) -> list[str]:
+    """Derives allowed CREATE directories from expected file paths. Root-level files
+    (e.g. 'delivery_test_note.md') intentionally produce NO directory entry here — only
+    the exact file is allowed via expected_files_create's exact match. Otherwise every
+    root-level file in the repo would become creatable, which is exactly the over-broad
+    allowance Existing App Upgrade must not grant by accident."""
     dirs: list[str] = []
-    for p in paths:
+    for raw in paths:
+        p = _normalize_repo_relative_path(raw)
         if any(ch in p for ch in "*?["):
             continue
         d = str(Path(p).parent)
@@ -5558,10 +5583,14 @@ def generate_selected_feature_change_boundary(
     selected feature sprint from the sprint plan, the selected sprint scope, the
     additive architecture, and the build prompt already written for it. Writes
     selected_feature_change_boundary.json/.md."""
-    expected_create = selected_sprint.get("likely_files_created") or []
-    expected_modify = selected_sprint.get("likely_files_modified") or []
-    must_not_modify = selected_sprint.get("must_not_modify") or []
-    expected_deletions = selected_sprint.get("expected_deletions") or []
+    # Normalize every path the sprint plan provides BEFORE deriving directories or
+    # storing expected files — 'delivery_test_note.md', './delivery_test_note.md', and
+    # '/delivery_test_note.md' must all become the same boundary entry, matching the
+    # leading-slash-free relative paths write_changed_files_report() always produces.
+    expected_create = [_normalize_repo_relative_path(p) for p in (selected_sprint.get("likely_files_created") or [])]
+    expected_modify = [_normalize_repo_relative_path(p) for p in (selected_sprint.get("likely_files_modified") or [])]
+    must_not_modify = [_normalize_repo_relative_path(p) for p in (selected_sprint.get("must_not_modify") or [])]
+    expected_deletions = [_normalize_repo_relative_path(p) for p in (selected_sprint.get("expected_deletions") or [])]
 
     boundary = {
         "sprint_number": selected_sprint.get("sprint_number"),
@@ -5592,6 +5621,10 @@ def generate_selected_feature_change_boundary(
 
 
 def render_change_boundary_markdown(boundary: dict) -> str:
+    expected_create = boundary.get("expected_files_create") or []
+    expected_modify = boundary.get("expected_files_modify") or []
+    root_files = sorted({f for f in expected_create + expected_modify
+                          if f and "/" not in f and not any(ch in f for ch in "*?[")})
     lines = [
         "# Selected Feature Change Boundary",
         "",
@@ -5599,9 +5632,18 @@ def render_change_boundary_markdown(boundary: dict) -> str:
         "",
         "## Expected Files To Create",
     ]
-    lines += [f"- `{f}`" for f in boundary.get("expected_files_create") or ["(none specified)"]]
+    lines += [f"- `{f}`" for f in expected_create or ["(none specified)"]]
     lines += ["", "## Expected Files To Modify"]
-    lines += [f"- `{f}`" for f in boundary.get("expected_files_modify") or ["(none specified)"]]
+    lines += [f"- `{f}`" for f in expected_modify or ["(none specified)"]]
+    if root_files:
+        lines += [
+            "",
+            "## Expected Root-Level Files (repo root, `.`)",
+            "These files live directly in the repo root rather than under a subdirectory. "
+            "Only the exact files listed here are allowed at the repo root — this does NOT "
+            "allow every root-level file, only these specific ones.",
+        ]
+        lines += [f"- `{f}` (repo root)" for f in root_files]
     lines += ["", "## Allowed Directories"]
     lines += [f"- `{d}`" for d in boundary.get("allowed_directories") or ["(none — only the exact files above)"]]
     lines += ["", "## Protected Existing Files (must not modify)"]
@@ -5685,6 +5727,12 @@ def write_boundary_violation_report(
                 if f in smoke_mutated_paths:
                     lines.append(f"- `{f}` — caused by a smoke-check command (e.g. `npm install`/`npm ci`), "
                                  "NOT by the Claude build. See smoke_mutation_report.md.")
+                elif "/" not in f:
+                    # Root-level files are only ever in-boundary as an EXACT match against
+                    # expected_files_create/modify — a root file that wasn't explicitly
+                    # expected is always a real violation, never a directory-allowance gap.
+                    lines.append(f"- `{f}` — Unexpected root-level file not listed in selected feature "
+                                 "boundary. Changed during the Claude build or fix pass.")
                 else:
                     lines.append(f"- `{f}` — changed during the Claude build or fix pass.")
         else:
@@ -5946,7 +5994,15 @@ def _hash_file(path: Path) -> str:
 def _resolve_protected_paths(existing_app_path: Path, patterns: list[str]) -> list[Path]:
     existing_app_path = Path(existing_app_path)
     resolved: list[Path] = []
-    for pattern in patterns:
+    for raw_pattern in patterns:
+        # Normalize first — `existing_app_path / "/foo"` silently DISCARDS
+        # existing_app_path entirely (pathlib treats the right side as absolute and
+        # replaces the left side), which would resolve outside the repo root for a
+        # pattern like "/etc/passwd". Stripping the leading slash keeps every
+        # protected-path lookup confined to existing_app_path.
+        pattern = _normalize_repo_relative_path(raw_pattern)
+        if not pattern:
+            continue
         if any(ch in pattern for ch in "*?["):
             resolved.extend(existing_app_path.glob(pattern))
         else:
@@ -6015,8 +6071,14 @@ def snapshot_post_build_files(existing_app_path: Path, run_dir) -> dict:
 
 def _path_matches_expected(path: str, expected: list[str]) -> bool:
     from fnmatch import fnmatch
+    # Defensive normalization: boundary entries are normalized at generation time
+    # (generate_selected_feature_change_boundary), but normalize here too so any
+    # caller passing a raw '/'- or './'-prefixed path still matches correctly —
+    # e.g. '/delivery_test_note.md' must match the same as 'delivery_test_note.md'.
+    path = _normalize_repo_relative_path(path)
+    normalized_expected = [_normalize_repo_relative_path(item) for item in expected if item and not item.startswith("(")]
     return any(path == item.rstrip("/") or path.startswith(item.rstrip("/") + "/") or fnmatch(path, item)
-               for item in expected if item and not item.startswith("("))
+               for item in normalized_expected)
 
 
 def write_changed_files_report(existing_app_path: Path, run_dir, selected_sprint: dict) -> tuple[dict, str]:
