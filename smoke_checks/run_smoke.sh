@@ -24,15 +24,37 @@ PASS=0
 FAIL=0
 SKIP=0
 
+# NOTE: counters are updated with `VAR=$((VAR + 1))`, never `((VAR++))`. The
+# postfix-increment form evaluates to the OLD value, so the very first increment
+# (0 -> 1) makes `((...))` itself report failure (arithmetic result 0 is "false"),
+# which previously made `cmd && ((PASS++)) || ((FAIL++))` silently double-count
+# the first successful check into FAIL too. `VAR=$((VAR + 1))` is a plain
+# assignment and always exits 0, so it can't corrupt the surrounding && / || chain.
 run_check() {
     local name="$1"
     local script="$SCRIPT_DIR/$2"
     echo "--- CHECK: $name ---"
     if [ ! -f "$script" ]; then
         echo "[SKIP] Script not found: $script"
-        ((SKIP++)) || true
+        SKIP=$((SKIP + 1))
     else
-        bash "$script" "$MVP_DIR" && ((PASS++)) || ((FAIL++)) || true
+        local output exit_code
+        # `output=$(...)` is itself a simple command whose exit status is the
+        # substituted command's exit status — under `set -e` a failing check (e.g.
+        # a real npm build failure) would abort run_smoke.sh right here, before the
+        # FAIL counter or the summary ever runs. `cmd && a=0 || a=$?` keeps the exit
+        # code without letting -e see a bare failing command.
+        output=$(bash "$script" "$MVP_DIR" 2>&1) && exit_code=0 || exit_code=$?
+        echo "$output"
+        if [ "$exit_code" -ne 0 ]; then
+            FAIL=$((FAIL + 1))
+        elif printf '%s\n' "$output" | grep -qi '^\[SKIP\]'; then
+            # The check itself reported not-applicable (e.g. no DB_NAME in a
+            # frontend-only app) — exit 0 but it's a SKIP, not a PASS.
+            SKIP=$((SKIP + 1))
+        else
+            PASS=$((PASS + 1))
+        fi
     fi
     echo ""
 }

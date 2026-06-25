@@ -123,6 +123,8 @@ const ARTIFACT_LABELS: Record<string, string> = {
   "smoke_test_log.txt":                "Smoke Test Log",
   "smoke_mutation_report.md":          "Smoke Mutation Report",
   "smoke_mutation_report.json":        "Smoke Mutation Report JSON",
+  "repo_hygiene_report.md":            "Repo Hygiene Report",
+  "repo_hygiene_report.json":          "Repo Hygiene Report JSON",
   "regression_check.md":               "Regression Check",
   "feature_completion_report.md":      "Feature Completion Report",
   "continuation_source.md":            "Continuation Source",
@@ -1446,6 +1448,15 @@ function DeliveryCard({ runId }: { runId: string }) {
   const canPushSandbox = !!precheck && precheck.decision === "PASS_SANDBOX_PUSH";
   const smokeMutationBlocked = !!info.smoke_mutation?.blocked;
   const boundaryBlocked = !!info.boundary?.blocked || smokeMutationBlocked;
+  // Repo hygiene — e.g. node_modules tracked/dirty in the TARGET repo. This is a
+  // target-repo problem, not a generated-feature defect, so it gets its own panel
+  // with a copyable (never auto-run) cleanup command instead of the boundary wording.
+  const hygiene = info.state?.repo_hygiene ?? precheck?.repo_hygiene;
+  const hygieneBlockReason = info.state?.block_reason ?? precheck?.block_reason;
+  const nodeModulesHygieneBlocked = hygieneBlockReason === "DENIED_TRACKED_DEPENDENCY_FILES"
+    && !!hygiene?.human_cleanup_recommended;
+  const precheckBlocked = precheck?.decision === "BLOCKED";
+  const deliveryBlocked = boundaryBlocked || precheckBlocked;
 
   const doCommit = async () => {
     setBusy("commit"); setError(null);
@@ -1480,7 +1491,7 @@ function DeliveryCard({ runId }: { runId: string }) {
             Create a local branch/commit safely. Company repositories are never pushed unless explicitly allowed.
           </div>
         </div>
-        <DeliveryStatusBadge decision={boundaryBlocked ? "BLOCKED" : (info.state?.decision ?? precheck?.decision)} />
+        <DeliveryStatusBadge decision={deliveryBlocked ? "BLOCKED" : (info.state?.decision ?? precheck?.decision)} />
       </div>
 
       <div className="delivery-repo-line">
@@ -1505,6 +1516,27 @@ function DeliveryCard({ runId }: { runId: string }) {
             </>
           )}
           No branch, commit, or push can be created until this is resolved.
+        </div>
+      )}
+
+      {nodeModulesHygieneBlocked && (
+        <div className="delivery-warning-panel delivery-warning-panel-severe">
+          <strong>Target repo hygiene issue: node_modules is tracked or dirty</strong>
+          <p>
+            The generated feature passed its change boundary, but local delivery is blocked because
+            dependency files under <code>node_modules</code> are tracked/dirty in the target repo. The
+            pipeline will not stage or commit dependency folders. Ask the repo owner before cleaning
+            this up.
+          </p>
+          <p>
+            <strong>No GitHub push was attempted.</strong>
+          </p>
+          <details>
+            <summary>Recommended cleanup command (requires human approval — not run automatically)</summary>
+            <div className="delivery-command-preview">
+              <pre>{(hygiene?.recommended_commands ?? []).join("\n")}</pre>
+            </div>
+          </details>
         </div>
       )}
 
@@ -1535,14 +1567,14 @@ function DeliveryCard({ runId }: { runId: string }) {
 
       <div className="delivery-actions">
         <div className="delivery-action">
-          <button className="submit-btn" disabled={busy !== null || !branchName || !commitMessage || boundaryBlocked} onClick={doCommit}>
-            {boundaryBlocked ? "Blocked — see warning above" : busy === "commit" ? "Creating…" : "Create Local Commit"}
+          <button className="submit-btn" disabled={busy !== null || !branchName || !commitMessage || deliveryBlocked} onClick={doCommit}>
+            {deliveryBlocked ? "Blocked — see warning above" : busy === "commit" ? "Creating…" : "Create Local Commit"}
           </button>
           <div className="delivery-action-help">Creates a branch and commit on your machine only. Nothing is published to GitHub.</div>
         </div>
         <div className="delivery-action">
           <label className="delivery-sandbox-toggle">
-            <input type="checkbox" checked={sandboxPush} onChange={e => setSandboxPush(e.target.checked)} disabled={boundaryBlocked} />
+            <input type="checkbox" checked={sandboxPush} onChange={e => setSandboxPush(e.target.checked)} disabled={deliveryBlocked} />
             Enable sandbox push for this attempt
           </label>
           {isCompanyRepo ? (
@@ -1558,11 +1590,11 @@ function DeliveryCard({ runId }: { runId: string }) {
             <>
               <button
                 className="submit-btn"
-                disabled={busy !== null || !sandboxPush || !canPushSandbox || boundaryBlocked}
+                disabled={busy !== null || !sandboxPush || !canPushSandbox || deliveryBlocked}
                 onClick={doPush}
-                title={boundaryBlocked ? "Blocked — see warning above" : !canPushSandbox ? (precheck?.push_blocked_reasons.join("; ") || "Not eligible for sandbox push") : ""}
+                title={deliveryBlocked ? "Blocked — see warning above" : !canPushSandbox ? (precheck?.push_blocked_reasons.join("; ") || "Not eligible for sandbox push") : ""}
               >
-                {boundaryBlocked ? "Blocked — see warning above" : busy === "push" ? "Pushing…" : "Push Sandbox Demo Branch"}
+                {deliveryBlocked ? "Blocked — see warning above" : busy === "push" ? "Pushing…" : "Push Sandbox Demo Branch"}
               </button>
               <div className="delivery-action-help">Only enabled for allowlisted sandbox repos. Never pushes OneHR/OneATS company repos.</div>
             </>

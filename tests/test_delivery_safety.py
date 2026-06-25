@@ -2,6 +2,7 @@
 
 Uses temporary git fixture repos only. Never touches real OneHR repos.
 """
+import json
 import subprocess
 import sys
 import tempfile
@@ -179,6 +180,84 @@ def test_delivery_safety_check_md_contains_required_fields():
         assert d.DISABLED_PUSH_MARKER in content
         assert "push allowed" in content.lower() or "GitHub push allowed" in content
         assert precheck["decision"] in content
+
+
+# ── 10. Tracked node_modules is a target-repo hygiene issue, not a feature bug ──
+# Real OneHR UI tracks node_modules in git (bad hygiene, but pipeline must handle
+# it safely): committing it, then dirtying it (simulating npm install rewriting
+# files under it), reproduces the reported block without touching any real repo.
+
+def _make_repo_with_tracked_dirty_node_modules(root: Path) -> Path:
+    repo = make_repo(root)
+    (repo / "node_modules" / "pkg").mkdir(parents=True)
+    (repo / "node_modules" / "pkg" / "index.js").write_text("module.exports = {}\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "oops: tracked node_modules (bad repo hygiene)")
+    # Simulate npm install touching a tracked node_modules file during smoke checks.
+    (repo / "node_modules" / "pkg" / "index.js").write_text("module.exports = { v: 2 };\n")
+    return repo
+
+
+def test_tracked_node_modules_detected_by_repo_hygiene():
+    with tempfile.TemporaryDirectory() as td:
+        repo = _make_repo_with_tracked_dirty_node_modules(Path(td))
+        precheck = d.assert_clean_delivery_preconditions(repo, "local_only", "pipeline/test")
+        hygiene = precheck["repo_hygiene"]
+        assert hygiene["node_modules_tracked"] is True
+        assert hygiene["node_modules_dirty_count"] >= 1
+        assert hygiene["human_cleanup_recommended"] is True
+        assert hygiene["recommended_commands"]
+        assert hygiene["auto_cleanup_performed"] is False
+
+
+def test_denied_tracked_dependency_files_block_reason():
+    with tempfile.TemporaryDirectory() as td:
+        repo = _make_repo_with_tracked_dirty_node_modules(Path(td))
+        precheck = d.assert_clean_delivery_preconditions(repo, "local_only", "pipeline/test")
+        assert precheck["decision"] == "BLOCKED"
+        assert precheck["block_reason"] == "DENIED_TRACKED_DEPENDENCY_FILES"
+        assert precheck["local_commit_allowed"] is False
+        # Existing safety rules must not be weakened by the new reporting.
+        assert precheck["push_allowed"] is False
+
+
+def test_repo_hygiene_report_includes_cleanup_recommendation():
+    with tempfile.TemporaryDirectory() as td:
+        repo = _make_repo_with_tracked_dirty_node_modules(Path(td))
+        precheck = d.assert_clean_delivery_preconditions(repo, "local_only", "pipeline/test")
+        out_dir = Path(td) / "delivery_out"
+        content, json_content = d.generate_repo_hygiene_report(precheck["repo_hygiene"], out_dir)
+        assert (out_dir / "repo_hygiene_report.md").exists()
+        assert (out_dir / "repo_hygiene_report.json").exists()
+        assert "node_modules" in content
+        assert "git rm -r --cached node_modules" in content
+        assert "DO NOT run automatically" in content
+        assert "approved by the repo owner" in content
+        data = json.loads(json_content)
+        assert data["node_modules_tracked"] is True
+
+
+def test_run_local_delivery_blocks_for_tracked_node_modules_without_touching_repo():
+    with tempfile.TemporaryDirectory() as td:
+        repo = _make_repo_with_tracked_dirty_node_modules(Path(td))
+        out_dir = Path(td) / "delivery_out"
+        state = d.run_local_delivery(
+            repo, mode="local_only", branch_name="pipeline/test",
+            commit_message="msg", output_dir=out_dir,
+        )
+        assert state["decision"] == "BLOCKED"
+        assert state["block_reason"] == "DENIED_TRACKED_DEPENDENCY_FILES"
+        assert state["commit_hash"] is None
+        assert state["files_committed"] == []
+        for artifact in ("repo_hygiene_report.md", "repo_hygiene_report.json", "delivery_safety_check.md"):
+            assert (out_dir / artifact).exists(), f"missing {artifact}"
+        # The pipeline must never stage/commit/remove node_modules itself.
+        status_after = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo),
+                                       capture_output=True, text=True).stdout
+        assert "node_modules" in status_after
+        branch_after = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo),
+                                       capture_output=True, text=True).stdout.strip()
+        assert branch_after == "main"  # never branched, since delivery was blocked
 
 
 def test_sandbox_push_actually_pushes_to_local_bare_remote():

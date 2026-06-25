@@ -114,6 +114,63 @@ def scan_denied_paths(paths: list[str]) -> list[str]:
     return [p for p in paths if _DENIED_RE.search(p)]
 
 
+# Dependency/build-artifact directories that get tracked by accident in real repos
+# (bad repo hygiene, not a generated-feature problem) and account for the vast
+# majority of "denied paths are dirty" blocks in practice.
+_DEPENDENCY_DIR_RE = re.compile(r"(^|/)(node_modules|venv|__pycache__|\.pytest_cache)(/|$)")
+
+
+def classify_denied_paths(denied_paths: list[str]) -> str | None:
+    """Maps a list of denied/dirty paths to a stable block-reason code the frontend
+    can switch on. None means no denied paths were found."""
+    if not denied_paths:
+        return None
+    if any(_DEPENDENCY_DIR_RE.search(p) for p in denied_paths):
+        return "DENIED_TRACKED_DEPENDENCY_FILES"
+    return "DENIED_SENSITIVE_OR_PROTECTED_FILES"
+
+
+def detect_repo_hygiene(repo_path, denied_now: list[str]) -> dict:
+    """Inspects the TARGET repo (read-only — runs no mutating git commands) for the
+    most common cause of a denied-paths block: `node_modules` tracked in git. Never
+    auto-fixes anything; only reports facts and a human-approval-only recommendation.
+    """
+    repo_path = Path(repo_path)
+    node_modules_tracked = False
+    if (repo_path / ".git").exists():
+        ls = run_git_command(repo_path, ["ls-files", "--", "node_modules"], check=False)
+        node_modules_tracked = bool(ls.stdout.strip()) if ls.returncode == 0 else False
+
+    node_modules_dirty_count = sum(1 for p in denied_now if _DEPENDENCY_DIR_RE.search(p) and "node_modules" in p)
+
+    gitignore_has_node_modules = False
+    gitignore_path = repo_path / ".gitignore"
+    if gitignore_path.exists():
+        for line in gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.strip().strip("/") == "node_modules":
+                gitignore_has_node_modules = True
+                break
+
+    human_cleanup_recommended = node_modules_tracked or node_modules_dirty_count > 0
+    recommended_commands = [
+        'printf "\\nnode_modules/\\n" >> .gitignore',
+        "git rm -r --cached node_modules",
+        "git add .gitignore",
+        'git commit -m "Stop tracking node_modules"',
+    ] if human_cleanup_recommended else []
+
+    return {
+        "node_modules_tracked": node_modules_tracked,
+        "node_modules_dirty_count": node_modules_dirty_count,
+        "denied_dirty_file_count": len(denied_now),
+        "gitignore_has_node_modules": gitignore_has_node_modules,
+        "human_cleanup_recommended": human_cleanup_recommended,
+        "recommended_commands": recommended_commands,
+        "auto_cleanup_performed": False,
+        "requires_human_approval": human_cleanup_recommended,
+    }
+
+
 def detect_repo_type(repo_path, remote_info: dict) -> str:
     """company-protected | personal-sandbox | unknown."""
     if (
@@ -157,6 +214,8 @@ def assert_clean_delivery_preconditions(
             "local_commit_allowed": False, "push_allowed": False,
             "push_blocked_reasons": ["repo path is not a git repository"],
             "decision": "BLOCKED",
+            "block_reason": "NOT_A_GIT_REPO",
+            "repo_hygiene": detect_repo_hygiene(repo_path, []),
         }
 
     remote_info = get_git_remote_info(repo_path)
@@ -232,6 +291,15 @@ def assert_clean_delivery_preconditions(
     else:
         decision = "PASS_LOCAL_ONLY"
 
+    # block_reason is None unless local commit itself is blocked — a sandbox-push-only
+    # block (e.g. non-allowlisted remote) is not a "blocked delivery", local_only still
+    # proceeds. denied_now takes priority over the protected-branch reason since it's
+    # almost always a target-repo hygiene issue (e.g. tracked node_modules), not a
+    # generated-feature problem, and that distinction is what the UI needs to show.
+    block_reason = None
+    if not local_commit_allowed:
+        block_reason = classify_denied_paths(denied_now) if denied_now else "PROTECTED_BRANCH"
+
     return {
         "repo_path": str(repo_path),
         "repo_type": repo_type,
@@ -242,6 +310,8 @@ def assert_clean_delivery_preconditions(
         "push_allowed": push_allowed,
         "push_blocked_reasons": push_blocked_reasons,
         "decision": decision,
+        "block_reason": block_reason,
+        "repo_hygiene": detect_repo_hygiene(repo_path, denied_now),
     }
 
 
@@ -383,6 +453,21 @@ def generate_delivery_safety_check(precheck: dict, mode: str, branch_name: str |
         lines.append("")
         lines.append("**Push blocked reasons:**")
         lines.extend(f"- {r}" for r in precheck["push_blocked_reasons"])
+    if precheck.get("block_reason"):
+        lines.append("")
+        lines.append(f"**Block reason:** `{precheck['block_reason']}`")
+        if precheck["block_reason"] == "DENIED_TRACKED_DEPENDENCY_FILES":
+            hygiene = precheck.get("repo_hygiene") or {}
+            lines += [
+                "",
+                "This is a TARGET REPO HYGIENE issue, not a problem with the generated feature. "
+                "Dependency files (e.g. `node_modules/`) are tracked and/or dirty in this repo, so "
+                "Local Delivery is blocked — the pipeline will never stage or commit them.",
+                f"- `node_modules` tracked in git: {hygiene.get('node_modules_tracked')}",
+                f"- Dirty denied file count: {hygiene.get('denied_dirty_file_count')}",
+                f"- `.gitignore` already excludes `node_modules/`: {hygiene.get('gitignore_has_node_modules')}",
+                "- See repo_hygiene_report.md for the recommended (human-approval-only) cleanup commands.",
+            ]
     lines.append("")
     lines.append(f"## Final Decision: `{precheck['decision']}`")
     decision_text = {
@@ -395,6 +480,47 @@ def generate_delivery_safety_check(precheck: dict, mode: str, branch_name: str |
     content = "\n".join(lines) + "\n"
     Path(output_path).write_text(content, encoding="utf-8")
     return content
+
+
+def generate_repo_hygiene_report(hygiene: dict, output_dir) -> tuple[str, str]:
+    """Writes repo_hygiene_report.md/.json. Purely informational — never executes any
+    of the recommended commands, and never auto-restores or auto-untracks anything in
+    the target repo. Returns (markdown, json_text)."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["# Repo Hygiene Report", ""]
+    lines.append(f"**`node_modules` tracked in git:** {hygiene.get('node_modules_tracked', False)}")
+    lines.append(f"**`node_modules` dirty/changed file count:** {hygiene.get('node_modules_dirty_count', 0)}")
+    lines.append(f"**Total denied dirty file count:** {hygiene.get('denied_dirty_file_count', 0)}")
+    lines.append(f"**`.gitignore` already excludes `node_modules/`:** {hygiene.get('gitignore_has_node_modules', False)}")
+    lines.append("")
+    if hygiene.get("human_cleanup_recommended"):
+        lines += [
+            "## What This Means",
+            "Local Delivery is blocked because dependency files under `node_modules` are tracked "
+            "and/or dirty in the TARGET repository. **This is a target-repo hygiene issue, not a "
+            "problem with the generated feature.** The pipeline will never stage, commit, or remove "
+            "`node_modules` automatically.",
+            "",
+            "## Recommended Fix — requires human approval, DO NOT run automatically",
+            "```bash",
+        ]
+        lines += hygiene.get("recommended_commands") or []
+        lines += [
+            "```",
+            "",
+            "- Do not run these commands automatically — the pipeline never executes them.",
+            "- Do not push to a company-protected repository.",
+            "- This should be approved by the repo owner/team before running.",
+            "- No branch, commit, or push was attempted by this run.",
+        ]
+    else:
+        lines.append("No `node_modules` tracking/hygiene issue detected.")
+    content = "\n".join(lines) + "\n"
+    (output_dir / "repo_hygiene_report.md").write_text(content, encoding="utf-8")
+    json_content = json.dumps(hygiene, indent=2)
+    (output_dir / "repo_hygiene_report.json").write_text(json_content, encoding="utf-8")
+    return content, json_content
 
 
 def generate_github_delivery_plan(precheck: dict, mode: str, branch_name: str | None, output_path) -> str:
@@ -486,8 +612,8 @@ def run_local_delivery(
 ) -> dict:
     """
     End-to-end delivery workflow. Always writes delivery_safety_check.md,
-    github_delivery_plan.md, and delivery_state.json. Writes
-    changed_files_report.md / local_commit_summary.md / push_result.md only
+    github_delivery_plan.md, repo_hygiene_report.md/.json, and delivery_state.json.
+    Writes changed_files_report.md / local_commit_summary.md / push_result.md only
     when the corresponding step actually runs.
 
     mode: "local_only" | "sandbox_push"
@@ -501,6 +627,7 @@ def run_local_delivery(
     precheck = assert_clean_delivery_preconditions(repo_path, mode, branch_name, sandbox_allowlist)
     generate_delivery_safety_check(precheck, mode, branch_name, output_dir / "delivery_safety_check.md")
     generate_github_delivery_plan(precheck, mode, branch_name, output_dir / "github_delivery_plan.md")
+    generate_repo_hygiene_report(precheck.get("repo_hygiene") or {}, output_dir)
 
     state = {
         "repo_path": str(repo_path),
@@ -508,6 +635,8 @@ def run_local_delivery(
         "branch_name": branch_name,
         "repo_type": precheck["repo_type"],
         "decision": precheck["decision"],
+        "block_reason": precheck.get("block_reason"),
+        "repo_hygiene": precheck.get("repo_hygiene"),
         "plan_only": plan_only,
         "commit_hash": None,
         "files_committed": [],

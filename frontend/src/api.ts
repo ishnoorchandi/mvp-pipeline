@@ -150,6 +150,29 @@ export interface DeliveryCheckItem {
   detail: string;
 }
 
+// Repo Hygiene — facts about the TARGET repo's own git hygiene (e.g. node_modules
+// tracked in git), never auto-fixed by the pipeline. See repo_hygiene_report.md/.json.
+export interface RepoHygieneInfo {
+  node_modules_tracked: boolean;
+  node_modules_dirty_count: number;
+  denied_dirty_file_count: number;
+  gitignore_has_node_modules: boolean;
+  human_cleanup_recommended: boolean;
+  recommended_commands: string[];
+  auto_cleanup_performed: boolean;
+  requires_human_approval: boolean;
+}
+
+// Stable block-reason codes the UI can switch on. DENIED_TRACKED_DEPENDENCY_FILES means
+// the target repo itself has a hygiene problem (e.g. tracked node_modules) — not a
+// generated-feature defect.
+export type DeliveryBlockReason =
+  | "NOT_A_GIT_REPO"
+  | "PROTECTED_BRANCH"
+  | "DENIED_TRACKED_DEPENDENCY_FILES"
+  | "DENIED_SENSITIVE_OR_PROTECTED_FILES"
+  | null;
+
 export interface DeliveryPrecheck {
   repo_path: string;
   repo_type: "company-protected" | "personal-sandbox" | "unknown";
@@ -160,6 +183,8 @@ export interface DeliveryPrecheck {
   push_allowed: boolean;
   push_blocked_reasons: string[];
   decision: "PASS_LOCAL_ONLY" | "PASS_SANDBOX_PUSH" | "BLOCKED";
+  block_reason?: DeliveryBlockReason;
+  repo_hygiene?: RepoHygieneInfo;
 }
 
 export interface DeliveryState {
@@ -174,6 +199,8 @@ export interface DeliveryState {
   push_attempted: boolean;
   push_succeeded: boolean | null;
   blocked_reason?: string;
+  block_reason?: DeliveryBlockReason;
+  repo_hygiene?: RepoHygieneInfo;
   note?: string;
   timestamp: number;
 }
