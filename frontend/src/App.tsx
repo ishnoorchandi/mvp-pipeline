@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import type { ReactElement } from "react";
 import {
   getRuns, getRun, getArtifact, createUpgradeRun, createContinuationRun,
-  getDeliveryInfo, getDeliveryPrecheck, getDeliveryArtifact, createDeliveryCommit, pushDeliverySandbox,
+  getDeliveryInfo, getDeliveryPrecheck, createDeliveryCommit, pushDeliverySandbox,
 } from "./api";
 import type { RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck } from "./api";
 import "./App.css";
@@ -1291,13 +1291,18 @@ function FeatureSprintRoadmap({ plan, onBuild, launching }: {
 
 const DELIVERY_ARTIFACT_LABELS: Record<string, string> = {
   "delivery_safety_check.md": "Delivery Safety Check",
+  "delivery/delivery_safety_check.md": "Delivery Safety Check",
   "delivery_state.json": "Delivery State",
+  "delivery/delivery_state.json": "Delivery State",
   "changed_files_report.md": "Changed Files Report",
   "github_delivery_plan.md": "GitHub Delivery Plan",
+  "delivery/github_delivery_plan.md": "GitHub Delivery Plan",
   "local_commit_summary.md": "Local Commit Summary",
   "push_result.md": "Push Result",
   "repo_hygiene_report.md": "Repo Hygiene Report",
+  "delivery/repo_hygiene_report.md": "Repo Hygiene Report",
   "repo_hygiene_report.json": "Repo Hygiene Report JSON",
+  "delivery/repo_hygiene_report.json": "Repo Hygiene Report JSON",
 };
 
 const DELIVERY_CHECK_ORDER = [
@@ -1402,7 +1407,11 @@ function SmokeMutationBanner({ run }: { run: RunDetail | null }) {
   );
 }
 
-function DeliveryCard({ runId }: { runId: string }) {
+function DeliveryCard({ runId, selectedArtifact, onSelectArtifact }: {
+  runId: string;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
   const [info, setInfo] = useState<DeliveryInfo | null>(null);
   const [branchName, setBranchName] = useState(`pipeline/${runId}-delivery`);
   const [commitMessage, setCommitMessage] = useState("Deliver pipeline changes locally");
@@ -1410,8 +1419,6 @@ function DeliveryCard({ runId }: { runId: string }) {
   const [precheck, setPrecheck] = useState<DeliveryPrecheck | null>(null);
   const [busy, setBusy] = useState<"commit" | "push" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [viewArtifact, setViewArtifact] = useState<string | null>(null);
-  const [artifactContent, setArtifactContent] = useState("");
 
   const refresh = useCallback(() => {
     getDeliveryInfo(runId).then(setInfo).catch(() => setInfo({ available: false, state: null }));
@@ -1431,11 +1438,6 @@ function DeliveryCard({ runId }: { runId: string }) {
       .catch(() => { if (!cancelled) setPrecheck(null); });
     return () => { cancelled = true; };
   }, [runId, branchName, sandboxPush, info?.available, info?.state?.plan_only]);
-
-  useEffect(() => {
-    if (!viewArtifact) return;
-    getDeliveryArtifact(runId, viewArtifact).then(a => setArtifactContent(a.content)).catch(() => setArtifactContent("(error loading content)"));
-  }, [runId, viewArtifact]);
 
   if (!info) return null;
   if (!info.available) {
@@ -1659,17 +1661,19 @@ function DeliveryCard({ runId }: { runId: string }) {
         <div className="delivery-artifacts">
           <div className="delivery-artifacts-label">Delivery reports</div>
           <div className="delivery-artifact-tabs">
-            {info.artifacts!.map(f => (
-              <button key={f} className={`artifact-tab ${viewArtifact === f ? "active" : ""}`} onClick={() => setViewArtifact(f)}>
-                {DELIVERY_ARTIFACT_LABELS[f] ?? f}
-              </button>
-            ))}
+            {info.artifacts!.map(f => {
+              const artifactPath = `delivery/${f}`;
+              return (
+                <button
+                  key={f}
+                  className={`artifact-tab ${selectedArtifact === artifactPath ? "active" : ""}`}
+                  onClick={() => onSelectArtifact(artifactPath)}
+                >
+                  {DELIVERY_ARTIFACT_LABELS[f] ?? f}
+                </button>
+              );
+            })}
           </div>
-          {viewArtifact && (
-            <div className="delivery-artifact-content">
-              <pre>{artifactContent}</pre>
-            </div>
-          )}
         </div>
       )}
     </div>
@@ -1736,7 +1740,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             {plan && <FeatureSprintRoadmap plan={plan} onBuild={planReady ? buildFromPlan : undefined} launching={launching} />}
             <ChangeBoundaryBanner run={run} />
             <SmokeMutationBanner run={run} />
-            <DeliveryCard runId={runId} />
+            <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />
           </div>
         </div>
         <div className="right-panel">
@@ -1756,7 +1760,10 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
               {selected ? (
                 <>
                   <div className="artifact-filename">
-                    {UPGRADE_ARTIFACT_PANELS.find(p => p.file === selected)?.label ?? selected}
+                    {UPGRADE_ARTIFACT_PANELS.find(p => p.file === selected)?.label ?? artifactDisplayName(selected)}
+                    {artifactDisplayName(selected) !== selected && (
+                      <span className="artifact-filename-raw"> · {selected}</span>
+                    )}
                     {regressionStatus && (
                       <span className={`upgrade-regression-badge upgrade-regression-${regressionStatus.toLowerCase()}`}>
                         Regression: {regressionStatus}

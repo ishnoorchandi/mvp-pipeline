@@ -74,6 +74,9 @@ export async function getRun(runId: string): Promise<RunDetail> {
 }
 
 export async function getArtifact(runId: string, filename: string): Promise<Artifact> {
+  if (filename.startsWith("delivery/")) {
+    return getDeliveryArtifact(runId, filename.slice("delivery/".length));
+  }
   const r = await fetch(`${BASE}/api/runs/${runId}/artifacts/${encodeURIComponent(filename)}`);
   if (!r.ok) throw new Error(`Failed to fetch ${filename}`);
   return r.json();
