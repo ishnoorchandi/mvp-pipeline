@@ -411,11 +411,45 @@ def _delivery_dir(run_id: str) -> Path:
     return RUNS_DIR / run_id / "delivery"
 
 
+DELIVERY_ARTIFACT_FILES = (
+    "delivery_safety_check.md",
+    "delivery_state.json",
+    "github_delivery_plan.md",
+    "repo_hygiene_report.md",
+    "repo_hygiene_report.json",
+)
+
+
+def _load_delivery_state(run_id: str) -> dict | None:
+    state_path = _delivery_dir(run_id) / "delivery_state.json"
+    if not state_path.exists():
+        return None
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"decision": "UNKNOWN"}
+
+
+def _delivery_artifacts(run_id: str) -> tuple[list[str], dict[str, bool]]:
+    ddir = _delivery_dir(run_id)
+    artifacts = [f.name for f in ddir.iterdir() if f.is_file()] if ddir.exists() else []
+    artifact_set = set(artifacts)
+    availability = {name: name in artifact_set for name in DELIVERY_ARTIFACT_FILES}
+    return sorted(artifacts), availability
+
+
 def _delivery_repo_for_run(run_id: str) -> str | None:
     state = load_state(run_id)
+    delivery_state = _load_delivery_state(run_id) or {}
     if not state:
-        return None
-    return state.get("existing_app") or state.get("delivery_repo")
+        return delivery_state.get("repo_path")
+    return (
+        state.get("existing_app")
+        or state.get("existing_app_path")
+        or state.get("delivery_repo")
+        or state.get("delivery_repo_path")
+        or delivery_state.get("repo_path")
+    )
 
 
 def _boundary_info_for_run(run_id: str) -> dict:
@@ -451,21 +485,33 @@ def get_delivery_state(run_id: str):
     repo_path = _delivery_repo_for_run(run_id)
     boundary = _boundary_info_for_run(run_id)
     smoke_mutation = _smoke_mutation_info_for_run(run_id)
-    if not repo_path:
-        return jsonify({"available": False, "reason": "This run has no associated git repo (not an Existing App Upgrade run).", "boundary": boundary, "smoke_mutation": smoke_mutation})
+    state = _load_delivery_state(run_id)
+    artifacts, artifact_availability = _delivery_artifacts(run_id)
+    has_delivery_artifacts = bool(artifacts)
 
-    ddir = _delivery_dir(run_id)
-    state_path = ddir / "delivery_state.json"
-    artifacts = [f.name for f in ddir.iterdir()] if ddir.exists() else []
+    if state and state.get("repo_path"):
+        repo_path = repo_path or state.get("repo_path")
 
-    if state_path.exists():
-        try:
-            state = json.loads(state_path.read_text())
-        except Exception:
-            state = {"decision": "UNKNOWN"}
-        return jsonify({"available": True, "repo_path": repo_path, "state": state, "artifacts": sorted(artifacts), "boundary": boundary, "smoke_mutation": smoke_mutation})
+    if not repo_path and not has_delivery_artifacts:
+        return jsonify({
+            "available": False,
+            "reason": "This run has no associated git repo (not an Existing App Upgrade run).",
+            "state": None,
+            "artifacts": artifacts,
+            "artifact_availability": artifact_availability,
+            "boundary": boundary,
+            "smoke_mutation": smoke_mutation,
+        })
 
-    return jsonify({"available": True, "repo_path": repo_path, "state": None, "artifacts": sorted(artifacts), "boundary": boundary, "smoke_mutation": smoke_mutation})
+    return jsonify({
+        "available": True,
+        "repo_path": repo_path,
+        "state": state,
+        "artifacts": artifacts,
+        "artifact_availability": artifact_availability,
+        "boundary": boundary,
+        "smoke_mutation": smoke_mutation,
+    })
 
 
 @app.route("/api/runs/<run_id>/delivery/precheck", methods=["GET"])

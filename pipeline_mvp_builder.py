@@ -9522,6 +9522,16 @@ if __name__ == "__main__":
             commit_message=args.delivery_commit_message, output_dir=output_dir,
             sandbox_allowlist=allowlist, plan_only=args.delivery_plan_only,
         )
+        state_path = Path(output_dir).parent / "run_state.json"
+        if state_path.exists():
+            _update_state(Path(output_dir).parent.name, {
+                "delivery_repo_path": state.get("repo_path"),
+                "delivery_mode": state.get("mode"),
+                "delivery_branch_name": state.get("branch_name"),
+                "delivery_repo_type": state.get("repo_type"),
+                "delivery_decision": state.get("decision"),
+                "delivery_plan_only": bool(state.get("plan_only")),
+            })
         print(f"\n{'='*60}")
         print(f"  Local Delivery{f' — {run_label}' if run_label else ''}")
         print(f"  Repo       : {state['repo_path']}")

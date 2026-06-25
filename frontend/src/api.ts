@@ -224,6 +224,7 @@ export interface DeliveryInfo {
   repo_path?: string;
   state: DeliveryState | null;
   artifacts?: string[];
+  artifact_availability?: Record<string, boolean>;
   boundary?: DeliveryBoundaryInfo;
   smoke_mutation?: DeliverySmokeMutationInfo;
 }
