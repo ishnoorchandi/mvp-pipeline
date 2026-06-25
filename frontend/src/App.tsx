@@ -1,7 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { ReactElement } from "react";
-import { getRuns, getRun, getArtifact, createUpgradeRun, createContinuationRun } from "./api";
-import type { RunSummary, RunDetail } from "./api";
+import {
+  getRuns, getRun, getArtifact, createUpgradeRun, createContinuationRun,
+  getDeliveryInfo, getDeliveryPrecheck, getDeliveryArtifact, createDeliveryCommit, pushDeliverySandbox,
+} from "./api";
+import type { RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck } from "./api";
 import "./App.css";
 
 // ── Pipeline definitions ───────────────────────────────────────────────────────
@@ -1264,6 +1267,256 @@ function FeatureSprintRoadmap({ plan, onBuild, launching }: {
   );
 }
 
+// ── Delivery & Git Safety card ──────────────────────────────────────────────
+// Local Delivery + Optional Sandbox Push: makes it impossible to confuse "local
+// commit" with "GitHub push". Repo path is never client-supplied — the backend
+// reads it from the run's own state, so this UI can only ever act on the repo
+// the run was actually created against.
+
+const DELIVERY_ARTIFACT_LABELS: Record<string, string> = {
+  "delivery_safety_check.md": "Delivery Safety Check",
+  "changed_files_report.md": "Changed Files Report",
+  "github_delivery_plan.md": "GitHub Delivery Plan",
+  "local_commit_summary.md": "Local Commit Summary",
+  "push_result.md": "Push Result",
+};
+
+const DELIVERY_CHECK_ORDER = [
+  "target_repo_detected", "company_repo_protection", "current_branch_not_main",
+  "working_tree_clean_before_delivery", "denied_files_not_staged",
+  "local_commit_allowed", "github_push_allowed",
+];
+
+const DELIVERY_CHECK_LABELS: Record<string, string> = {
+  target_repo_detected: "Target repo detected",
+  company_repo_protection: "Company repo protection",
+  current_branch_not_main: "Delivery branch is not main",
+  working_tree_clean_before_delivery: "Working tree clean before delivery",
+  denied_files_not_staged: "Denied files not staged",
+  local_commit_allowed: "Local commit allowed",
+  github_push_allowed: "GitHub push allowed",
+};
+
+function DeliveryChecklist({ precheck }: { precheck: DeliveryPrecheck | null }) {
+  if (!precheck) return <div className="delivery-checklist-empty">Checking repo safety…</div>;
+  return (
+    <div className="delivery-checklist">
+      {DELIVERY_CHECK_ORDER.filter(k => precheck.checks[k]).map(k => {
+        const c = precheck.checks[k];
+        const icon = c.status === "pass" ? "✓" : c.status === "warn" ? "!" : "✕";
+        return (
+          <div key={k} className={`delivery-check-row delivery-check-${c.status}`}>
+            <span className="delivery-check-icon">{icon}</span>
+            <span className="delivery-check-label">{DELIVERY_CHECK_LABELS[k] ?? k}</span>
+            <span className="delivery-check-detail">{c.detail}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function DeliveryStatusBadge({ decision }: { decision?: string | null }) {
+  if (!decision) return <span className="delivery-badge delivery-badge-idle">Ready to create local commit</span>;
+  const map: Record<string, { label: string; cls: string }> = {
+    PASS_LOCAL_ONLY: { label: "Local only", cls: "ok" },
+    PASS_SANDBOX_PUSH: { label: "Sandbox push allowed", cls: "ok" },
+    BLOCKED: { label: "Blocked", cls: "fail" },
+  };
+  const v = map[decision] ?? { label: decision, cls: "warn" };
+  return <span className={`delivery-badge delivery-badge-${v.cls}`}>{v.label}</span>;
+}
+
+function DeliveryCard({ runId }: { runId: string }) {
+  const [info, setInfo] = useState<DeliveryInfo | null>(null);
+  const [branchName, setBranchName] = useState(`pipeline/${runId}-delivery`);
+  const [commitMessage, setCommitMessage] = useState("Deliver pipeline changes locally");
+  const [sandboxPush, setSandboxPush] = useState(false);
+  const [precheck, setPrecheck] = useState<DeliveryPrecheck | null>(null);
+  const [busy, setBusy] = useState<"commit" | "push" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [viewArtifact, setViewArtifact] = useState<string | null>(null);
+  const [artifactContent, setArtifactContent] = useState("");
+
+  const refresh = useCallback(() => {
+    getDeliveryInfo(runId).then(setInfo).catch(() => setInfo({ available: false, state: null }));
+  }, [runId]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (!info?.available || !branchName) { setPrecheck(null); return; }
+    let cancelled = false;
+    getDeliveryPrecheck(runId, branchName, sandboxPush)
+      .then(p => { if (!cancelled) setPrecheck(p); })
+      .catch(() => { if (!cancelled) setPrecheck(null); });
+    return () => { cancelled = true; };
+  }, [runId, branchName, sandboxPush, info?.available]);
+
+  useEffect(() => {
+    if (!viewArtifact) return;
+    getDeliveryArtifact(runId, viewArtifact).then(a => setArtifactContent(a.content)).catch(() => setArtifactContent("(error loading content)"));
+  }, [runId, viewArtifact]);
+
+  if (!info) return null;
+  if (!info.available) {
+    return (
+      <div className="delivery-card">
+        <div className="delivery-card-header">
+          <div>
+            <div className="delivery-card-title">Delivery &amp; Git Safety</div>
+            <div className="delivery-card-sub">{info.reason ?? "Delivery is not available for this run."}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const isCompanyRepo = precheck?.repo_type === "company-protected";
+  const canPushSandbox = !!precheck && precheck.decision === "PASS_SANDBOX_PUSH";
+
+  const doCommit = async () => {
+    setBusy("commit"); setError(null);
+    try {
+      await createDeliveryCommit(runId, branchName, commitMessage);
+      refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const doPush = async () => {
+    setBusy("push"); setError(null);
+    try {
+      await pushDeliverySandbox(runId, branchName, commitMessage);
+      refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Delivery &amp; Git Safety</div>
+          <div className="delivery-card-sub">
+            Create a local branch/commit safely. Company repositories are never pushed unless explicitly allowed.
+          </div>
+        </div>
+        <DeliveryStatusBadge decision={info.state?.decision ?? precheck?.decision} />
+      </div>
+
+      <div className="delivery-repo-line">
+        Target repo: <code>{info.repo_path}</code>
+        {precheck && <span className={`delivery-repo-type delivery-repo-type-${precheck.repo_type}`}>{precheck.repo_type}</span>}
+      </div>
+
+      {isCompanyRepo && (
+        <div className="delivery-warning-panel">
+          <strong>This repo is protected.</strong> The pipeline can create local commits for demo/review,
+          but it will not publish branches to the company GitHub remote.
+        </div>
+      )}
+
+      <div className="delivery-form-row">
+        <label>
+          Branch name
+          <input value={branchName} onChange={e => setBranchName(e.target.value)} placeholder="pipeline/my-change" />
+        </label>
+        <label>
+          Commit message
+          <input value={commitMessage} onChange={e => setCommitMessage(e.target.value)} placeholder="Describe the change" />
+        </label>
+      </div>
+
+      <DeliveryChecklist precheck={precheck} />
+
+      <div className="delivery-command-preview">
+        <div className="delivery-command-preview-label">What will run</div>
+        <pre>{`git checkout -b ${branchName || "<branch>"}\ngit add -A\ngit commit -m "${commitMessage || "<message>"}"${sandboxPush ? `\ngit push -u origin ${branchName || "<branch>"}` : ""}`}</pre>
+      </div>
+
+      <div className="delivery-actions">
+        <div className="delivery-action">
+          <button className="submit-btn" disabled={busy !== null || !branchName || !commitMessage} onClick={doCommit}>
+            {busy === "commit" ? "Creating…" : "Create Local Commit"}
+          </button>
+          <div className="delivery-action-help">Creates a branch and commit on your machine only. Nothing is published to GitHub.</div>
+        </div>
+        <div className="delivery-action">
+          <label className="delivery-sandbox-toggle">
+            <input type="checkbox" checked={sandboxPush} onChange={e => setSandboxPush(e.target.checked)} />
+            Enable sandbox push for this attempt
+          </label>
+          {isCompanyRepo ? (
+            <>
+              <button className="submit-btn submit-btn-disabled" disabled title="Push disabled for company repo">
+                Push disabled for company repo
+              </button>
+              <div className="delivery-action-help">
+                This repo is protected. The pipeline can create local commits for demo/review, but it will not publish branches to the company GitHub remote.
+              </div>
+            </>
+          ) : (
+            <>
+              <button
+                className="submit-btn"
+                disabled={busy !== null || !sandboxPush || !canPushSandbox}
+                onClick={doPush}
+                title={!canPushSandbox ? (precheck?.push_blocked_reasons.join("; ") || "Not eligible for sandbox push") : ""}
+              >
+                {busy === "push" ? "Pushing…" : "Push Sandbox Demo Branch"}
+              </button>
+              <div className="delivery-action-help">Only enabled for allowlisted sandbox repos. Never pushes OneHR/OneATS company repos.</div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {error && <div className="delivery-error-panel">{error}</div>}
+
+      {info.state && (
+        <div className={`delivery-result-panel delivery-result-${info.state.decision === "BLOCKED" ? "fail" : "ok"}`}>
+          {info.state.decision === "BLOCKED" ? (
+            <>Delivery blocked: {info.state.blocked_reason ?? "see delivery_safety_check.md"}</>
+          ) : (
+            <>
+              Local commit created on <code>{info.state.branch_name}</code>
+              {info.state.commit_hash && <> (<code>{info.state.commit_hash.slice(0, 10)}</code>)</>}.{" "}
+              {info.state.push_attempted
+                ? (info.state.push_succeeded ? "Pushed to sandbox remote." : "Push attempted but failed — see push_result.md.")
+                : "Not pushed to GitHub."}
+            </>
+          )}
+        </div>
+      )}
+
+      {(info.artifacts?.length ?? 0) > 0 && (
+        <div className="delivery-artifacts">
+          <div className="delivery-artifacts-label">Delivery reports</div>
+          <div className="delivery-artifact-tabs">
+            {info.artifacts!.map(f => (
+              <button key={f} className={`artifact-tab ${viewArtifact === f ? "active" : ""}`} onClick={() => setViewArtifact(f)}>
+                {DELIVERY_ARTIFACT_LABELS[f] ?? f}
+              </button>
+            ))}
+          </div>
+          {viewArtifact && (
+            <div className="delivery-artifact-content">
+              <pre>{artifactContent}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
   runId: string; run: RunDetail | null; onBack: () => void; onNewRun: (id: string) => void;
 }) {
@@ -1322,6 +1575,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             </div>
             {planReady && <div className="sprint-mode-banner">Review the plan, then build exactly one selected feature sprint.</div>}
             {plan && <FeatureSprintRoadmap plan={plan} onBuild={planReady ? buildFromPlan : undefined} launching={launching} />}
+            <DeliveryCard runId={runId} />
           </div>
         </div>
         <div className="right-panel">

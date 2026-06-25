@@ -1,0 +1,553 @@
+"""
+Local Delivery + Optional Sandbox Push
+=======================================
+Safety layer for delivering pipeline-generated changes into a real git
+repository without ever risking an accidental push to a protected company
+remote (OneHR-Interon) or to a protected branch (main/master/develop/production).
+
+Three delivery modes:
+  local_only    — inspect, branch, stage, commit. Never pushes.
+  sandbox_push  — local_only steps + push, but ONLY if every sandbox-push
+                  precondition passes (see assert_clean_delivery_preconditions).
+  blocked       — unsafe combination detected; nothing is modified.
+
+All git calls go through run_git_command(), which uses subprocess.run with an
+argv list (never a shell string), so there is no shell-injection surface.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import time
+from pathlib import Path
+
+# ── Safety constants ─────────────────────────────────────────────────────────
+
+COMPANY_PATH_MARKER = "/Projects/OneHR/"
+COMPANY_REMOTE_MARKER = "OneHR-Interon"
+DISABLED_PUSH_MARKER = "DISABLED_DO_NOT_PUSH_COMPANY_REPO"
+
+PROTECTED_BRANCHES = {"main", "master", "develop", "production"}
+SANDBOX_BRANCH_PREFIXES = ("pipeline/", "demo/")
+
+# Explicit allowlist of sandbox/demo repos that are safe to push to. Extended
+# at runtime via --allow-sandbox-remote OWNER/REPO.
+DEFAULT_SANDBOX_ALLOWLIST = {"ishnoorchandi/github-delivery-demo"}
+
+# Path fragments / suffixes that must never be staged or pushed.
+_DENIED_PATH_PATTERNS = [
+    r"(^|/)\.env($|\.)",
+    r"(^|/)node_modules(/|$)",
+    r"(^|/)runs(/|$)",
+    r"(^|/)venv(/|$)",
+    r"(^|/)__pycache__(/|$)",
+    r"(^|/)\.pytest_cache(/|$)",
+    r"\.log$",
+    r"(^|/)id_rsa(\.pub)?$",
+    r"\.pem$",
+    r"(^|/)\.ssh(/|$)",
+    r"(^|/)secrets?\.(json|ya?ml|txt)$",
+    r"(^|/)credentials(\.json)?$",
+]
+_DENIED_RE = re.compile("|".join(_DENIED_PATH_PATTERNS))
+
+
+class DeliveryError(RuntimeError):
+    """Raised when a git command genuinely fails (not a safety block)."""
+
+
+# ── Low-level git helpers ─────────────────────────────────────────────────────
+
+def run_git_command(repo_path, args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    """Run `git <args>` in repo_path via argv (no shell), returning the CompletedProcess."""
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(repo_path),
+        capture_output=True,
+        text=True,
+    )
+    if check and result.returncode != 0:
+        raise DeliveryError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result
+
+
+def get_git_remote_info(repo_path, remote: str = "origin") -> dict:
+    """Fetch/push URLs for `remote`. Empty strings if the remote doesn't exist."""
+    fetch = run_git_command(repo_path, ["remote", "get-url", remote], check=False)
+    push = run_git_command(repo_path, ["remote", "get-url", "--push", remote], check=False)
+    return {
+        "remote": remote,
+        "fetch_url": fetch.stdout.strip() if fetch.returncode == 0 else "",
+        "push_url": push.stdout.strip() if push.returncode == 0 else "",
+    }
+
+
+def get_git_status(repo_path) -> dict:
+    """Current branch + working tree cleanliness."""
+    branch_res = run_git_command(repo_path, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    branch = branch_res.stdout.strip() if branch_res.returncode == 0 else ""
+    status_res = run_git_command(repo_path, ["status", "--porcelain"], check=False)
+    lines = [l for l in status_res.stdout.splitlines() if l.strip()]
+    return {"branch": branch, "clean": len(lines) == 0, "porcelain": lines}
+
+
+# ── Classification helpers ────────────────────────────────────────────────────
+
+def is_company_repo_path(repo_path) -> bool:
+    return COMPANY_PATH_MARKER in str(Path(repo_path).resolve())
+
+
+def is_company_remote(remote_url: str) -> bool:
+    return bool(remote_url) and COMPANY_REMOTE_MARKER in remote_url
+
+
+def is_safe_sandbox_remote(remote_url: str, allowlist=None) -> bool:
+    if not remote_url:
+        return False
+    allowlist = allowlist or DEFAULT_SANDBOX_ALLOWLIST
+    return any(owner_repo in remote_url for owner_repo in allowlist)
+
+
+def scan_denied_paths(paths: list[str]) -> list[str]:
+    return [p for p in paths if _DENIED_RE.search(p)]
+
+
+def detect_repo_type(repo_path, remote_info: dict) -> str:
+    """company-protected | personal-sandbox | unknown."""
+    if (
+        is_company_repo_path(repo_path)
+        or is_company_remote(remote_info.get("fetch_url", ""))
+        or is_company_remote(remote_info.get("push_url", ""))
+        or remote_info.get("push_url") == DISABLED_PUSH_MARKER
+    ):
+        return "company-protected"
+    if remote_info.get("fetch_url"):
+        return "personal-sandbox"
+    return "unknown"
+
+
+# ── Precondition checks ───────────────────────────────────────────────────────
+
+def assert_clean_delivery_preconditions(
+    repo_path, mode: str, branch_name: str | None = None, sandbox_allowlist=None,
+) -> dict:
+    """
+    Run every safety check and return a structured result:
+      { repo_path, repo_type, remote_info, git_status, checks: {name: {status, detail}},
+        local_commit_allowed, push_allowed, push_blocked_reasons, decision }
+    Never raises for "unsafe" conditions — those are reported, not exceptions.
+    Only raises DeliveryError for things like git itself being unusable.
+    """
+    sandbox_allowlist = sandbox_allowlist or DEFAULT_SANDBOX_ALLOWLIST
+    repo_path = Path(repo_path).resolve()
+    checks: dict[str, dict] = {}
+
+    repo_exists = repo_path.exists() and (repo_path / ".git").exists()
+    checks["target_repo_detected"] = (
+        {"status": "pass", "detail": str(repo_path)}
+        if repo_exists else
+        {"status": "fail", "detail": f"{repo_path} is not a git repository"}
+    )
+    if not repo_exists:
+        return {
+            "repo_path": str(repo_path), "repo_type": "unknown",
+            "remote_info": {}, "git_status": {}, "checks": checks,
+            "local_commit_allowed": False, "push_allowed": False,
+            "push_blocked_reasons": ["repo path is not a git repository"],
+            "decision": "BLOCKED",
+        }
+
+    remote_info = get_git_remote_info(repo_path)
+    status = get_git_status(repo_path)
+    repo_type = detect_repo_type(repo_path, remote_info)
+    company = repo_type == "company-protected"
+
+    checks["company_repo_protection"] = (
+        {"status": "warn", "detail": "Company repo detected — push is always blocked for this repo."}
+        if company else
+        {"status": "pass", "detail": "Not a recognized company-protected repo."}
+    )
+
+    # The branch we are about to create/commit on/push is the one that matters —
+    # not necessarily the branch HEAD happens to be on right now (we always branch
+    # off of HEAD before committing).
+    target_branch = branch_name or status["branch"]
+    branch_ok = target_branch not in PROTECTED_BRANCHES
+    checks["current_branch_not_main"] = (
+        {"status": "pass", "detail": f"Delivery branch '{target_branch}' is not protected."}
+        if branch_ok else
+        {"status": "fail", "detail": f"Delivery branch '{target_branch}' is a protected branch name."}
+    )
+
+    checks["working_tree_clean_before_delivery"] = (
+        {"status": "pass", "detail": "Working tree was clean before delivery."}
+        if status["clean"] else
+        {"status": "warn", "detail": f"{len(status['porcelain'])} pending change(s) will be staged for the delivery commit."}
+    )
+
+    denied_now = scan_denied_paths([line[3:].strip() for line in status["porcelain"]])
+    checks["denied_files_not_staged"] = (
+        {"status": "fail", "detail": f"Denied paths present in working tree: {denied_now}"}
+        if denied_now else
+        {"status": "pass", "detail": "No denied paths (.env, node_modules, runs, logs, secrets) detected."}
+    )
+
+    local_commit_allowed = branch_ok and not denied_now
+    checks["local_commit_allowed"] = (
+        {"status": "pass", "detail": "Local branch + commit can proceed."}
+        if local_commit_allowed else
+        {"status": "fail", "detail": "Blocked by protected branch name or denied files."}
+    )
+
+    push_blocked_reasons: list[str] = []
+    if mode != "sandbox_push":
+        push_blocked_reasons.append("delivery mode is local_only — push was not requested")
+    if company:
+        push_blocked_reasons.append("repo is company-protected (path under /Projects/OneHR/, OneHR-Interon remote, or disabled push URL)")
+    if remote_info.get("push_url") == DISABLED_PUSH_MARKER:
+        push_blocked_reasons.append(f"push URL is '{DISABLED_PUSH_MARKER}'")
+    if not branch_ok:
+        push_blocked_reasons.append(f"delivery branch '{target_branch}' is a protected branch name")
+    if not target_branch.startswith(SANDBOX_BRANCH_PREFIXES):
+        push_blocked_reasons.append(f"delivery branch '{target_branch}' does not start with 'pipeline/' or 'demo/'")
+    candidate_remote = remote_info.get("fetch_url") or remote_info.get("push_url") or ""
+    if not is_safe_sandbox_remote(candidate_remote, sandbox_allowlist):
+        push_blocked_reasons.append("remote is not in the sandbox allowlist")
+    if denied_now:
+        push_blocked_reasons.append("denied paths are present and would be staged")
+
+    push_allowed = len(push_blocked_reasons) == 0
+    checks["github_push_allowed"] = (
+        {"status": "pass", "detail": "All sandbox push conditions are satisfied."}
+        if push_allowed else
+        {"status": "fail" if mode == "sandbox_push" else "warn", "detail": "; ".join(push_blocked_reasons)}
+    )
+
+    if not local_commit_allowed:
+        decision = "BLOCKED"
+    elif mode == "sandbox_push":
+        decision = "PASS_SANDBOX_PUSH" if push_allowed else "BLOCKED"
+    else:
+        decision = "PASS_LOCAL_ONLY"
+
+    return {
+        "repo_path": str(repo_path),
+        "repo_type": repo_type,
+        "remote_info": remote_info,
+        "git_status": status,
+        "checks": checks,
+        "local_commit_allowed": local_commit_allowed,
+        "push_allowed": push_allowed,
+        "push_blocked_reasons": push_blocked_reasons,
+        "decision": decision,
+    }
+
+
+# ── Branch / stage / commit / push operations ────────────────────────────────
+
+def create_local_delivery_branch(repo_path, branch_name: str) -> str:
+    """Create+checkout branch_name off current HEAD, or checkout it if it already exists."""
+    existing = run_git_command(repo_path, ["rev-parse", "--verify", "--quiet", branch_name], check=False)
+    if existing.returncode == 0:
+        run_git_command(repo_path, ["checkout", branch_name])
+    else:
+        run_git_command(repo_path, ["checkout", "-b", branch_name])
+    return branch_name
+
+
+def stage_allowed_files(repo_path, allowlist: list[str] | None = None, denylist: list[str] | None = None) -> dict:
+    """Stage files (allowlist of paths, or everything via `git add -A`), then unstage
+    anything matching the denylist (or the built-in denied-path patterns)."""
+    if allowlist:
+        run_git_command(repo_path, ["add", "--", *allowlist])
+    else:
+        run_git_command(repo_path, ["add", "-A"])
+
+    staged = [s for s in run_git_command(repo_path, ["diff", "--cached", "--name-only"]).stdout.splitlines() if s.strip()]
+
+    if denylist:
+        denied_matches = [s for s in staged if any(d in s for d in denylist)]
+    else:
+        denied_matches = scan_denied_paths(staged)
+
+    if denied_matches:
+        run_git_command(repo_path, ["reset", "HEAD", "--", *denied_matches], check=False)
+        staged = [s for s in staged if s not in denied_matches]
+
+    return {"staged": staged, "denied_removed": denied_matches}
+
+
+def create_local_delivery_commit(repo_path, message: str) -> dict | None:
+    """Commit currently staged files. Returns None if nothing is staged."""
+    staged = [s for s in run_git_command(repo_path, ["diff", "--cached", "--name-only"]).stdout.splitlines() if s.strip()]
+    if not staged:
+        return None
+    run_git_command(repo_path, ["commit", "-m", message])
+    commit_hash = run_git_command(repo_path, ["rev-parse", "HEAD"]).stdout.strip()
+    author = run_git_command(repo_path, ["log", "-1", "--pretty=%an <%ae>"]).stdout.strip()
+    return {"hash": commit_hash, "author": author, "message": message, "files": staged}
+
+
+def push_sandbox_branch(repo_path, branch_name: str) -> dict:
+    """Push branch_name to origin. Only call this after a PASS_SANDBOX_PUSH decision."""
+    result = run_git_command(repo_path, ["push", "-u", "origin", branch_name], check=False)
+    return {
+        "success": result.returncode == 0,
+        "branch": branch_name,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+        "returncode": result.returncode,
+    }
+
+
+# ── Report generation ─────────────────────────────────────────────────────────
+
+def _github_web_url(remote_url: str, branch: str) -> str | None:
+    """Best-effort https://github.com/OWNER/REPO/tree/BRANCH derivation. None if not derivable."""
+    if not remote_url:
+        return None
+    m = re.search(r"github\.com[:/]+([\w.-]+)/([\w.-]+?)(\.git)?$", remote_url)
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    return f"https://github.com/{owner}/{repo}/tree/{branch}"
+
+
+def generate_changed_files_report(repo_path, output_path) -> tuple[str, dict]:
+    """Diff of what's currently staged (git diff --cached). Writes changed_files_report.md."""
+    name_status = run_git_command(repo_path, ["diff", "--cached", "--name-status"], check=False).stdout.splitlines()
+    added, modified, deleted, renamed = [], [], [], []
+    for line in name_status:
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        code = parts[0]
+        if code.startswith("A"):
+            added.append(parts[1])
+        elif code.startswith("M"):
+            modified.append(parts[1])
+        elif code.startswith("D"):
+            deleted.append(parts[1])
+        elif code.startswith("R"):
+            renamed.append(f"{parts[1]} -> {parts[2]}")
+
+    all_paths = added + modified + deleted + [r.split(" -> ")[1] for r in renamed]
+    denied = scan_denied_paths(all_paths)
+
+    lines = ["# Changed Files Report", ""]
+    lines.append(f"**Total staged files:** {len(all_paths)}")
+    lines.append("")
+    for label, items in (("Added", added), ("Modified", modified), ("Deleted", deleted), ("Renamed", renamed)):
+        lines.append(f"## {label} ({len(items)})")
+        lines.extend(f"- `{f}`" for f in items) if items else lines.append("- (none)")
+        lines.append("")
+    lines.append(f"## Denied / Risky Paths Detected ({len(denied)})")
+    if denied:
+        lines.append("**These paths were detected and were NOT included in the delivery commit:**")
+        lines.extend(f"- `{f}`" for f in denied)
+    else:
+        lines.append("- (none — no `.env`, `node_modules/`, `runs/`, `venv/`, logs, or secret-like files detected)")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append(f"{len(all_paths) - len(denied)} file(s) staged and committed; {len(denied)} denied file(s) excluded.")
+
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    data = {"added": added, "modified": modified, "deleted": deleted, "renamed": renamed, "denied": denied}
+    return content, data
+
+
+def generate_delivery_safety_check(precheck: dict, mode: str, branch_name: str | None, output_path) -> str:
+    remote_info = precheck.get("remote_info", {})
+    status = precheck.get("git_status", {})
+    lines = ["# Delivery Safety Check", ""]
+    lines.append(f"**Repo path:** `{precheck['repo_path']}`")
+    lines.append(f"**Current branch:** `{status.get('branch', '(unknown)')}`")
+    lines.append(f"**Delivery branch:** `{branch_name or status.get('branch', '(unknown)')}`")
+    lines.append(f"**Fetch URL:** `{remote_info.get('fetch_url') or '(none)'}`")
+    lines.append(f"**Push URL:** `{remote_info.get('push_url') or '(none)'}`")
+    lines.append(f"**Detected repo type:** `{precheck['repo_type']}`")
+    lines.append(f"**Working tree clean:** {status.get('clean', '(unknown)')}")
+    lines.append(f"**Requested mode:** `{mode}`")
+    lines.append("")
+    lines.append("## Safety Checklist")
+    icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}
+    for name, result in precheck.get("checks", {}).items():
+        lines.append(f"- {icon.get(result['status'], '•')} **{name.replace('_', ' ')}** — {result['detail']}")
+    lines.append("")
+    lines.append(f"**Local commit allowed:** {precheck['local_commit_allowed']}")
+    lines.append(f"**GitHub push allowed:** {precheck['push_allowed']}")
+    if precheck.get("push_blocked_reasons"):
+        lines.append("")
+        lines.append("**Push blocked reasons:**")
+        lines.extend(f"- {r}" for r in precheck["push_blocked_reasons"])
+    lines.append("")
+    lines.append(f"## Final Decision: `{precheck['decision']}`")
+    decision_text = {
+        "PASS_LOCAL_ONLY": "A local branch and commit will be created. Nothing will be pushed to GitHub.",
+        "PASS_SANDBOX_PUSH": "A local branch/commit will be created AND pushed to the allowlisted sandbox remote only.",
+        "BLOCKED": "No changes were made. See the checklist above for the reason(s).",
+    }
+    lines.append(decision_text.get(precheck["decision"], ""))
+
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_github_delivery_plan(precheck: dict, mode: str, branch_name: str | None, output_path) -> str:
+    remote_info = precheck.get("remote_info", {})
+    status = precheck.get("git_status", {})
+    target_branch = branch_name or status.get("branch", "(unknown)")
+    lines = ["# GitHub Delivery Plan", ""]
+
+    if precheck["decision"] == "PASS_SANDBOX_PUSH":
+        lines.append("```")
+        lines.append("Push status: ALLOWED_SANDBOX_ONLY")
+        lines.append(f"Remote: {remote_info.get('fetch_url') or remote_info.get('push_url')}")
+        lines.append(f"Branch: {target_branch}")
+        lines.append(f"Push command: git push origin {target_branch}")
+        lines.append("```")
+    elif precheck["decision"] == "PASS_LOCAL_ONLY":
+        lines.append("```")
+        lines.append("Push status: DISABLED")
+        lines.append("Reason: Company repo protected, or local-only mode requested. This workflow")
+        lines.append("created a local branch/commit only.")
+        lines.append("No changes were published to GitHub.")
+        lines.append("```")
+    else:
+        lines.append("```")
+        lines.append("Push status: BLOCKED")
+        lines.append("Reason: One or more safety preconditions failed. No branch, commit, or push")
+        lines.append("was performed. See delivery_safety_check.md for details.")
+        lines.append("```")
+
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_local_commit_summary(branch_name: str, commit_info: dict | None, repo_path, output_path) -> str:
+    lines = ["# Local Commit Summary", ""]
+    if commit_info is None:
+        lines.append("No commit was created (nothing was staged, or delivery was blocked).")
+    else:
+        status_after = get_git_status(repo_path)
+        lines.append(f"**Branch:** `{branch_name}`")
+        lines.append(f"**Commit hash:** `{commit_info['hash']}`")
+        lines.append(f"**Commit message:** {commit_info['message']}")
+        lines.append(f"**Author:** {commit_info['author']}")
+        lines.append("")
+        lines.append(f"## Files committed ({len(commit_info['files'])})")
+        lines.extend(f"- `{f}`" for f in commit_info["files"])
+        lines.append("")
+        lines.append(f"**Working tree clean after commit:** {status_after['clean']}")
+
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_push_result(push_result: dict, remote_info: dict, output_path) -> str:
+    lines = ["# Push Result", ""]
+    lines.append(f"**Branch pushed:** `{push_result['branch']}`")
+    lines.append(f"**Remote:** `{remote_info.get('fetch_url') or remote_info.get('push_url') or '(unknown)'}`")
+    lines.append(f"**Success:** {push_result['success']}")
+    lines.append("")
+    lines.append("## Command output")
+    lines.append("```")
+    lines.append(push_result.get("stdout") or "(no stdout)")
+    if push_result.get("stderr"):
+        lines.append(push_result["stderr"])
+    lines.append("```")
+    if push_result["success"]:
+        url = _github_web_url(remote_info.get("fetch_url") or remote_info.get("push_url") or "", push_result["branch"])
+        if url:
+            lines.append("")
+            lines.append(f"**Probable GitHub branch URL:** {url}")
+
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+# ── Orchestrator ───────────────────────────────────────────────────────────────
+
+def run_local_delivery(
+    repo_path,
+    mode: str,
+    branch_name: str | None,
+    commit_message: str | None,
+    output_dir,
+    sandbox_allowlist=None,
+    plan_only: bool = False,
+) -> dict:
+    """
+    End-to-end delivery workflow. Always writes delivery_safety_check.md,
+    github_delivery_plan.md, and delivery_state.json. Writes
+    changed_files_report.md / local_commit_summary.md / push_result.md only
+    when the corresponding step actually runs.
+
+    mode: "local_only" | "sandbox_push"
+    Returns the final delivery_state dict (also written to delivery_state.json).
+    """
+    repo_path = Path(repo_path).resolve()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sandbox_allowlist = sandbox_allowlist or DEFAULT_SANDBOX_ALLOWLIST
+
+    precheck = assert_clean_delivery_preconditions(repo_path, mode, branch_name, sandbox_allowlist)
+    generate_delivery_safety_check(precheck, mode, branch_name, output_dir / "delivery_safety_check.md")
+    generate_github_delivery_plan(precheck, mode, branch_name, output_dir / "github_delivery_plan.md")
+
+    state = {
+        "repo_path": str(repo_path),
+        "mode": mode,
+        "branch_name": branch_name,
+        "repo_type": precheck["repo_type"],
+        "decision": precheck["decision"],
+        "plan_only": plan_only,
+        "commit_hash": None,
+        "files_committed": [],
+        "push_attempted": False,
+        "push_succeeded": None,
+        "timestamp": time.time(),
+    }
+
+    if precheck["decision"] == "BLOCKED" or plan_only:
+        if plan_only and precheck["decision"] != "BLOCKED":
+            state["note"] = "delivery-plan-only run — no branch, commit, or push was performed"
+        (output_dir / "delivery_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return state
+
+    if not branch_name or not commit_message:
+        raise DeliveryError("branch_name and commit_message are required unless plan_only=True")
+
+    create_local_delivery_branch(repo_path, branch_name)
+    staged_result = stage_allowed_files(repo_path)
+
+    generate_changed_files_report(repo_path, output_dir / "changed_files_report.md")
+
+    commit_info = create_local_delivery_commit(repo_path, commit_message)
+    if commit_info is None:
+        state["decision"] = "BLOCKED"
+        state["blocked_reason"] = "Nothing to commit — working tree already matched HEAD after denylist filtering."
+        generate_local_commit_summary(branch_name, None, repo_path, output_dir / "local_commit_summary.md")
+        (output_dir / "delivery_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return state
+
+    state["commit_hash"] = commit_info["hash"]
+    state["files_committed"] = commit_info["files"]
+    state["denied_files_excluded"] = staged_result["denied_removed"]
+    generate_local_commit_summary(branch_name, commit_info, repo_path, output_dir / "local_commit_summary.md")
+
+    if mode == "sandbox_push" and precheck["decision"] == "PASS_SANDBOX_PUSH":
+        push_result = push_sandbox_branch(repo_path, branch_name)
+        state["push_attempted"] = True
+        state["push_succeeded"] = push_result["success"]
+        generate_push_result(push_result, precheck["remote_info"], output_dir / "push_result.md")
+
+    (output_dir / "delivery_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return state

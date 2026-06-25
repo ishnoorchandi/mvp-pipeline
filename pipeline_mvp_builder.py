@@ -39,6 +39,8 @@ from pathlib import Path
 import requests
 from openai import OpenAI
 
+import delivery as delivery_mod
+
 from config import (
     OPENAI_API_KEY, GPT_MODEL, GPT4O_MODEL,
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
@@ -8686,6 +8688,33 @@ if __name__ == "__main__":
                               "current_app_inventory.md, continuation_gap_analysis.md, selected "
                               "continuation sprint scope + build prompt) then stop. Skips Claude "
                               "Code and DeepSeek entirely.")
+
+    # ── Local Delivery + Optional Sandbox Push ───────────────────────────────
+    parser.add_argument("--local-git-delivery", action="store_true",
+                         help="After the pipeline run (or standalone with --delivery-repo), run "
+                              "the local delivery safety workflow: branch + stage + commit + "
+                              "reports against a real git repo. Never pushes company repos. "
+                              "Can be combined with --upgrade-mode (delivers --existing-app) or "
+                              "used standalone with --delivery-repo.")
+    parser.add_argument("--delivery-repo", default=None, metavar="PATH",
+                         help="Git repo to deliver into. Defaults to --existing-app if omitted.")
+    parser.add_argument("--delivery-branch", default=None, metavar="BRANCH_NAME",
+                         help="Branch name to create for the delivery commit (and sandbox push, "
+                              "if requested). Required unless --delivery-plan-only.")
+    parser.add_argument("--delivery-commit-message", default=None, metavar="MESSAGE",
+                         help="Commit message for the local delivery commit. Required unless "
+                              "--delivery-plan-only.")
+    parser.add_argument("--sandbox-push", action="store_true",
+                         help="Attempt to push the delivery branch to origin. Only succeeds if the "
+                              "repo passes every sandbox-push safety precondition (never company "
+                              "repos, never main/master/develop/production, branch must start with "
+                              "pipeline/ or demo/, remote must be sandbox-allowlisted).")
+    parser.add_argument("--delivery-plan-only", action="store_true",
+                         help="Run the delivery safety check and write delivery_safety_check.md / "
+                              "github_delivery_plan.md only — no branch, commit, or push.")
+    parser.add_argument("--allow-sandbox-remote", action="append", default=[], metavar="OWNER/REPO",
+                         help="Additional sandbox remote(s) allowed for --sandbox-push, e.g. "
+                              "ishnoorchandi/github-delivery-demo. Repeatable.")
     args = parser.parse_args()
 
     run_id_arg = args.run_id  # may be None
@@ -8697,8 +8726,48 @@ if __name__ == "__main__":
         sprint_plan_only=args.sprint_plan_only,
     )
 
+    def _run_delivery_step(output_dir, run_label: str = ""):
+        """Shared by the standalone and post-upgrade delivery paths below."""
+        repo_path = args.delivery_repo or args.existing_app
+        if not repo_path:
+            print("--local-git-delivery requires --delivery-repo PATH (or --existing-app PATH in --upgrade-mode).")
+            sys.exit(1)
+        if not args.delivery_plan_only and (not args.delivery_branch or not args.delivery_commit_message):
+            print("--local-git-delivery requires --delivery-branch and --delivery-commit-message "
+                  "(or pass --delivery-plan-only to only run the safety check).")
+            sys.exit(1)
+        mode = "sandbox_push" if args.sandbox_push else "local_only"
+        allowlist = set(delivery_mod.DEFAULT_SANDBOX_ALLOWLIST) | set(args.allow_sandbox_remote)
+        state = delivery_mod.run_local_delivery(
+            repo_path, mode=mode, branch_name=args.delivery_branch,
+            commit_message=args.delivery_commit_message, output_dir=output_dir,
+            sandbox_allowlist=allowlist, plan_only=args.delivery_plan_only,
+        )
+        print(f"\n{'='*60}")
+        print(f"  Local Delivery{f' — {run_label}' if run_label else ''}")
+        print(f"  Repo       : {state['repo_path']}")
+        print(f"  Mode       : {state['mode']}")
+        print(f"  Decision   : {state['decision']}")
+        if state.get("commit_hash"):
+            print(f"  Commit     : {state['commit_hash']}")
+        if state["push_attempted"]:
+            print(f"  Push       : {'succeeded' if state['push_succeeded'] else 'FAILED'}")
+        print(f"  Reports    : {output_dir}")
+        print(f"{'='*60}\n")
+        return state
+
     try:
-        if args.continue_run and args.continue_feature_sprint is not None:
+        standalone_delivery = (
+            args.local_git_delivery
+            and not args.continue_run and not args.upgrade_mode
+            and not args.resume and not args.jira and not args.input
+        )
+        if standalone_delivery:
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path("delivery_runs") / f"delivery_{ts}"
+            state = _run_delivery_step(output_dir)
+            sys.exit(1 if state["decision"] == "BLOCKED" else 0)
+        elif args.continue_run and args.continue_feature_sprint is not None:
             pipeline_continue_feature_sprint(
                 args.continue_run, args.continue_feature_sprint,
                 run_id=run_id_arg, use_deepseek=not args.no_deepseek,
@@ -8719,7 +8788,7 @@ if __name__ == "__main__":
                 print("--upgrade-mode requires both --existing-app PATH and --feature-request PATH.")
                 sys.exit(1)
             feature_request_text = Path(args.feature_request).read_text(encoding="utf-8").strip()
-            pipeline_existing_app_upgrade(
+            upgrade_run_id = pipeline_existing_app_upgrade(
                 args.existing_app,
                 feature_request_text,
                 run_id=run_id_arg,
@@ -8727,6 +8796,8 @@ if __name__ == "__main__":
                 feature_plan_only=args.feature_plan_only,
                 use_deepseek=not args.no_deepseek,
             )
+            if args.local_git_delivery and not args.feature_plan_only:
+                _run_delivery_step(run_dir(upgrade_run_id) / "delivery", run_label=f"{upgrade_run_id}")
         elif args.resume:
             resume_id = Path(args.resume).name
             raw = (run_dir(resume_id) / "raw_input.md").read_text()

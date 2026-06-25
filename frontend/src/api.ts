@@ -130,3 +130,85 @@ export function createUpgradeRun(payload: UpgradeRunPayload) {
 export function createContinuationRun(payload: ContinuationRunPayload) {
   return postRun(payload);
 }
+
+// ── Local Delivery + Optional Sandbox Push ──────────────────────────────────
+
+export interface DeliveryCheckItem {
+  status: "pass" | "warn" | "fail";
+  detail: string;
+}
+
+export interface DeliveryPrecheck {
+  repo_path: string;
+  repo_type: "company-protected" | "personal-sandbox" | "unknown";
+  remote_info: { remote: string; fetch_url: string; push_url: string };
+  git_status: { branch: string; clean: boolean; porcelain: string[] };
+  checks: Record<string, DeliveryCheckItem>;
+  local_commit_allowed: boolean;
+  push_allowed: boolean;
+  push_blocked_reasons: string[];
+  decision: "PASS_LOCAL_ONLY" | "PASS_SANDBOX_PUSH" | "BLOCKED";
+}
+
+export interface DeliveryState {
+  repo_path: string;
+  mode: "local_only" | "sandbox_push";
+  branch_name: string | null;
+  repo_type: string;
+  decision: "PASS_LOCAL_ONLY" | "PASS_SANDBOX_PUSH" | "BLOCKED";
+  plan_only: boolean;
+  commit_hash: string | null;
+  files_committed: string[];
+  push_attempted: boolean;
+  push_succeeded: boolean | null;
+  blocked_reason?: string;
+  note?: string;
+  timestamp: number;
+}
+
+export interface DeliveryInfo {
+  available: boolean;
+  reason?: string;
+  repo_path?: string;
+  state: DeliveryState | null;
+  artifacts?: string[];
+}
+
+export async function getDeliveryInfo(runId: string): Promise<DeliveryInfo> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/delivery`);
+  if (!r.ok) throw new Error("Failed to fetch delivery info");
+  return r.json();
+}
+
+export async function getDeliveryPrecheck(runId: string, branchName: string, sandboxPush: boolean): Promise<DeliveryPrecheck> {
+  const params = new URLSearchParams({ branch_name: branchName, sandbox_push: String(sandboxPush) });
+  const r = await fetch(`${BASE}/api/runs/${runId}/delivery/precheck?${params.toString()}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function getDeliveryArtifact(runId: string, filename: string): Promise<Artifact> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/delivery/artifacts/${encodeURIComponent(filename)}`);
+  if (!r.ok) throw new Error(`Failed to fetch ${filename}`);
+  return r.json();
+}
+
+export async function createDeliveryCommit(runId: string, branchName: string, commitMessage: string): Promise<DeliveryState> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/delivery/commit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ branch_name: branchName, commit_message: commitMessage }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function pushDeliverySandbox(runId: string, branchName: string, commitMessage: string): Promise<DeliveryState> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/delivery/push`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ branch_name: branchName, commit_message: commitMessage }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}

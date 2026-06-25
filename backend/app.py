@@ -29,6 +29,9 @@ BASE_DIR = Path(__file__).parent.parent.resolve()
 RUNS_DIR = BASE_DIR / "runs"
 PIPELINE_SCRIPT = BASE_DIR / "pipeline_mvp_builder.py"
 
+sys.path.insert(0, str(BASE_DIR))
+import delivery as delivery_mod  # noqa: E402 — needs BASE_DIR on sys.path first
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -396,6 +399,115 @@ def get_artifact(run_id: str, filename: str):
         abort(404, f"{filename} not found in {run_id}")
     content = p.read_text(encoding="utf-8", errors="replace")
     return jsonify({"run_id": run_id, "filename": filename, "content": content})
+
+
+# ── Local Delivery + Optional Sandbox Push ──────────────────────────────────
+# The repo path for delivery is NEVER taken from the client — it is always read
+# from this run's own run_state.json (existing_app), which was set when the run
+# was created. This is what stops the frontend from being able to point the
+# backend at an arbitrary path, branch, or remote.
+
+def _delivery_dir(run_id: str) -> Path:
+    return RUNS_DIR / run_id / "delivery"
+
+
+def _delivery_repo_for_run(run_id: str) -> str | None:
+    state = load_state(run_id)
+    if not state:
+        return None
+    return state.get("existing_app") or state.get("delivery_repo")
+
+
+@app.route("/api/runs/<run_id>/delivery", methods=["GET"])
+def get_delivery_state(run_id: str):
+    if load_state(run_id) is None:
+        abort(404, f"Run {run_id} not found")
+    repo_path = _delivery_repo_for_run(run_id)
+    if not repo_path:
+        return jsonify({"available": False, "reason": "This run has no associated git repo (not an Existing App Upgrade run)."})
+
+    ddir = _delivery_dir(run_id)
+    state_path = ddir / "delivery_state.json"
+    artifacts = [f.name for f in ddir.iterdir()] if ddir.exists() else []
+
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text())
+        except Exception:
+            state = {"decision": "UNKNOWN"}
+        return jsonify({"available": True, "repo_path": repo_path, "state": state, "artifacts": sorted(artifacts)})
+
+    return jsonify({"available": True, "repo_path": repo_path, "state": None, "artifacts": sorted(artifacts)})
+
+
+@app.route("/api/runs/<run_id>/delivery/precheck", methods=["GET"])
+def get_delivery_precheck(run_id: str):
+    """Read-only safety check preview — never modifies the repo."""
+    if load_state(run_id) is None:
+        abort(404, f"Run {run_id} not found")
+    repo_path = _delivery_repo_for_run(run_id)
+    if not repo_path:
+        abort(400, "This run has no associated git repo")
+
+    mode = "sandbox_push" if request.args.get("sandbox_push") == "true" else "local_only"
+    branch_name = request.args.get("branch_name") or None
+    try:
+        precheck = delivery_mod.assert_clean_delivery_preconditions(repo_path, mode, branch_name)
+    except delivery_mod.DeliveryError as e:
+        abort(400, str(e))
+    return jsonify(precheck)
+
+
+@app.route("/api/runs/<run_id>/delivery/artifacts/<filename>", methods=["GET"])
+def get_delivery_artifact(run_id: str, filename: str):
+    if ".." in filename or "/" in filename:
+        abort(400, "Invalid filename")
+    p = _delivery_dir(run_id) / filename
+    if not p.exists():
+        abort(404, f"{filename} not found in {run_id}/delivery")
+    return jsonify({"run_id": run_id, "filename": filename, "content": p.read_text(encoding="utf-8", errors="replace")})
+
+
+def _run_delivery_action(run_id: str, mode: str):
+    if load_state(run_id) is None:
+        abort(404, f"Run {run_id} not found")
+    repo_path = _delivery_repo_for_run(run_id)
+    if not repo_path:
+        abort(400, "This run has no associated git repo")
+
+    body = request.get_json(force=True, silent=True) or {}
+    branch_name = (body.get("branch_name") or "").strip()
+    commit_message = (body.get("commit_message") or "").strip()
+    if not branch_name or not commit_message:
+        abort(400, "branch_name and commit_message are required")
+
+    allowlist = set(delivery_mod.DEFAULT_SANDBOX_ALLOWLIST)
+    extra = body.get("allow_sandbox_remote") or []
+    if isinstance(extra, list):
+        allowlist |= {str(x).strip() for x in extra if str(x).strip()}
+
+    try:
+        state = delivery_mod.run_local_delivery(
+            repo_path, mode=mode, branch_name=branch_name, commit_message=commit_message,
+            output_dir=_delivery_dir(run_id), sandbox_allowlist=allowlist,
+        )
+    except delivery_mod.DeliveryError as e:
+        abort(400, str(e))
+    return jsonify(state)
+
+
+@app.route("/api/runs/<run_id>/delivery/commit", methods=["POST"])
+def create_delivery_commit(run_id: str):
+    """Local-only: create a branch + commit. Never pushes, regardless of request body."""
+    return _run_delivery_action(run_id, mode="local_only")
+
+
+@app.route("/api/runs/<run_id>/delivery/push", methods=["POST"])
+def push_delivery_sandbox(run_id: str):
+    """Sandbox push attempt. Only actually pushes if every safety precondition passes —
+    company repos, protected branches, and non-allowlisted remotes are blocked inside
+    delivery_mod.run_local_delivery regardless of this request."""
+    return _run_delivery_action(run_id, mode="sandbox_push")
 
 
 if __name__ == "__main__":
