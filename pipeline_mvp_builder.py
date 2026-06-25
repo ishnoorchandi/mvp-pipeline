@@ -4429,6 +4429,9 @@ _FEATURE_SPRINT_FIELD_DEFAULTS = {
     "likely_files_created": [],
     "likely_files_modified": [],
     "must_not_modify": [],
+    # Existing files this sprint is explicitly allowed to delete. Empty by default —
+    # Existing App Upgrade forbids deleting existing files unless a sprint lists them here.
+    "expected_deletions": [],
     "non_goals": [],
     "regression_risks": [],
     "completion_criteria": [],
@@ -4814,7 +4817,7 @@ def normalize_feature_sprint_plan(
         if entry["sprint_number"] <= 0:
             entry["sprint_number"] = i + 1
         for k in ("features", "requirements_covered", "deferred_requirements", "likely_files_created",
-                  "likely_files_modified", "must_not_modify", "non_goals", "regression_risks",
+                  "likely_files_modified", "must_not_modify", "expected_deletions", "non_goals", "regression_risks",
                   "completion_criteria", "smoke_checks", "manual_qa_checklist"):
             entry[k] = _coerce_list(entry[k])
         entry["depends_on"] = sorted(set(
@@ -5528,6 +5531,386 @@ def generate_selected_feature_sprint_build_prompt(
     return prompt_text
 
 
+# ── Selected Feature Change Boundary ────────────────────────────────────────────
+# Existing App Upgrade must stay strictly inside the selected feature sprint's scope,
+# even when a regression/DeepSeek review surfaces broader, real issues elsewhere in
+# the app. This boundary is the single source of truth used by: the Claude fix
+# prompt's hard file boundary, the review-finding classifier (only
+# selected_sprint_actionable findings ever reach a fix prompt), and the post-build /
+# post-fix boundary check that gates Local Delivery.
+
+def _boundary_dirs_for(paths: list[str]) -> list[str]:
+    dirs: list[str] = []
+    for p in paths:
+        if any(ch in p for ch in "*?["):
+            continue
+        d = str(Path(p).parent)
+        if d and d != "." and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def generate_selected_feature_change_boundary(
+    selected_sprint: dict, plan_json: dict, additive_architecture: str,
+    build_prompt_text: str, run_dir,
+) -> dict:
+    """Deterministic — no GPT call. Derives the hard file/directory boundary for the
+    selected feature sprint from the sprint plan, the selected sprint scope, the
+    additive architecture, and the build prompt already written for it. Writes
+    selected_feature_change_boundary.json/.md."""
+    expected_create = selected_sprint.get("likely_files_created") or []
+    expected_modify = selected_sprint.get("likely_files_modified") or []
+    must_not_modify = selected_sprint.get("must_not_modify") or []
+    expected_deletions = selected_sprint.get("expected_deletions") or []
+
+    boundary = {
+        "sprint_number": selected_sprint.get("sprint_number"),
+        "sprint_title": selected_sprint.get("title", ""),
+        "acceptance_criteria": selected_sprint.get("completion_criteria") or [],
+        "expected_files_create": expected_create,
+        "expected_files_modify": expected_modify,
+        "allowed_directories": _boundary_dirs_for(expected_create + expected_modify),
+        "protected_existing_files": must_not_modify,
+        # No deletion of an existing file is allowed unless the sprint plan explicitly
+        # lists it here — Existing App Upgrade's no-delete-by-default rule.
+        "forbidden_deletes_default": True,
+        "expected_deletions": expected_deletions,
+        "source": [
+            "feature_sprint_plan.json",
+            "selected_feature_sprint_scope.md",
+            "additive_architecture.md" if additive_architecture else None,
+            "selected_feature_sprint_build_prompt.txt" if build_prompt_text else None,
+        ],
+    }
+    boundary["source"] = [s for s in boundary["source"] if s]
+
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "selected_feature_change_boundary.json").write_text(json.dumps(boundary, indent=2), encoding="utf-8")
+    (run_dir / "selected_feature_change_boundary.md").write_text(render_change_boundary_markdown(boundary), encoding="utf-8")
+    return boundary
+
+
+def render_change_boundary_markdown(boundary: dict) -> str:
+    lines = [
+        "# Selected Feature Change Boundary",
+        "",
+        f"**Sprint:** {boundary.get('sprint_number')} — {boundary.get('sprint_title', '')}",
+        "",
+        "## Expected Files To Create",
+    ]
+    lines += [f"- `{f}`" for f in boundary.get("expected_files_create") or ["(none specified)"]]
+    lines += ["", "## Expected Files To Modify"]
+    lines += [f"- `{f}`" for f in boundary.get("expected_files_modify") or ["(none specified)"]]
+    lines += ["", "## Allowed Directories"]
+    lines += [f"- `{d}`" for d in boundary.get("allowed_directories") or ["(none — only the exact files above)"]]
+    lines += ["", "## Protected Existing Files (must not modify)"]
+    lines += [f"- `{f}`" for f in boundary.get("protected_existing_files") or ["(none explicitly listed)"]]
+    lines += ["", "## Forbidden Deletes",
+              "All existing files are forbidden to delete by default."]
+    if boundary.get("expected_deletions"):
+        lines += [f"- Explicitly allowed deletion: `{f}`" for f in boundary["expected_deletions"]]
+    else:
+        lines.append("- No deletions are expected or allowed for this sprint.")
+    lines += ["", "## Acceptance Criteria"]
+    lines += [f"- {c}" for c in boundary.get("acceptance_criteria") or ["(not specified)"]]
+    lines += ["", "## Source Used To Infer This Boundary"]
+    lines += [f"- {s}" for s in boundary.get("source") or ["(unknown)"]]
+    return "\n".join(lines) + "\n"
+
+
+def check_selected_feature_boundary(changed_files: dict, boundary: dict) -> dict:
+    """Compares the actual added/modified/deleted files (from write_changed_files_report)
+    against the selected feature change boundary. Any deletion of an existing file is
+    always a high-severity violation unless explicitly listed in expected_deletions.
+
+    allowed_directories only relaxes where NEW files may be created — it does NOT excuse
+    modifying a pre-existing file that merely happens to live in an allowed directory.
+    That directory can (and usually does) contain unrelated existing files — e.g. an
+    allowed "src/components" directory for a new DemoDashboardCard.tsx must not excuse
+    edits to an unrelated src/components/figma/ImageWithFallback.tsx. Modifying a
+    pre-existing file is only ever in-boundary if it was explicitly predicted."""
+    expected_create = boundary.get("expected_files_create") or []
+    expected_modify = boundary.get("expected_files_modify") or []
+    allowed_dirs = boundary.get("allowed_directories") or []
+    expected_deletions = set(boundary.get("expected_deletions") or [])
+
+    def _new_file_in_boundary(path: str) -> bool:
+        if _path_matches_expected(path, expected_create):
+            return True
+        return any(path == d.rstrip("/") or path.startswith(d.rstrip("/") + "/") for d in allowed_dirs)
+
+    def _modified_file_in_boundary(path: str) -> bool:
+        return _path_matches_expected(path, expected_modify)
+
+    added = changed_files.get("added", [])
+    modified = changed_files.get("modified", [])
+    deleted = changed_files.get("deleted", [])
+
+    unexpected_files = sorted(
+        [p for p in added if not _new_file_in_boundary(p)]
+        + [p for p in modified if not _modified_file_in_boundary(p)]
+    )
+    unauthorized_deletions = sorted(p for p in deleted if p not in expected_deletions)
+
+    violations = [{"file": p, "type": "unauthorized_deletion", "severity": "high"} for p in unauthorized_deletions]
+    violations += [{"file": p, "type": "unexpected_change", "severity": "high"} for p in unexpected_files]
+
+    return {
+        "status": "FAIL" if violations else "PASS",
+        "unexpected_files": unexpected_files,
+        "deleted_files": deleted,
+        "unauthorized_deletions": unauthorized_deletions,
+        "violations": violations,
+    }
+
+
+def write_boundary_violation_report(boundary_result: dict, boundary: dict, run_dir) -> str:
+    lines = ["# Boundary Violation Report", "", f"**Status:** {boundary_result['status']}", ""]
+    if boundary_result["status"] == "PASS":
+        lines.append("No boundary violations detected.")
+    else:
+        lines += ["## Unauthorized Deletions (high severity)"]
+        lines += [f"- `{f}`" for f in boundary_result["unauthorized_deletions"] or ["(none)"]]
+        lines += ["", "## Unexpected Files Changed (outside the allowed boundary)"]
+        lines += [f"- `{f}`" for f in boundary_result["unexpected_files"] or ["(none)"]]
+        lines += [
+            "",
+            "## What This Means",
+            "Local Delivery and local commit creation are blocked for this run.",
+            "",
+            "## Recommendation",
+            "Review the changes above against selected_feature_change_boundary.md. If unrelated "
+            "files were modified or deleted, restore the target repo (e.g. `git checkout -- <file>` "
+            "or `git restore <file>`, or reset to the commit before this run) before re-running the "
+            "sprint build.",
+        ]
+    content = "\n".join(lines) + "\n"
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "boundary_violation_report.md").write_text(content, encoding="utf-8")
+    return content
+
+
+# ── Review Finding Classification ───────────────────────────────────────────────
+# Regression / DeepSeek review may legitimately surface real issues outside the
+# selected sprint (a broken existing auth flow, a stale config file, etc). That's
+# fine to report — but it must never silently slip into a fix pass. Every finding is
+# classified deterministically (no GPT call, so this is fully unit-testable without
+# network access) before a fix prompt is ever built.
+
+_REVIEW_FINDING_BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.*\S)\s*$")
+
+
+def parse_review_findings(report_text: str) -> list[str]:
+    """Extracts individual bullet/numbered findings from a freeform review report."""
+    findings = []
+    for line in (report_text or "").splitlines():
+        m = _REVIEW_FINDING_BULLET_RE.match(line)
+        if m:
+            text = m.group(1).strip()
+            if len(text) > 3:
+                findings.append(text)
+    return findings
+
+
+_REVIEW_CLASSIFICATION_STOPWORDS = {
+    "the", "a", "an", "to", "of", "in", "on", "for", "with", "and", "or", "is", "are",
+    "this", "that", "add", "new", "feature", "existing", "file", "files", "app", "sprint",
+    "must", "not", "modify", "create", "update", "build", "should", "be", "it", "its", "as",
+    "has", "have", "uses", "use", "old", "out", "scope",
+}
+
+
+def _tokenize_review_words(text: str) -> set[str]:
+    """Lowercased word set, splitting camelCase/PascalCase tokens (e.g. DemoDashboardCard
+    -> {demo, dashboard, card}) so sprint vocabulary overlap detection also catches
+    component/file names, not just plain English words."""
+    words: set[str] = set()
+    for token in re.findall(r"[A-Za-z]+", text or ""):
+        parts = re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+", token) or [token]
+        for p in parts:
+            w = p.lower()
+            if len(w) > 2 and w not in _REVIEW_CLASSIFICATION_STOPWORDS:
+                words.add(w)
+    return words
+
+
+def _selected_sprint_vocab(selected_sprint: dict) -> set[str]:
+    vocab: set[str] = set()
+    vocab |= _tokenize_review_words(selected_sprint.get("title", ""))
+    vocab |= _tokenize_review_words(selected_sprint.get("goal", ""))
+    for f in selected_sprint.get("features") or []:
+        vocab |= _tokenize_review_words(f)
+    for path in (selected_sprint.get("likely_files_created") or []) + (selected_sprint.get("likely_files_modified") or []):
+        vocab |= _tokenize_review_words(Path(path).stem)
+    return vocab
+
+
+_SENSITIVE_REVIEW_KEYWORDS = (
+    "auth", "login", "permission", "rbac", "encrypt", "credential", "password", "access control",
+)
+_REVIEW_PATH_TOKEN_RE = re.compile(r"`?([\w][\w\-./]*\.[A-Za-z]{1,5})`?")
+
+
+def classify_review_finding(text: str, boundary: dict, selected_sprint: dict) -> tuple[str, str]:
+    """Deterministic, rule-based classification into one of:
+    selected_sprint_actionable | out_of_scope_existing_app_issue | needs_human_review |
+    blocked_by_boundary. No GPT call — fully testable offline, and every decision carries
+    an auditable reason string."""
+    lower = text.lower()
+    vocab = _selected_sprint_vocab(selected_sprint)
+    overlap = _tokenize_review_words(text) & vocab
+
+    expected_all = (boundary.get("expected_files_create") or []) + (boundary.get("expected_files_modify") or [])
+    allowed_dirs = boundary.get("allowed_directories") or []
+    protected = boundary.get("protected_existing_files") or []
+
+    def _in_boundary(p: str) -> bool:
+        if _path_matches_expected(p, expected_all):
+            return True
+        return any(p == d.rstrip("/") or p.startswith(d.rstrip("/") + "/") for d in allowed_dirs)
+
+    path_matches = _REVIEW_PATH_TOKEN_RE.findall(text)
+    if path_matches:
+        if any(_path_matches_expected(p, protected) for p in path_matches):
+            return "blocked_by_boundary", f"Requests editing a protected existing file: `{path_matches[0]}`."
+        if any(_in_boundary(p) for p in path_matches):
+            return "selected_sprint_actionable", f"References a file inside the selected sprint boundary: `{path_matches[0]}`."
+        if not overlap:
+            return "out_of_scope_existing_app_issue", f"References an existing file outside the selected sprint boundary: `{path_matches[0]}`."
+
+    # A finding describing PRE-EXISTING app state ("Existing backend has no auth...") is an
+    # out-of-scope existing-app issue even when it mentions a sensitive keyword — it's a
+    # report, not a request. This check runs BEFORE the sensitive-keyword check below so
+    # "Existing X has no auth" doesn't get mistaken for "Request requires changing auth".
+    if "existing" in lower and not overlap:
+        return "out_of_scope_existing_app_issue", "Describes a pre-existing app issue unrelated to the selected sprint's files or features."
+
+    if any(k in lower for k in _SENSITIVE_REVIEW_KEYWORDS):
+        # Only treat this as in-scope if the SELECTED SPRINT ITSELF explicitly mentions a
+        # sensitive/auth-like term — incidental overlap on the feature name (e.g. "demo",
+        # "card") is not enough to justify touching auth/permissions/security.
+        sensitive_vocab = _tokenize_review_words(" ".join(_SENSITIVE_REVIEW_KEYWORDS))
+        if vocab & sensitive_vocab:
+            return "selected_sprint_actionable", "Mentions a sensitive area that the selected sprint explicitly covers."
+        return "needs_human_review", "Mentions auth/permissions/security outside the selected sprint scope — requires explicit human sign-off before any change."
+
+    if overlap:
+        return "selected_sprint_actionable", f"Overlaps with the selected sprint's scope (matched terms: {', '.join(sorted(overlap))})."
+
+    return ("out_of_scope_existing_app_issue",
+            "No reference to the selected sprint's files or feature vocabulary; treated as an "
+            "existing-app issue, not actionable for this sprint.")
+
+
+def classify_review_findings(report_text: str, boundary: dict, selected_sprint: dict) -> dict:
+    findings = parse_review_findings(report_text)
+    classified = []
+    counts = {"selected_sprint_actionable": 0, "out_of_scope_existing_app_issue": 0,
+              "needs_human_review": 0, "blocked_by_boundary": 0}
+    for text in findings:
+        category, reason = classify_review_finding(text, boundary, selected_sprint)
+        classified.append({"text": text, "category": category, "reason": reason})
+        counts[category] = counts.get(category, 0) + 1
+    return {"findings": classified, "counts": counts}
+
+
+def render_review_finding_classification_md(classification: dict) -> str:
+    lines = ["# Review Finding Classification", "", "## Counts"]
+    for k, v in classification["counts"].items():
+        lines.append(f"- {k}: {v}")
+    lines += ["", "## Findings"]
+    if not classification["findings"]:
+        lines.append("(No bullet-point findings were extracted from the review report.)")
+    for f in classification["findings"]:
+        lines += [f"### [{f['category']}] {f['text']}", f"- Reason: {f['reason']}", ""]
+    lines += [
+        "## Fix Pass Scope",
+        "Only findings classified as `selected_sprint_actionable` are included in the Claude fix "
+        "prompt. All other categories are intentionally skipped — they are out of scope for this "
+        "sprint, even when the underlying issue is real.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_review_finding_classification(classification: dict, run_dir) -> str:
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    md = render_review_finding_classification_md(classification)
+    (run_dir / "review_finding_classification.md").write_text(md, encoding="utf-8")
+    (run_dir / "review_finding_classification.json").write_text(json.dumps(classification, indent=2), encoding="utf-8")
+    return md
+
+
+def generate_existing_app_fix_prompt(
+    existing_app_summary: str, boundary: dict, classification: dict, fix_iteration: int,
+) -> str:
+    """Existing App Upgrade's own fix-prompt builder. Unlike generate_fix_prompt() (used
+    by the from-scratch MVP pipeline), this NEVER hands Claude the full raw review report
+    and NEVER omits a hard file boundary — only selected_sprint_actionable findings are
+    listed as things to fix, and every other finding is explicitly listed as off-limits."""
+    actionable = [f for f in classification["findings"] if f["category"] == "selected_sprint_actionable"]
+    skipped = [f for f in classification["findings"] if f["category"] != "selected_sprint_actionable"]
+
+    parts = [
+        f"# Existing App Upgrade — Fix Prompt (Iteration {fix_iteration})",
+        "",
+        "## CONTEXT: EXISTING APPLICATION",
+        "You are fixing issues in ONE selected feature sprint on top of an existing application. "
+        "Do not rewrite or clean up the rest of the app, even if you notice other problems.",
+        "",
+        existing_app_summary,
+        "",
+        f"## SELECTED SPRINT: {boundary.get('sprint_title', '')} (Sprint {boundary.get('sprint_number')})",
+        "",
+        "## HARD FILE BOUNDARY — DO NOT VIOLATE",
+        "### Allowed files (exact)",
+    ]
+    allowed_files = (boundary.get("expected_files_create") or []) + (boundary.get("expected_files_modify") or [])
+    parts += [f"- `{f}`" for f in allowed_files or ["(none specified — use the allowed directories below)"]]
+    parts += ["", "### Allowed directories"]
+    parts += [f"- `{d}`" for d in boundary.get("allowed_directories") or ["(none — exact files only)"]]
+    parts += ["", "### Forbidden files (must not touch)"]
+    parts += [f"- `{f}`" for f in boundary.get("protected_existing_files") or ["(none explicitly listed — still apply the rules below)"]]
+    parts += [
+        "",
+        "### Rules",
+        "- Do not delete existing files unless explicitly listed as expected deletion.",
+        "- Do not modify unrelated existing files.",
+        "- If a review finding requires editing outside this boundary, classify it as out of scope and do not change files.",
+        "- Only fix selected-sprint actionable issues.",
+    ]
+    if boundary.get("expected_deletions"):
+        parts += ["", "### Explicitly allowed deletions"]
+        parts += [f"- `{f}`" for f in boundary["expected_deletions"]]
+
+    parts += ["", "## ISSUES TO FIX (selected-sprint actionable only)"]
+    if actionable:
+        parts += [f"- {f['text']}" for f in actionable]
+    else:
+        parts.append("(No selected-sprint-actionable issues were found. Do not change any files.)")
+
+    if skipped:
+        parts += [
+            "", "## OUT-OF-SCOPE FINDINGS — DO NOT FIX",
+            "These were reported by review but are NOT part of this sprint. Leave them alone:",
+        ]
+        parts += [f"- [{f['category']}] {f['text']}" for f in skipped]
+
+    parts += [
+        "",
+        "## INSTRUCTIONS",
+        "Fix ONLY the issues listed under 'ISSUES TO FIX' above, and only by editing files inside "
+        "the hard file boundary above. Do not refactor working code. Do not add features not in the "
+        "selected sprint. Do not touch the out-of-scope findings listed above, even if they look easy "
+        "to fix.",
+        "After fixing, print a summary of every file you created, modified, or deleted, and confirm "
+        "each one is inside the allowed boundary.",
+    ]
+    return "\n".join(parts)
+
+
 # ── Regression Protection ──────────────────────────────────────────────────────
 
 def _hash_file(path: Path) -> str:
@@ -5652,11 +6035,21 @@ def run_regression_check(
     smoke_log: str = "",
     changed_files: dict | None = None,
     baseline_checklist: str = "",
+    boundary_result: dict | None = None,
+    review_classification: dict | None = None,
 ) -> tuple[str, str]:
     """
     Combines protected hashes, the complete file-change report, smoke evidence,
     known routes/endpoints, and sprint acceptance criteria. Untested behavior is
     always called out as manual verification required.
+
+    boundary_result (from check_selected_feature_boundary), when supplied, ALWAYS
+    forces FAIL if it reports a violation — a change boundary violation is never
+    merely a warning, since it means files outside the selected sprint were
+    created/modified/deleted. review_classification (from classify_review_findings),
+    when supplied, is reported so it's clear how many review findings were filtered
+    out as out-of-scope rather than silently dropped.
+
     Writes regression_check.md. Returns (status, report_text).
     """
     run_dir = Path(run_dir)
@@ -5706,7 +6099,8 @@ def run_regression_check(
                             or changed_files.get("sensitive_changes"))
     boundary_warn = bool(changed_files.get("unexpected") or changed_files.get("lockfile_changes")
                          or missing_new)
-    if high_risk_change or smoke_failed or changed or missing:
+    boundary_failed = bool(boundary_result and boundary_result.get("status") == "FAIL")
+    if high_risk_change or smoke_failed or changed or missing or boundary_failed:
         status = "FAIL"
     elif not smoke_executed or boundary_warn or not baseline_hashes:
         status = "WARN"
@@ -5751,8 +6145,31 @@ def run_regression_check(
               f"- Unexpected files changed: {len(changed_files.get('unexpected', []))}",
               f"- Deleted files: {len(changed_files.get('deleted', []))}",
               f"- Protected/risky files changed: {len(changed_files.get('protected_changes', []))}",
-              "- See changed_files_report.md for exact paths.", "",
-              "## Manual QA Still Required"]
+              "- See changed_files_report.md for exact paths.", ""]
+
+    lines += ["## Selected Feature Change Boundary"]
+    if boundary_result is None:
+        lines.append("- Not evaluated for this run.")
+    else:
+        lines.append(f"- **Boundary status:** {boundary_result['status']}")
+        lines.append(f"- Unexpected files changed (outside boundary): {len(boundary_result.get('unexpected_files', []))}")
+        lines.append(f"- Files deleted: {len(boundary_result.get('deleted_files', []))}")
+        lines.append(f"- Unauthorized deletions: {len(boundary_result.get('unauthorized_deletions', []))}")
+        lines.append(f"- Local Delivery blocked by boundary: {'Yes' if boundary_failed else 'No'}")
+        if boundary_result.get("violations"):
+            lines.append("- See boundary_violation_report.md for exact file-level violations.")
+    if review_classification is not None:
+        counts = review_classification.get("counts", {})
+        lines += [
+            "",
+            "## DeepSeek / Review Finding Filtering",
+            f"- selected_sprint_actionable: {counts.get('selected_sprint_actionable', 0)} (sent to the fix pass)",
+            f"- out_of_scope_existing_app_issue: {counts.get('out_of_scope_existing_app_issue', 0)} (filtered out, not fixed)",
+            f"- needs_human_review: {counts.get('needs_human_review', 0)} (filtered out, not fixed)",
+            f"- blocked_by_boundary: {counts.get('blocked_by_boundary', 0)} (filtered out, not fixed)",
+            "- See review_finding_classification.md for the per-finding breakdown.",
+        ]
+    lines += ["", "## Manual QA Still Required"]
     for item in selected_sprint.get("manual_qa_checklist") or ["Exercise the old routes/pages and the new feature end to end"]:
         lines.append(f"- [ ] {item}")
     lines += ["", "## Acceptance Recommendation"]
@@ -5792,6 +6209,12 @@ Bullet list, grounded in the regression check.
 ## Files Created / Modified / Deleted
 Summarize from the build output and regression check.
 
+## Change Boundary
+State whether the selected feature change boundary PASSED or FAILED, whether any unexpected
+files were changed, whether any files were deleted, whether any DeepSeek/review findings were
+filtered out as out-of-scope (and how many), and whether Local Delivery was blocked because of
+a boundary violation.
+
 ## Regression Result
 State the PASS/WARN/FAIL result and what it means without overclaiming.
 
@@ -5825,6 +6248,9 @@ def generate_feature_completion_report(
     smoke_log: str,
     run_dir,
     changed_files_report: str = "",
+    boundary_result: dict | None = None,
+    review_classification: dict | None = None,
+    local_delivery_blocked: bool = False,
 ) -> str:
     all_sprints = sorted(plan_json.get("sprints", []), key=lambda s: s.get("sprint_number", 0))
     n = selected_sprint.get("sprint_number")
@@ -5833,6 +6259,20 @@ def generate_feature_completion_report(
         f"Sprint {next_sprint.get('sprint_number')}: {next_sprint.get('title', '')}"
         if next_sprint else "(none — this was the last planned feature sprint)"
     )
+    if boundary_result is None:
+        boundary_facts = "Not evaluated for this run."
+    else:
+        counts = (review_classification or {}).get("counts", {})
+        boundary_facts = (
+            f"Boundary status: {boundary_result['status']}\n"
+            f"Unexpected files changed: {len(boundary_result.get('unexpected_files', []))}\n"
+            f"Files deleted: {len(boundary_result.get('deleted_files', []))}\n"
+            f"Unauthorized deletions: {len(boundary_result.get('unauthorized_deletions', []))}\n"
+            f"Out-of-scope review findings filtered out: {counts.get('out_of_scope_existing_app_issue', 0)}\n"
+            f"Needs-human-review findings filtered out: {counts.get('needs_human_review', 0)}\n"
+            f"Blocked-by-boundary findings filtered out: {counts.get('blocked_by_boundary', 0)}\n"
+            f"Local Delivery blocked by boundary: {'Yes' if local_delivery_blocked else 'No'}"
+        )
     report = gpt([
         {"role": "system", "content": FEATURE_COMPLETION_REPORT_SYSTEM},
         {"role": "user", "content": (
@@ -5844,6 +6284,7 @@ def generate_feature_completion_report(
             f"## CLAUDE CODE BUILD OUTPUT (tail)\n{build_output[-4000:]}\n\n"
             f"## REGRESSION STATUS: {regression_status}\n{regression_report}\n\n"
             f"## CHANGED FILES REPORT\n{changed_files_report}\n\n"
+            f"## CHANGE BOUNDARY FACTS\n{boundary_facts}\n\n"
             f"## SMOKE LOG\n{smoke_log[:2000]}\n\n"
             "Write the feature completion report."
         )},
@@ -6080,6 +6521,11 @@ def pipeline_existing_app_upgrade(
     snapshot_protected_files(existing_app_path, must_not_modify, rdir)
     snapshot_existing_files(existing_app_path, rdir)
 
+    print("▶ Step 11b  Deriving selected feature change boundary...")
+    boundary = generate_selected_feature_change_boundary(
+        selected_sprint, plan_json, additive_architecture, build_prompt_text, rdir,
+    )
+
     print(f"\n▶ Step 12  Claude Code — building Sprint {selected_feature_sprint} in place...")
     t0 = time.time()
     _update_state(run_id, {"current_step": "building", "status": "building"})
@@ -6087,7 +6533,7 @@ def pipeline_existing_app_upgrade(
     record_step_time(run_id, "built", t0)
     _update_state(run_id, {"status": "built"})
 
-    print("\n▶ Step 13  Regression check...")
+    print("\n▶ Step 13  Regression + change boundary check...")
     smoke_log = ""
     try:
         smoke_log = run_smoke_checks(run_id, existing_app_path)
@@ -6096,33 +6542,72 @@ def pipeline_existing_app_upgrade(
     save_artifact(run_id, "feature_sprint_smoke_log.txt", smoke_log)
     save_artifact(run_id, "smoke_test_log.txt", smoke_log)
     changed_files, changed_files_report = write_changed_files_report(existing_app_path, rdir, selected_sprint)
+    boundary_result = check_selected_feature_boundary(changed_files, boundary)
+    if boundary_result["status"] == "FAIL":
+        write_boundary_violation_report(boundary_result, boundary, rdir)
+        print(f"  ⚠️  Change boundary FAIL — {len(boundary_result['violations'])} violation(s) "
+              "outside the selected sprint (see boundary_violation_report.md).")
+    review_classification: dict | None = None
     regression_status, regression_report = run_regression_check(
         existing_app_path, rdir, selected_sprint, smoke_log, changed_files, baseline_checklist,
+        boundary_result=boundary_result,
     )
     print(f"  Regression result: {regression_status}")
     if regression_status == "FAIL":
         print("  ⚠️  WARNING: unexpected changes to protected files were detected.")
 
-    if use_deepseek and DEEPSEEK_API_KEY:
+    # Only attempt a fix pass (and only re-check the boundary after one) while the
+    # boundary is still clean — once it has FAILed, no further automated edits run;
+    # a human must restore the repo before retrying.
+    if use_deepseek and DEEPSEEK_API_KEY and boundary_result["status"] == "PASS":
         print("\n▶ Step 14  DeepSeek review (optional)...")
         deepseek_report = deepseek_attack_review(existing_app_summary, existing_app_path, smoke_log + "\n\n" + regression_report)
         save_artifact(run_id, "deepseek_attack_report.md", deepseek_report)
         if not is_approved(deepseek_report):
-            print("  Applying one fix iteration based on DeepSeek review...")
-            fix_prompt = generate_fix_prompt(existing_app_summary, existing_app_path, deepseek_report, 1)
-            apply_fixes(run_id, existing_app_path, fix_prompt, 1)
-            smoke_log = run_smoke_checks(run_id, existing_app_path)
-            save_artifact(run_id, "smoke_test_log.txt", smoke_log)
-            changed_files, changed_files_report = write_changed_files_report(existing_app_path, rdir, selected_sprint)
-            regression_status, regression_report = run_regression_check(
-                existing_app_path, rdir, selected_sprint, smoke_log, changed_files, baseline_checklist,
-            )
-            print(f"  Regression result after fix: {regression_status}")
+            review_classification = classify_review_findings(deepseek_report, boundary, selected_sprint)
+            write_review_finding_classification(review_classification, rdir)
+            actionable = review_classification["counts"]["selected_sprint_actionable"]
+            skipped = sum(v for k, v in review_classification["counts"].items() if k != "selected_sprint_actionable")
+            print(f"  Review findings: {actionable} selected-sprint-actionable, {skipped} skipped "
+                  "(out of scope / needs human review / blocked by boundary).")
+            if actionable > 0:
+                print("  Applying one fix iteration scoped to the selected sprint boundary...")
+                fix_prompt = generate_existing_app_fix_prompt(
+                    existing_app_summary, boundary, review_classification, 1,
+                )
+                apply_fixes(run_id, existing_app_path, fix_prompt, 1)
+                smoke_log = run_smoke_checks(run_id, existing_app_path)
+                save_artifact(run_id, "smoke_test_log.txt", smoke_log)
+                changed_files, changed_files_report = write_changed_files_report(existing_app_path, rdir, selected_sprint)
+                boundary_result = check_selected_feature_boundary(changed_files, boundary)
+                if boundary_result["status"] == "FAIL":
+                    write_boundary_violation_report(boundary_result, boundary, rdir)
+                    print(f"  ⚠️  Change boundary FAIL after fix pass — {len(boundary_result['violations'])} "
+                          "violation(s) outside the selected sprint.")
+                regression_status, regression_report = run_regression_check(
+                    existing_app_path, rdir, selected_sprint, smoke_log, changed_files, baseline_checklist,
+                    boundary_result=boundary_result, review_classification=review_classification,
+                )
+                print(f"  Regression result after fix: {regression_status}")
+            else:
+                print("  No selected-sprint-actionable issues found — skipping the fix pass entirely. "
+                      "All findings were out of scope, need human review, or are blocked by the boundary.")
+
+    local_delivery_blocked = boundary_result["status"] == "FAIL"
+    out_of_scope_count = (review_classification or {}).get("counts", {}).get("out_of_scope_existing_app_issue", 0)
+    _update_state(run_id, {
+        "change_boundary_status": boundary_result["status"],
+        "boundary_violation_count": len(boundary_result.get("violations", [])),
+        "out_of_scope_review_findings": out_of_scope_count,
+        "local_delivery_blocked_by_boundary": local_delivery_blocked,
+    })
 
     print("\n▶ Step 15  Writing feature completion report...")
     generate_feature_completion_report(
         existing_app_summary, plan_json, selected_sprint, build_output,
         regression_status, regression_report, smoke_log, rdir, changed_files_report,
+        boundary_result=boundary_result, review_classification=review_classification,
+        local_delivery_blocked=local_delivery_blocked,
     )
 
     _update_state(run_id, {"status": "done", "current_step": "done", "regression_status": regression_status})
@@ -6130,8 +6615,12 @@ def pipeline_existing_app_upgrade(
 
     print(f"\n{'='*60}")
     print("  Existing App Upgrade — Feature Sprint Complete")
-    print(f"  Run folder : {rdir}")
-    print(f"  Regression : {regression_status}")
+    print(f"  Run folder        : {rdir}")
+    print(f"  Regression        : {regression_status}")
+    print(f"  Change boundary   : {boundary_result['status']}")
+    if local_delivery_blocked:
+        print("  Local Delivery    : BLOCKED — a change boundary violation was detected. "
+              "See boundary_violation_report.md.")
     print("  Artifacts  :")
     for f in sorted(rdir.iterdir()):
         if f.is_file():
@@ -8797,6 +9286,16 @@ if __name__ == "__main__":
                 use_deepseek=not args.no_deepseek,
             )
             if args.local_git_delivery and not args.feature_plan_only:
+                upgrade_state = load_state(upgrade_run_id)
+                if upgrade_state.get("local_delivery_blocked_by_boundary"):
+                    print(f"\n{'='*60}")
+                    print("  Local Delivery — BLOCKED")
+                    print("  The selected feature change boundary FAILED for this run "
+                          f"({upgrade_state.get('boundary_violation_count', 0)} violation(s)). "
+                          "No branch, commit, or push was attempted.")
+                    print(f"  See {run_dir(upgrade_run_id) / 'boundary_violation_report.md'}")
+                    print(f"{'='*60}\n")
+                    sys.exit(1)
                 _run_delivery_step(run_dir(upgrade_run_id) / "delivery", run_label=f"{upgrade_run_id}")
         elif args.resume:
             resume_id = Path(args.resume).name

@@ -41,6 +41,12 @@ export interface RunDetail {
   continue_run?: string;
   continue_sprint?: number;
   continue_plan_only?: boolean;
+  // Selected Feature Change Boundary — set by pipeline_existing_app_upgrade after build
+  // and after any DeepSeek-driven fix pass. Used to gate Local Delivery.
+  change_boundary_status?: "PASS" | "FAIL" | null;
+  boundary_violation_count?: number;
+  out_of_scope_review_findings?: number;
+  local_delivery_blocked_by_boundary?: boolean;
 }
 
 export interface Artifact {
@@ -166,12 +172,20 @@ export interface DeliveryState {
   timestamp: number;
 }
 
+export interface DeliveryBoundaryInfo {
+  status: "PASS" | "FAIL" | null;
+  violation_count: number | null;
+  out_of_scope_review_findings: number | null;
+  blocked: boolean;
+}
+
 export interface DeliveryInfo {
   available: boolean;
   reason?: string;
   repo_path?: string;
   state: DeliveryState | null;
   artifacts?: string[];
+  boundary?: DeliveryBoundaryInfo;
 }
 
 export async function getDeliveryInfo(runId: string): Promise<DeliveryInfo> {

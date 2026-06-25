@@ -115,6 +115,11 @@ const ARTIFACT_LABELS: Record<string, string> = {
   "selected_feature_sprint_scope.md":  "Selected Feature Sprint Scope",
   "selected_feature_sprint_build_prompt.txt": "Selected Feature Sprint Build Prompt",
   "changed_files_report.md":           "Changed Files Report",
+  "selected_feature_change_boundary.md": "Selected Feature Change Boundary",
+  "selected_feature_change_boundary.json": "Selected Feature Change Boundary JSON",
+  "review_finding_classification.md":  "Review Finding Classification",
+  "review_finding_classification.json": "Review Finding Classification JSON",
+  "boundary_violation_report.md":      "Boundary Violation Report",
   "smoke_test_log.txt":                "Smoke Test Log",
   "regression_check.md":               "Regression Check",
   "feature_completion_report.md":      "Feature Completion Report",
@@ -1204,8 +1209,13 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "feature_sprint_plan.json", label: "Feature Sprint Plan JSON" },
   { file: "selected_feature_sprint_scope.md", label: "Selected Feature Sprint Scope" },
   { file: "selected_feature_sprint_build_prompt.txt", label: "Selected Feature Sprint Build Prompt" },
+  { file: "selected_feature_change_boundary.md", label: "Selected Feature Change Boundary" },
+  { file: "selected_feature_change_boundary.json", label: "Selected Feature Change Boundary JSON" },
   { file: "changed_files_report.md", label: "Changed Files Report" },
   { file: "smoke_test_log.txt", label: "Smoke Test Log" },
+  { file: "review_finding_classification.md", label: "Review Finding Classification" },
+  { file: "review_finding_classification.json", label: "Review Finding Classification JSON" },
+  { file: "boundary_violation_report.md", label: "Boundary Violation Report" },
   { file: "regression_check.md", label: "Regression Check" },
   { file: "feature_completion_report.md", label: "Feature Completion Report" },
 ];
@@ -1327,6 +1337,33 @@ function DeliveryStatusBadge({ decision }: { decision?: string | null }) {
   return <span className={`delivery-badge delivery-badge-${v.cls}`}>{v.label}</span>;
 }
 
+// Selected Feature Change Boundary summary — derived directly from run_state.json
+// fields written by pipeline_existing_app_upgrade. Shown above the Delivery card so
+// it's clear BEFORE looking at delivery whether the build/fix pass stayed in scope.
+function ChangeBoundaryBanner({ run }: { run: RunDetail | null }) {
+  const status = run?.change_boundary_status;
+  if (!status) return null;
+  const violations = run?.boundary_violation_count ?? 0;
+  const outOfScope = run?.out_of_scope_review_findings ?? 0;
+  const blocked = !!run?.local_delivery_blocked_by_boundary;
+  return (
+    <div className={`boundary-banner boundary-banner-${status === "FAIL" ? "fail" : "pass"}`}>
+      <div className="boundary-banner-row">
+        <span className={`delivery-badge delivery-badge-${status === "FAIL" ? "fail" : "ok"}`}>
+          Change Boundary: {status}
+        </span>
+        {blocked && <span className="delivery-badge delivery-badge-fail">Local Delivery blocked</span>}
+      </div>
+      <div className="boundary-banner-detail">
+        {status === "FAIL"
+          ? `${violations} file(s) outside the selected sprint were changed or deleted. See boundary_violation_report.md.`
+          : "All build and fix-pass changes stayed inside the selected sprint's file boundary."}
+        {outOfScope > 0 && ` ${outOfScope} review finding(s) were filtered out as out-of-scope and were not fixed.`}
+      </div>
+    </div>
+  );
+}
+
 function DeliveryCard({ runId }: { runId: string }) {
   const [info, setInfo] = useState<DeliveryInfo | null>(null);
   const [branchName, setBranchName] = useState(`pipeline/${runId}-delivery`);
@@ -1374,6 +1411,7 @@ function DeliveryCard({ runId }: { runId: string }) {
 
   const isCompanyRepo = precheck?.repo_type === "company-protected";
   const canPushSandbox = !!precheck && precheck.decision === "PASS_SANDBOX_PUSH";
+  const boundaryBlocked = !!info.boundary?.blocked;
 
   const doCommit = async () => {
     setBusy("commit"); setError(null);
@@ -1408,13 +1446,22 @@ function DeliveryCard({ runId }: { runId: string }) {
             Create a local branch/commit safely. Company repositories are never pushed unless explicitly allowed.
           </div>
         </div>
-        <DeliveryStatusBadge decision={info.state?.decision ?? precheck?.decision} />
+        <DeliveryStatusBadge decision={boundaryBlocked ? "BLOCKED" : (info.state?.decision ?? precheck?.decision)} />
       </div>
 
       <div className="delivery-repo-line">
         Target repo: <code>{info.repo_path}</code>
         {precheck && <span className={`delivery-repo-type delivery-repo-type-${precheck.repo_type}`}>{precheck.repo_type}</span>}
       </div>
+
+      {boundaryBlocked && (
+        <div className="delivery-warning-panel delivery-warning-panel-severe">
+          <strong>Local Delivery is blocked.</strong> The Selected Feature Change Boundary check
+          failed for this run{info.boundary?.violation_count ? ` (${info.boundary.violation_count} violation(s))` : ""} —
+          files outside the selected sprint were changed or deleted. No branch, commit, or push can
+          be created until this is resolved. See the Boundary Violation Report below.
+        </div>
+      )}
 
       {isCompanyRepo && (
         <div className="delivery-warning-panel">
@@ -1443,14 +1490,14 @@ function DeliveryCard({ runId }: { runId: string }) {
 
       <div className="delivery-actions">
         <div className="delivery-action">
-          <button className="submit-btn" disabled={busy !== null || !branchName || !commitMessage} onClick={doCommit}>
-            {busy === "commit" ? "Creating…" : "Create Local Commit"}
+          <button className="submit-btn" disabled={busy !== null || !branchName || !commitMessage || boundaryBlocked} onClick={doCommit}>
+            {boundaryBlocked ? "Blocked by change boundary" : busy === "commit" ? "Creating…" : "Create Local Commit"}
           </button>
           <div className="delivery-action-help">Creates a branch and commit on your machine only. Nothing is published to GitHub.</div>
         </div>
         <div className="delivery-action">
           <label className="delivery-sandbox-toggle">
-            <input type="checkbox" checked={sandboxPush} onChange={e => setSandboxPush(e.target.checked)} />
+            <input type="checkbox" checked={sandboxPush} onChange={e => setSandboxPush(e.target.checked)} disabled={boundaryBlocked} />
             Enable sandbox push for this attempt
           </label>
           {isCompanyRepo ? (
@@ -1466,11 +1513,11 @@ function DeliveryCard({ runId }: { runId: string }) {
             <>
               <button
                 className="submit-btn"
-                disabled={busy !== null || !sandboxPush || !canPushSandbox}
+                disabled={busy !== null || !sandboxPush || !canPushSandbox || boundaryBlocked}
                 onClick={doPush}
-                title={!canPushSandbox ? (precheck?.push_blocked_reasons.join("; ") || "Not eligible for sandbox push") : ""}
+                title={boundaryBlocked ? "Blocked by a change boundary violation" : !canPushSandbox ? (precheck?.push_blocked_reasons.join("; ") || "Not eligible for sandbox push") : ""}
               >
-                {busy === "push" ? "Pushing…" : "Push Sandbox Demo Branch"}
+                {boundaryBlocked ? "Blocked by change boundary" : busy === "push" ? "Pushing…" : "Push Sandbox Demo Branch"}
               </button>
               <div className="delivery-action-help">Only enabled for allowlisted sandbox repos. Never pushes OneHR/OneATS company repos.</div>
             </>
@@ -1575,6 +1622,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             </div>
             {planReady && <div className="sprint-mode-banner">Review the plan, then build exactly one selected feature sprint.</div>}
             {plan && <FeatureSprintRoadmap plan={plan} onBuild={planReady ? buildFromPlan : undefined} launching={launching} />}
+            <ChangeBoundaryBanner run={run} />
             <DeliveryCard runId={runId} />
           </div>
         </div>
