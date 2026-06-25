@@ -5665,7 +5665,14 @@ def check_selected_feature_boundary(changed_files: dict, boundary: dict) -> dict
     }
 
 
-def write_boundary_violation_report(boundary_result: dict, boundary: dict, run_dir) -> str:
+def write_boundary_violation_report(
+    boundary_result: dict, boundary: dict, run_dir, smoke_mutation_result: dict | None = None,
+) -> str:
+    """smoke_mutation_result (from write_smoke_mutation_report), when supplied, is used to
+    annotate which unexpected files were caused by smoke-check commands (e.g. npm install
+    rewriting package-lock.json) rather than by the Claude build itself — so this report
+    never blames the build for a mutation it didn't make."""
+    smoke_mutated_paths = {f["file"] for f in (smoke_mutation_result or {}).get("files", [])}
     lines = ["# Boundary Violation Report", "", f"**Status:** {boundary_result['status']}", ""]
     if boundary_result["status"] == "PASS":
         lines.append("No boundary violations detected.")
@@ -5673,18 +5680,35 @@ def write_boundary_violation_report(boundary_result: dict, boundary: dict, run_d
         lines += ["## Unauthorized Deletions (high severity)"]
         lines += [f"- `{f}`" for f in boundary_result["unauthorized_deletions"] or ["(none)"]]
         lines += ["", "## Unexpected Files Changed (outside the allowed boundary)"]
-        lines += [f"- `{f}`" for f in boundary_result["unexpected_files"] or ["(none)"]]
+        if boundary_result["unexpected_files"]:
+            for f in boundary_result["unexpected_files"]:
+                if f in smoke_mutated_paths:
+                    lines.append(f"- `{f}` — caused by a smoke-check command (e.g. `npm install`/`npm ci`), "
+                                 "NOT by the Claude build. See smoke_mutation_report.md.")
+                else:
+                    lines.append(f"- `{f}` — changed during the Claude build or fix pass.")
+        else:
+            lines.append("- (none)")
         lines += [
             "",
             "## What This Means",
             "Local Delivery and local commit creation are blocked for this run.",
             "",
             "## Recommendation",
-            "Review the changes above against selected_feature_change_boundary.md. If unrelated "
-            "files were modified or deleted, restore the target repo (e.g. `git checkout -- <file>` "
-            "or `git restore <file>`, or reset to the commit before this run) before re-running the "
-            "sprint build.",
         ]
+        if smoke_mutated_paths and smoke_mutated_paths.issuperset(boundary_result["unexpected_files"] or []):
+            lines += [
+                "Every unexpected file above was mutated by a smoke-check command, not by the build. "
+                f"Restore the target repo before rerunning: " +
+                "; ".join(f"`git restore {f}`" for f in sorted(smoke_mutated_paths)),
+            ]
+        else:
+            lines += [
+                "Review the changes above against selected_feature_change_boundary.md. If unrelated "
+                "files were modified or deleted, restore the target repo (e.g. `git checkout -- <file>` "
+                "or `git restore <file>`, or reset to the commit before this run) before re-running the "
+                "sprint build.",
+            ]
     content = "\n".join(lines) + "\n"
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -5952,9 +5976,7 @@ def snapshot_protected_files(existing_app_path: Path, must_not_modify: list[str]
     return record
 
 
-def snapshot_existing_files(existing_app_path: Path, run_dir) -> dict:
-    """Hash all ordinary source files before a build for complete change accountability."""
-    existing_app_path = Path(existing_app_path)
+def _hash_tree(existing_app_path: Path) -> dict[str, dict]:
     files: dict[str, dict] = {}
     for path in existing_app_path.rglob("*"):
         if not path.is_file() or any(part in _SCAN_IGNORE_DIRS for part in path.relative_to(existing_app_path).parts):
@@ -5966,9 +5988,28 @@ def snapshot_existing_files(existing_app_path: Path, run_dir) -> dict:
             }
         except OSError:
             continue
-    record = {"root": str(existing_app_path), "files": files}
+    return files
+
+
+def snapshot_existing_files(existing_app_path: Path, run_dir) -> dict:
+    """Hash all ordinary source files before a build for complete change accountability."""
+    existing_app_path = Path(existing_app_path)
+    record = {"root": str(existing_app_path), "files": _hash_tree(existing_app_path)}
     run_dir = Path(run_dir)
     (run_dir / "baseline_file_snapshot.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return record
+
+
+def snapshot_post_build_files(existing_app_path: Path, run_dir) -> dict:
+    """Hash the tree again right after the Claude build (or a fix pass) finishes, but
+    BEFORE smoke checks run. Comparing this snapshot to the post-smoke tree isolates
+    mutations caused by smoke-check commands themselves (e.g. `npm install` rewriting
+    package-lock.json) from changes the build/fix pass made. Writes
+    post_build_file_snapshot.json."""
+    existing_app_path = Path(existing_app_path)
+    record = {"root": str(existing_app_path), "files": _hash_tree(existing_app_path)}
+    run_dir = Path(run_dir)
+    (run_dir / "post_build_file_snapshot.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     return record
 
 
@@ -6028,6 +6069,125 @@ def write_changed_files_report(existing_app_path: Path, run_dir, selected_sprint
     return result, content
 
 
+# ── Smoke Mutation Detection ─────────────────────────────────────────────────
+# Smoke checks for Existing App Upgrade run real install/build commands (npm
+# install, pip install, ...) against the REAL target repo. Those commands can
+# rewrite tracked files (most commonly a lockfile) even when the smoke check
+# itself "passes" and even when the Claude build stayed perfectly inside its
+# boundary. Comparing the post-build (pre-smoke) snapshot to the post-smoke tree
+# isolates exactly which files smoke checks touched, so the build is never
+# blamed for a mutation the smoke-check command caused.
+
+_INSTALL_ARTIFACT_FILENAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml"}
+
+
+def _likely_smoke_mutation_cause(path: str, smoke_log: str) -> str:
+    name = Path(path).name
+    if name == "package-lock.json":
+        return "npm install/ci run during the Node smoke check"
+    if name == "yarn.lock":
+        return "yarn install run during the Node smoke check"
+    if name == "pnpm-lock.yaml":
+        return "pnpm install run during the Node smoke check"
+    if name in ("Pipfile.lock", "poetry.lock"):
+        return "pip/pipenv/poetry install run during the Python smoke check"
+    if re.search(r"npm (install|ci)|yarn install|pnpm install|pip install", smoke_log or "", re.I):
+        return "an install command in the smoke check log"
+    return "unknown — not attributable to a specific smoke-check command from the log"
+
+
+def write_smoke_mutation_report(
+    existing_app_path: Path, run_dir, boundary: dict | None = None, smoke_log: str = "",
+) -> tuple[dict, str]:
+    """Compares the post_build_file_snapshot.json (taken right after the build/fix pass,
+    before smoke checks ran) against the current on-disk state. Any difference was caused
+    by the smoke-check commands themselves, not by Claude. Writes smoke_mutation_report.md
+    and smoke_mutation_report.json. Returns (result, markdown)."""
+    existing_app_path, run_dir = Path(existing_app_path), Path(run_dir)
+    post_build = _safe_read_json(run_dir / "post_build_file_snapshot.json").get("files", {})
+    current = _hash_tree(existing_app_path)
+    current_hashes = {p: v["sha256"] for p, v in current.items()}
+
+    added = sorted(set(current_hashes) - set(post_build))
+    deleted = sorted(set(post_build) - set(current_hashes))
+    modified = sorted(p for p in set(current_hashes) & set(post_build)
+                      if current_hashes[p] != post_build[p].get("sha256"))
+    mutated = sorted(added + modified + deleted)
+
+    expected_all = ((boundary or {}).get("expected_files_create") or []) + \
+                   ((boundary or {}).get("expected_files_modify") or [])
+
+    files: list[dict] = []
+    for path in mutated:
+        change_type = "added" if path in added else ("deleted" if path in deleted else "modified")
+        files.append({
+            "file": path,
+            "change_type": change_type,
+            "in_selected_feature_boundary": _path_matches_expected(path, expected_all),
+            "is_known_install_artifact": Path(path).name in _INSTALL_ARTIFACT_FILENAMES,
+            "likely_cause": _likely_smoke_mutation_cause(path, smoke_log),
+        })
+
+    mutation_detected = bool(mutated)
+    out_of_boundary_files = [f["file"] for f in files if not f["in_selected_feature_boundary"]]
+    only_known_install_artifacts = mutation_detected and all(f["is_known_install_artifact"] for f in files)
+    mutation_allowed = mutation_detected and not out_of_boundary_files
+    should_fail_regression = mutation_detected and bool(out_of_boundary_files)
+    status = "PASS" if not mutation_detected else ("FAIL" if should_fail_regression else "WARN")
+
+    result = {
+        "status": status,
+        "mutation_detected": mutation_detected,
+        "files": files,
+        "out_of_boundary_files": out_of_boundary_files,
+        "mutation_allowed": mutation_allowed,
+        "should_fail_regression": should_fail_regression,
+        "only_known_install_artifacts": only_known_install_artifacts,
+    }
+
+    lines = ["# Smoke Mutation Report", "", f"**Status:** {status}", "",
+             "Detects whether running smoke checks (e.g. `npm install`, `pip install`) changed "
+             "any tracked file AFTER the build/fix pass finished, so a lockfile or config rewrite "
+             "caused by the smoke-check command itself is never mistaken for a Claude build change.",
+             ""]
+    if not mutation_detected:
+        lines.append("No tracked files were changed by smoke checks.")
+    else:
+        lines.append("## Files Changed By Smoke Checks (after the build, before this report)")
+        for f in files:
+            lines.append(
+                f"- `{f['file']}` ({f['change_type']}) — likely cause: {f['likely_cause']}; "
+                f"in selected feature boundary: {'Yes' if f['in_selected_feature_boundary'] else 'No'}"
+            )
+        lines += [
+            "",
+            "## Verdict",
+            f"- Mutation allowed: {'Yes' if mutation_allowed else 'No'}",
+            f"- Should fail regression: {'Yes' if should_fail_regression else 'No'}",
+        ]
+        if should_fail_regression:
+            lines += [
+                "",
+                "## What This Means",
+                "Smoke checks modified one or more tracked files outside the selected feature "
+                "boundary. This is a regression failure caused by the smoke-check command itself, "
+                "NOT by the Claude build — Local Delivery and local commit creation are blocked for "
+                "this run.",
+            ]
+        if only_known_install_artifacts:
+            lines += [
+                "",
+                "## Recommendation",
+                "Only known install artifacts (lockfiles) were mutated by smoke checks — this is not "
+                "a build defect. Restore the target repo before rerunning:",
+            ]
+            lines += [f"- `git restore {f['file']}`" for f in files]
+    content = "\n".join(lines) + "\n"
+    (run_dir / "smoke_mutation_report.md").write_text(content, encoding="utf-8")
+    (run_dir / "smoke_mutation_report.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result, content
+
+
 def run_regression_check(
     existing_app_path: Path,
     run_dir,
@@ -6037,6 +6197,7 @@ def run_regression_check(
     baseline_checklist: str = "",
     boundary_result: dict | None = None,
     review_classification: dict | None = None,
+    smoke_mutation_result: dict | None = None,
 ) -> tuple[str, str]:
     """
     Combines protected hashes, the complete file-change report, smoke evidence,
@@ -6048,7 +6209,10 @@ def run_regression_check(
     merely a warning, since it means files outside the selected sprint were
     created/modified/deleted. review_classification (from classify_review_findings),
     when supplied, is reported so it's clear how many review findings were filtered
-    out as out-of-scope rather than silently dropped.
+    out as out-of-scope rather than silently dropped. smoke_mutation_result (from
+    write_smoke_mutation_report), when supplied, ALSO forces FAIL if smoke checks
+    mutated a tracked file outside the selected feature boundary — that's a
+    smoke-check-induced regression, not a build defect, but it is still a regression.
 
     Writes regression_check.md. Returns (status, report_text).
     """
@@ -6100,7 +6264,8 @@ def run_regression_check(
     boundary_warn = bool(changed_files.get("unexpected") or changed_files.get("lockfile_changes")
                          or missing_new)
     boundary_failed = bool(boundary_result and boundary_result.get("status") == "FAIL")
-    if high_risk_change or smoke_failed or changed or missing or boundary_failed:
+    smoke_mutation_failed = bool(smoke_mutation_result and smoke_mutation_result.get("should_fail_regression"))
+    if high_risk_change or smoke_failed or changed or missing or boundary_failed or smoke_mutation_failed:
         status = "FAIL"
     elif not smoke_executed or boundary_warn or not baseline_hashes:
         status = "WARN"
@@ -6158,6 +6323,18 @@ def run_regression_check(
         lines.append(f"- Local Delivery blocked by boundary: {'Yes' if boundary_failed else 'No'}")
         if boundary_result.get("violations"):
             lines.append("- See boundary_violation_report.md for exact file-level violations.")
+
+    lines += ["", "## Smoke-Induced Mutations"]
+    if smoke_mutation_result is None:
+        lines.append("- Not evaluated for this run.")
+    else:
+        lines.append(f"- **Smoke mutation status:** {smoke_mutation_result.get('status', 'UNKNOWN')}")
+        lines.append(f"- Tracked files changed by smoke checks (after the build finished): {len(smoke_mutation_result.get('files', []))}")
+        lines.append(f"- Mutation allowed: {'Yes' if smoke_mutation_result.get('mutation_allowed') else 'No'}")
+        lines.append(f"- Local Delivery blocked by smoke mutation: {'Yes' if smoke_mutation_failed else 'No'}")
+        if smoke_mutation_result.get("files"):
+            lines.append("- See smoke_mutation_report.md for exact files and likely cause per file — "
+                         "these changes happened AFTER the build finished and are not Claude build changes.")
     if review_classification is not None:
         counts = review_classification.get("counts", {})
         lines += [
@@ -6221,6 +6398,13 @@ State the PASS/WARN/FAIL result and what it means without overclaiming.
 ## Smoke Check Result
 State the result if available, or "Not run."
 
+## Smoke Mutation
+State whether smoke checks (e.g. `npm install`/`npm ci`, `pip install`) changed any tracked file
+AFTER the build finished, which file(s) if any, whether those were known install artifacts like
+package-lock.json, and whether Local Delivery was blocked because of it. Be explicit that a
+smoke-induced mutation is NOT a Claude build defect — attribute it to the smoke-check command, not
+the build, even when it still blocks delivery.
+
 ## What Was Intentionally Not Touched
 Bullet list, from the must_not_modify list.
 
@@ -6251,6 +6435,7 @@ def generate_feature_completion_report(
     boundary_result: dict | None = None,
     review_classification: dict | None = None,
     local_delivery_blocked: bool = False,
+    smoke_mutation_result: dict | None = None,
 ) -> str:
     all_sprints = sorted(plan_json.get("sprints", []), key=lambda s: s.get("sprint_number", 0))
     n = selected_sprint.get("sprint_number")
@@ -6273,6 +6458,16 @@ def generate_feature_completion_report(
             f"Blocked-by-boundary findings filtered out: {counts.get('blocked_by_boundary', 0)}\n"
             f"Local Delivery blocked by boundary: {'Yes' if local_delivery_blocked else 'No'}"
         )
+    if smoke_mutation_result is None:
+        smoke_mutation_facts = "Not evaluated for this run."
+    else:
+        smoke_mutation_facts = (
+            f"Smoke mutation status: {smoke_mutation_result.get('status', 'UNKNOWN')}\n"
+            f"Tracked files changed by smoke checks (after build): {len(smoke_mutation_result.get('files', []))}\n"
+            f"Files: {[f['file'] for f in smoke_mutation_result.get('files', [])]}\n"
+            f"Only known install artifacts (e.g. lockfiles): {'Yes' if smoke_mutation_result.get('only_known_install_artifacts') else 'No'}\n"
+            f"Local Delivery blocked by smoke mutation: {'Yes' if smoke_mutation_result.get('should_fail_regression') else 'No'}"
+        )
     report = gpt([
         {"role": "system", "content": FEATURE_COMPLETION_REPORT_SYSTEM},
         {"role": "user", "content": (
@@ -6285,6 +6480,7 @@ def generate_feature_completion_report(
             f"## REGRESSION STATUS: {regression_status}\n{regression_report}\n\n"
             f"## CHANGED FILES REPORT\n{changed_files_report}\n\n"
             f"## CHANGE BOUNDARY FACTS\n{boundary_facts}\n\n"
+            f"## SMOKE MUTATION FACTS\n{smoke_mutation_facts}\n\n"
             f"## SMOKE LOG\n{smoke_log[:2000]}\n\n"
             "Write the feature completion report."
         )},
@@ -6361,20 +6557,29 @@ def pipeline_continue_feature_sprint(
     snapshot_existing_files(existing_app_path, rdir)
     _update_state(run_id, {"current_step": "building", "status": "building"})
     build_output = build_feature_sprint(run_id, existing_app_path, prompt)
+    snapshot_post_build_files(existing_app_path, rdir)
     try:
         smoke_log = run_smoke_checks(run_id, existing_app_path)
     except Exception as exc:
         smoke_log = f"Smoke checks could not run: {exc}"
     save_artifact(run_id, "smoke_test_log.txt", smoke_log)
+    smoke_mutation_result, _ = write_smoke_mutation_report(existing_app_path, rdir, None, smoke_log)
     changed, changed_report = write_changed_files_report(existing_app_path, rdir, selected_sprint)
     status, regression = run_regression_check(
         existing_app_path, rdir, selected_sprint, smoke_log, changed, checklist,
+        smoke_mutation_result=smoke_mutation_result,
     )
     generate_feature_completion_report(
         summary, plan_json, selected_sprint, build_output, status, regression,
-        smoke_log, rdir, changed_report,
+        smoke_log, rdir, changed_report, smoke_mutation_result=smoke_mutation_result,
     )
-    _update_state(run_id, {"status": "done", "current_step": "done", "regression_status": status})
+    _update_state(run_id, {
+        "status": "done", "current_step": "done", "regression_status": status,
+        "smoke_mutation_status": smoke_mutation_result.get("status"),
+        "smoke_mutation_file_count": len(smoke_mutation_result.get("files", [])),
+        "smoke_mutation_blocked_delivery": smoke_mutation_result.get("should_fail_regression", False),
+        "local_delivery_blocked_by_boundary": smoke_mutation_result.get("should_fail_regression", False),
+    })
     return run_id
 
 
@@ -6532,6 +6737,11 @@ def pipeline_existing_app_upgrade(
     build_output = build_feature_sprint(run_id, existing_app_path, build_prompt_text)
     record_step_time(run_id, "built", t0)
     _update_state(run_id, {"status": "built"})
+    # Snapshot the tree right after the build, BEFORE smoke checks run, so any file
+    # that differs between this snapshot and the post-smoke tree was changed by the
+    # smoke-check commands themselves (e.g. `npm install` rewriting package-lock.json),
+    # never by Claude.
+    snapshot_post_build_files(existing_app_path, rdir)
 
     print("\n▶ Step 13  Regression + change boundary check...")
     smoke_log = ""
@@ -6541,16 +6751,20 @@ def pipeline_existing_app_upgrade(
         smoke_log = f"Smoke checks could not run: {e}"
     save_artifact(run_id, "feature_sprint_smoke_log.txt", smoke_log)
     save_artifact(run_id, "smoke_test_log.txt", smoke_log)
+    smoke_mutation_result, _ = write_smoke_mutation_report(existing_app_path, rdir, boundary, smoke_log)
+    if smoke_mutation_result["mutation_detected"]:
+        print(f"  ⚠️  Smoke checks mutated {len(smoke_mutation_result['files'])} tracked file(s) "
+              "after the build finished (see smoke_mutation_report.md).")
     changed_files, changed_files_report = write_changed_files_report(existing_app_path, rdir, selected_sprint)
     boundary_result = check_selected_feature_boundary(changed_files, boundary)
     if boundary_result["status"] == "FAIL":
-        write_boundary_violation_report(boundary_result, boundary, rdir)
+        write_boundary_violation_report(boundary_result, boundary, rdir, smoke_mutation_result)
         print(f"  ⚠️  Change boundary FAIL — {len(boundary_result['violations'])} violation(s) "
               "outside the selected sprint (see boundary_violation_report.md).")
     review_classification: dict | None = None
     regression_status, regression_report = run_regression_check(
         existing_app_path, rdir, selected_sprint, smoke_log, changed_files, baseline_checklist,
-        boundary_result=boundary_result,
+        boundary_result=boundary_result, smoke_mutation_result=smoke_mutation_result,
     )
     print(f"  Regression result: {regression_status}")
     if regression_status == "FAIL":
@@ -6576,30 +6790,40 @@ def pipeline_existing_app_upgrade(
                     existing_app_summary, boundary, review_classification, 1,
                 )
                 apply_fixes(run_id, existing_app_path, fix_prompt, 1)
+                snapshot_post_build_files(existing_app_path, rdir)
                 smoke_log = run_smoke_checks(run_id, existing_app_path)
                 save_artifact(run_id, "smoke_test_log.txt", smoke_log)
+                smoke_mutation_result, _ = write_smoke_mutation_report(existing_app_path, rdir, boundary, smoke_log)
+                if smoke_mutation_result["mutation_detected"]:
+                    print(f"  ⚠️  Smoke checks mutated {len(smoke_mutation_result['files'])} tracked file(s) "
+                          "after the fix pass finished (see smoke_mutation_report.md).")
                 changed_files, changed_files_report = write_changed_files_report(existing_app_path, rdir, selected_sprint)
                 boundary_result = check_selected_feature_boundary(changed_files, boundary)
                 if boundary_result["status"] == "FAIL":
-                    write_boundary_violation_report(boundary_result, boundary, rdir)
+                    write_boundary_violation_report(boundary_result, boundary, rdir, smoke_mutation_result)
                     print(f"  ⚠️  Change boundary FAIL after fix pass — {len(boundary_result['violations'])} "
                           "violation(s) outside the selected sprint.")
                 regression_status, regression_report = run_regression_check(
                     existing_app_path, rdir, selected_sprint, smoke_log, changed_files, baseline_checklist,
                     boundary_result=boundary_result, review_classification=review_classification,
+                    smoke_mutation_result=smoke_mutation_result,
                 )
                 print(f"  Regression result after fix: {regression_status}")
             else:
                 print("  No selected-sprint-actionable issues found — skipping the fix pass entirely. "
                       "All findings were out of scope, need human review, or are blocked by the boundary.")
 
-    local_delivery_blocked = boundary_result["status"] == "FAIL"
+    smoke_mutation_blocked = bool(smoke_mutation_result.get("should_fail_regression"))
+    local_delivery_blocked = boundary_result["status"] == "FAIL" or smoke_mutation_blocked
     out_of_scope_count = (review_classification or {}).get("counts", {}).get("out_of_scope_existing_app_issue", 0)
     _update_state(run_id, {
         "change_boundary_status": boundary_result["status"],
         "boundary_violation_count": len(boundary_result.get("violations", [])),
         "out_of_scope_review_findings": out_of_scope_count,
         "local_delivery_blocked_by_boundary": local_delivery_blocked,
+        "smoke_mutation_status": smoke_mutation_result.get("status"),
+        "smoke_mutation_file_count": len(smoke_mutation_result.get("files", [])),
+        "smoke_mutation_blocked_delivery": smoke_mutation_blocked,
     })
 
     print("\n▶ Step 15  Writing feature completion report...")
@@ -6607,7 +6831,7 @@ def pipeline_existing_app_upgrade(
         existing_app_summary, plan_json, selected_sprint, build_output,
         regression_status, regression_report, smoke_log, rdir, changed_files_report,
         boundary_result=boundary_result, review_classification=review_classification,
-        local_delivery_blocked=local_delivery_blocked,
+        local_delivery_blocked=local_delivery_blocked, smoke_mutation_result=smoke_mutation_result,
     )
 
     _update_state(run_id, {"status": "done", "current_step": "done", "regression_status": regression_status})
@@ -6618,9 +6842,13 @@ def pipeline_existing_app_upgrade(
     print(f"  Run folder        : {rdir}")
     print(f"  Regression        : {regression_status}")
     print(f"  Change boundary   : {boundary_result['status']}")
+    print(f"  Smoke mutation    : {smoke_mutation_result.get('status')}")
     if local_delivery_blocked:
-        print("  Local Delivery    : BLOCKED — a change boundary violation was detected. "
-              "See boundary_violation_report.md.")
+        reason = "a change boundary violation" if boundary_result["status"] == "FAIL" else ""
+        if smoke_mutation_blocked:
+            reason = (reason + " and " if reason else "") + "a smoke-check-induced mutation of tracked files"
+        print(f"  Local Delivery    : BLOCKED — {reason} was detected. "
+              "See boundary_violation_report.md / smoke_mutation_report.md.")
     print("  Artifacts  :")
     for f in sorted(rdir.iterdir()):
         if f.is_file():

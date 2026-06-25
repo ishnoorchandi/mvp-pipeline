@@ -121,6 +121,8 @@ const ARTIFACT_LABELS: Record<string, string> = {
   "review_finding_classification.json": "Review Finding Classification JSON",
   "boundary_violation_report.md":      "Boundary Violation Report",
   "smoke_test_log.txt":                "Smoke Test Log",
+  "smoke_mutation_report.md":          "Smoke Mutation Report",
+  "smoke_mutation_report.json":        "Smoke Mutation Report JSON",
   "regression_check.md":               "Regression Check",
   "feature_completion_report.md":      "Feature Completion Report",
   "continuation_source.md":            "Continuation Source",
@@ -1213,6 +1215,8 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "selected_feature_change_boundary.json", label: "Selected Feature Change Boundary JSON" },
   { file: "changed_files_report.md", label: "Changed Files Report" },
   { file: "smoke_test_log.txt", label: "Smoke Test Log" },
+  { file: "smoke_mutation_report.md", label: "Smoke Mutation Report" },
+  { file: "smoke_mutation_report.json", label: "Smoke Mutation Report JSON" },
   { file: "review_finding_classification.md", label: "Review Finding Classification" },
   { file: "review_finding_classification.json", label: "Review Finding Classification JSON" },
   { file: "boundary_violation_report.md", label: "Boundary Violation Report" },
@@ -1364,6 +1368,35 @@ function ChangeBoundaryBanner({ run }: { run: RunDetail | null }) {
   );
 }
 
+// Smoke Mutation — fields written by pipeline_existing_app_upgrade after smoke checks run.
+// Detects whether the smoke-check commands themselves (e.g. `npm install`/`npm ci`) changed a
+// tracked file — kept separate from ChangeBoundaryBanner so a lockfile rewrite caused by smoke
+// is never read as "the build broke the boundary."
+function SmokeMutationBanner({ run }: { run: RunDetail | null }) {
+  const status = run?.smoke_mutation_status;
+  if (!status) return null;
+  const fileCount = run?.smoke_mutation_file_count ?? 0;
+  const blocked = !!run?.smoke_mutation_blocked_delivery;
+  const badgeClass = status === "FAIL" ? "fail" : status === "WARN" ? "warn" : "ok";
+  return (
+    <div className={`boundary-banner boundary-banner-${status === "FAIL" ? "fail" : "pass"}`}>
+      <div className="boundary-banner-row">
+        <span className={`delivery-badge delivery-badge-${badgeClass}`}>
+          Smoke Mutation: {status}
+        </span>
+        {blocked && <span className="delivery-badge delivery-badge-fail">Local Delivery blocked</span>}
+      </div>
+      <div className="boundary-banner-detail">
+        {status === "PASS"
+          ? "Smoke checks (npm install / pip install, etc.) did not change any tracked file."
+          : `Smoke checks changed ${fileCount} tracked file(s) after the build finished — not a Claude `
+            + `build change. See smoke_mutation_report.md.`}
+        {status === "FAIL" && " This is outside the selected feature boundary and blocks Local Delivery."}
+      </div>
+    </div>
+  );
+}
+
 function DeliveryCard({ runId }: { runId: string }) {
   const [info, setInfo] = useState<DeliveryInfo | null>(null);
   const [branchName, setBranchName] = useState(`pipeline/${runId}-delivery`);
@@ -1411,7 +1444,8 @@ function DeliveryCard({ runId }: { runId: string }) {
 
   const isCompanyRepo = precheck?.repo_type === "company-protected";
   const canPushSandbox = !!precheck && precheck.decision === "PASS_SANDBOX_PUSH";
-  const boundaryBlocked = !!info.boundary?.blocked;
+  const smokeMutationBlocked = !!info.smoke_mutation?.blocked;
+  const boundaryBlocked = !!info.boundary?.blocked || smokeMutationBlocked;
 
   const doCommit = async () => {
     setBusy("commit"); setError(null);
@@ -1456,10 +1490,21 @@ function DeliveryCard({ runId }: { runId: string }) {
 
       {boundaryBlocked && (
         <div className="delivery-warning-panel delivery-warning-panel-severe">
-          <strong>Local Delivery is blocked.</strong> The Selected Feature Change Boundary check
-          failed for this run{info.boundary?.violation_count ? ` (${info.boundary.violation_count} violation(s))` : ""} —
-          files outside the selected sprint were changed or deleted. No branch, commit, or push can
-          be created until this is resolved. See the Boundary Violation Report below.
+          <strong>Local Delivery is blocked.</strong>{" "}
+          {info.boundary?.blocked && (
+            <>
+              The Selected Feature Change Boundary check failed for this run
+              {info.boundary?.violation_count ? ` (${info.boundary.violation_count} violation(s))` : ""} —
+              files outside the selected sprint were changed or deleted.{" "}
+            </>
+          )}
+          {smokeMutationBlocked && (
+            <>
+              Smoke checks (e.g. <code>npm install</code>) mutated {info.smoke_mutation?.file_count ?? "some"} tracked
+              file(s) outside the selected feature boundary after the build finished — see smoke_mutation_report.md.{" "}
+            </>
+          )}
+          No branch, commit, or push can be created until this is resolved.
         </div>
       )}
 
@@ -1491,7 +1536,7 @@ function DeliveryCard({ runId }: { runId: string }) {
       <div className="delivery-actions">
         <div className="delivery-action">
           <button className="submit-btn" disabled={busy !== null || !branchName || !commitMessage || boundaryBlocked} onClick={doCommit}>
-            {boundaryBlocked ? "Blocked by change boundary" : busy === "commit" ? "Creating…" : "Create Local Commit"}
+            {boundaryBlocked ? "Blocked — see warning above" : busy === "commit" ? "Creating…" : "Create Local Commit"}
           </button>
           <div className="delivery-action-help">Creates a branch and commit on your machine only. Nothing is published to GitHub.</div>
         </div>
@@ -1515,9 +1560,9 @@ function DeliveryCard({ runId }: { runId: string }) {
                 className="submit-btn"
                 disabled={busy !== null || !sandboxPush || !canPushSandbox || boundaryBlocked}
                 onClick={doPush}
-                title={boundaryBlocked ? "Blocked by a change boundary violation" : !canPushSandbox ? (precheck?.push_blocked_reasons.join("; ") || "Not eligible for sandbox push") : ""}
+                title={boundaryBlocked ? "Blocked — see warning above" : !canPushSandbox ? (precheck?.push_blocked_reasons.join("; ") || "Not eligible for sandbox push") : ""}
               >
-                {boundaryBlocked ? "Blocked by change boundary" : busy === "push" ? "Pushing…" : "Push Sandbox Demo Branch"}
+                {boundaryBlocked ? "Blocked — see warning above" : busy === "push" ? "Pushing…" : "Push Sandbox Demo Branch"}
               </button>
               <div className="delivery-action-help">Only enabled for allowlisted sandbox repos. Never pushes OneHR/OneATS company repos.</div>
             </>
@@ -1623,6 +1668,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             {planReady && <div className="sprint-mode-banner">Review the plan, then build exactly one selected feature sprint.</div>}
             {plan && <FeatureSprintRoadmap plan={plan} onBuild={planReady ? buildFromPlan : undefined} launching={launching} />}
             <ChangeBoundaryBanner run={run} />
+            <SmokeMutationBanner run={run} />
             <DeliveryCard runId={runId} />
           </div>
         </div>

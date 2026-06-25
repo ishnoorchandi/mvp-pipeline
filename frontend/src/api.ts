@@ -47,6 +47,12 @@ export interface RunDetail {
   boundary_violation_count?: number;
   out_of_scope_review_findings?: number;
   local_delivery_blocked_by_boundary?: boolean;
+  // Smoke Mutation — set after smoke checks run. Detects whether smoke-check commands
+  // (e.g. `npm install`/`npm ci`) themselves changed a tracked file, separately from the
+  // build's own change boundary, so a lockfile rewrite is never attributed to the build.
+  smoke_mutation_status?: "PASS" | "WARN" | "FAIL" | null;
+  smoke_mutation_file_count?: number;
+  smoke_mutation_blocked_delivery?: boolean;
 }
 
 export interface Artifact {
@@ -179,6 +185,12 @@ export interface DeliveryBoundaryInfo {
   blocked: boolean;
 }
 
+export interface DeliverySmokeMutationInfo {
+  status: "PASS" | "WARN" | "FAIL" | null;
+  file_count: number | null;
+  blocked: boolean;
+}
+
 export interface DeliveryInfo {
   available: boolean;
   reason?: string;
@@ -186,6 +198,7 @@ export interface DeliveryInfo {
   state: DeliveryState | null;
   artifacts?: string[];
   boundary?: DeliveryBoundaryInfo;
+  smoke_mutation?: DeliverySmokeMutationInfo;
 }
 
 export async function getDeliveryInfo(runId: string): Promise<DeliveryInfo> {

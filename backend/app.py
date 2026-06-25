@@ -430,14 +430,29 @@ def _boundary_info_for_run(run_id: str) -> dict:
     }
 
 
+def _smoke_mutation_info_for_run(run_id: str) -> dict:
+    """Smoke Mutation status, read from this run's own run_state.json (written by
+    pipeline_existing_app_upgrade / pipeline_continue_feature_sprint after smoke checks
+    run) — never recomputed by the backend. Tells the UI whether smoke-check commands
+    (e.g. `npm install`) mutated a tracked file, separately from the build's own change
+    boundary, so a lockfile rewrite is never attributed to the Claude build."""
+    run_state = load_state(run_id) or {}
+    return {
+        "status": run_state.get("smoke_mutation_status"),
+        "file_count": run_state.get("smoke_mutation_file_count"),
+        "blocked": bool(run_state.get("smoke_mutation_blocked_delivery")),
+    }
+
+
 @app.route("/api/runs/<run_id>/delivery", methods=["GET"])
 def get_delivery_state(run_id: str):
     if load_state(run_id) is None:
         abort(404, f"Run {run_id} not found")
     repo_path = _delivery_repo_for_run(run_id)
     boundary = _boundary_info_for_run(run_id)
+    smoke_mutation = _smoke_mutation_info_for_run(run_id)
     if not repo_path:
-        return jsonify({"available": False, "reason": "This run has no associated git repo (not an Existing App Upgrade run).", "boundary": boundary})
+        return jsonify({"available": False, "reason": "This run has no associated git repo (not an Existing App Upgrade run).", "boundary": boundary, "smoke_mutation": smoke_mutation})
 
     ddir = _delivery_dir(run_id)
     state_path = ddir / "delivery_state.json"
@@ -448,9 +463,9 @@ def get_delivery_state(run_id: str):
             state = json.loads(state_path.read_text())
         except Exception:
             state = {"decision": "UNKNOWN"}
-        return jsonify({"available": True, "repo_path": repo_path, "state": state, "artifacts": sorted(artifacts), "boundary": boundary})
+        return jsonify({"available": True, "repo_path": repo_path, "state": state, "artifacts": sorted(artifacts), "boundary": boundary, "smoke_mutation": smoke_mutation})
 
-    return jsonify({"available": True, "repo_path": repo_path, "state": None, "artifacts": sorted(artifacts), "boundary": boundary})
+    return jsonify({"available": True, "repo_path": repo_path, "state": None, "artifacts": sorted(artifacts), "boundary": boundary, "smoke_mutation": smoke_mutation})
 
 
 @app.route("/api/runs/<run_id>/delivery/precheck", methods=["GET"])
@@ -489,10 +504,17 @@ def _run_delivery_action(run_id: str, mode: str):
     if not repo_path:
         abort(400, "This run has no associated git repo")
     if run_state.get("local_delivery_blocked_by_boundary"):
-        abort(409, "Local Delivery is blocked: a Selected Feature Change Boundary violation was "
-                    "detected for this run (files outside the selected sprint were changed or "
-                    "deleted). See boundary_violation_report.md. No branch, commit, or push was "
-                    "performed.")
+        reasons = []
+        if run_state.get("change_boundary_status") == "FAIL":
+            reasons.append("a Selected Feature Change Boundary violation (files outside the selected "
+                           "sprint were changed or deleted — see boundary_violation_report.md)")
+        if run_state.get("smoke_mutation_blocked_delivery"):
+            reasons.append("a smoke-check-induced mutation of tracked files outside the selected "
+                           "feature boundary, caused by a smoke-check command (e.g. `npm install`), "
+                           "not the Claude build — see smoke_mutation_report.md")
+        detail = " and ".join(reasons) or "a safety check failure"
+        abort(409, f"Local Delivery is blocked: {detail} was detected for this run. No branch, "
+                    "commit, or push was performed.")
 
     body = request.get_json(force=True, silent=True) or {}
     branch_name = (body.get("branch_name") or "").strip()

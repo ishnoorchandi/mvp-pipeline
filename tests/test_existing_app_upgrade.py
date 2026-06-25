@@ -432,6 +432,7 @@ def test_build_mode_creates_accountability_artifacts():
             run_id = p.pipeline_existing_app_upgrade(str(app), "save filters", use_deepseek=False)
             run = p.RUNS_DIR / run_id
             for name in ("selected_feature_sprint_build_prompt.txt", "baseline_file_snapshot.json",
+                         "post_build_file_snapshot.json", "smoke_mutation_report.md", "smoke_mutation_report.json",
                          "changed_files_report.md", "smoke_test_log.txt", "regression_check.md",
                          "feature_completion_report.md"):
                 assert (run / name).exists(), name
