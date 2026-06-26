@@ -371,6 +371,46 @@ def run_existing_app_pr_delivery_plan(
     return plan
 
 
+# ── Pull Request Branch Preparation ─────────────────────────────────────────────
+# Local-only PR branch/commit prep. Delegates to delivery.run_prepare_pr_branch,
+# which may create/switch to a local feature branch and create a local commit, but
+# never pushes and never opens a PR.
+
+def run_existing_app_pr_branch_prepare(
+    run_id: str,
+    existing_app_path,
+    base_branch: str = "main",
+    branch_name: str | None = None,
+    pr_title: str | None = None,
+    commit_message: str | None = None,
+    allow_company_local_branch: bool = False,
+) -> dict:
+    existing_app_path = Path(existing_app_path)
+    rdir = run_dir(run_id)
+    state = delivery_mod.run_prepare_pr_branch(
+        existing_app_path,
+        base_branch=base_branch,
+        branch_name=branch_name,
+        pr_title=pr_title,
+        commit_message=commit_message,
+        allow_company_local_branch=allow_company_local_branch,
+        run_dir=rdir,
+        output_dir=rdir,
+    )
+    summary = (
+        f"{state['decision']} — {state['feature_branch']}"
+        + (f" @ {state['commit_hash']}" if state.get("commit_hash") else "")
+    )
+    _update_state(run_id, {
+        "pr_branch_decision": state["decision"],
+        "pr_branch_name": state["feature_branch"],
+        "pr_commit_hash": state.get("commit_hash"),
+        "pr_branch_artifacts": delivery_mod.PR_BRANCH_PREP_ARTIFACTS,
+        "pr_branch_summary": summary,
+    })
+    return state
+
+
 # ── LLM helpers ───────────────────────────────────────────────────────────────
 
 def gpt(messages: list[dict]) -> str:
@@ -6768,6 +6808,9 @@ def pipeline_existing_app_upgrade(
     pr_base_branch: str | None = None,
     pr_branch_name: str | None = None,
     pr_title: str | None = None,
+    prepare_pr_branch: bool = False,
+    pr_commit_message: str | None = None,
+    allow_company_local_branch: bool = False,
 ) -> str:
     """
     Existing App Upgrade mode entry point. Additive, not generative-from-scratch:
@@ -6941,6 +6984,21 @@ def pipeline_existing_app_upgrade(
         print(f"  PR delivery plan : {plan['pr_readiness']} — suggested branch "
               f"'{plan['suggested_branch']}' (see pr_delivery_plan.md)")
 
+    def _maybe_prepare_pr_branch():
+        """Local-only — may create/switch a feature branch and commit, never push/PR."""
+        if not prepare_pr_branch:
+            return
+        state = run_existing_app_pr_branch_prepare(
+            run_id, existing_app_path,
+            base_branch=pr_base_branch or git_sync_base_branch,
+            branch_name=pr_branch_name,
+            pr_title=pr_title,
+            commit_message=pr_commit_message,
+            allow_company_local_branch=allow_company_local_branch,
+        )
+        print(f"  PR branch prep   : {state['decision']} — feature branch "
+              f"'{state['feature_branch']}' (see pr_branch_plan.md)")
+
     if feature_plan_only:
         _update_state(run_id, {"status": "feature_plan_only_done", "current_step": "done"})
         log_event(run_id, "feature_plan_only_done")
@@ -7094,6 +7152,8 @@ def pipeline_existing_app_upgrade(
     _update_state(run_id, {"status": "done", "current_step": "done", "regression_status": regression_status})
     log_event(run_id, "done", f"regression={regression_status}")
     _maybe_write_pr_delivery_plan()
+    if not local_delivery_blocked:
+        _maybe_prepare_pr_branch()
 
     print(f"\n{'='*60}")
     print("  Existing App Upgrade — Feature Sprint Complete")
@@ -9733,6 +9793,16 @@ if __name__ == "__main__":
     parser.add_argument("--pr-title", default=None, metavar="TITLE",
                          help="Suggested PR title; also used (slugified) as the feature-branch "
                               "name seed when --pr-branch is not given.")
+    parser.add_argument("--prepare-pr-branch", action="store_true",
+                         help="Prepare a local PR feature branch and, when safe changed files "
+                              "exist, create a local commit. Local-only: never pushes and never "
+                              "opens a PR.")
+    parser.add_argument("--pr-commit-message", default=None, metavar="MESSAGE",
+                         help="Commit message for --prepare-pr-branch when changed files are "
+                              "present.")
+    parser.add_argument("--allow-company-local-branch", action="store_true",
+                         help="Allow --prepare-pr-branch to create/switch a local feature branch "
+                              "in a company-protected repo. Still never pushes or opens a PR.")
     args = parser.parse_args()
 
     run_id_arg = args.run_id  # may be None
@@ -9799,9 +9869,48 @@ if __name__ == "__main__":
         standalone_pr_plan = (
             args.pr_delivery_plan
             and not args.git_sync_check and not args.git_pull_ff_only and not args.local_git_delivery
+            and not args.prepare_pr_branch
             and not args.continue_run and not args.upgrade_mode
             and not args.resume and not args.jira and not args.input
         )
+        standalone_pr_branch = (
+            args.prepare_pr_branch
+            and not args.git_sync_check and not args.git_pull_ff_only and not args.local_git_delivery
+            and not args.continue_run and not args.upgrade_mode
+            and not args.resume and not args.jira and not args.input
+        )
+        if standalone_pr_branch:
+            repo_path = args.delivery_repo or args.existing_app
+            if not repo_path:
+                print("--prepare-pr-branch requires --existing-app PATH or --delivery-repo PATH.")
+                sys.exit(1)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path("pr_branch_runs") / f"pr_branch_{ts}"
+            pr_base_branch = args.pr_base_branch or args.base_branch
+            state = delivery_mod.run_prepare_pr_branch(
+                repo_path,
+                base_branch=pr_base_branch,
+                branch_name=args.pr_branch,
+                pr_title=args.pr_title,
+                commit_message=args.pr_commit_message,
+                allow_company_local_branch=args.allow_company_local_branch,
+                output_dir=output_dir,
+            )
+            print(f"\n{'='*60}")
+            print("  PR Branch Preparation (local only)")
+            print(f"  Repo              : {state['repo_path']}")
+            print(f"  Repo type         : {state['repo_type']}")
+            print(f"  Base branch       : {state['base_branch']}")
+            print(f"  Feature branch    : {state['feature_branch']}")
+            print(f"  Decision          : {state['decision']}")
+            if state.get("commit_hash"):
+                print(f"  Local commit      : {state['commit_hash']}")
+            if state["block_reasons"]:
+                print(f"  Blocker(s)        : {'; '.join(state['block_reasons'])}")
+            print("  No push was attempted. No PR was opened. No reset/stash/clean/discard was performed.")
+            print(f"  Reports           : {output_dir}")
+            print(f"{'='*60}\n")
+            sys.exit(0 if state["decision"] in ("BRANCH_READY", "COMMITTED_LOCAL", "NO_CHANGES") else 1)
         if standalone_pr_plan:
             repo_path = args.delivery_repo or args.existing_app
             if not repo_path:
@@ -9911,6 +10020,9 @@ if __name__ == "__main__":
                 pr_base_branch=args.pr_base_branch or args.base_branch,
                 pr_branch_name=args.pr_branch,
                 pr_title=args.pr_title,
+                prepare_pr_branch=args.prepare_pr_branch,
+                pr_commit_message=args.pr_commit_message,
+                allow_company_local_branch=args.allow_company_local_branch,
             )
             if args.local_git_delivery and not args.feature_plan_only:
                 upgrade_state = load_state(upgrade_run_id)

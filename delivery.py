@@ -41,6 +41,7 @@ _DENIED_PATH_PATTERNS = [
     r"(^|/)\.env($|\.)",
     r"(^|/)node_modules(/|$)",
     r"(^|/)runs(/|$)",
+    r"(^|/)(delivery_runs|git_sync_runs|pr_branch_runs|pr_delivery_runs)(/|$)",
     r"(^|/)venv(/|$)",
     r"(^|/)__pycache__(/|$)",
     r"(^|/)\.pytest_cache(/|$)",
@@ -1548,3 +1549,365 @@ def run_pr_delivery_plan(
         generate_pr_delivery_plan_report(plan, output_dir / "pr_delivery_plan.md")
         (output_dir / "pr_state.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
     return plan
+
+
+# ── Pull Request Branch Preparation ─────────────────────────────────────────────
+# Local-only branch/commit preparation for a future PR. This layer may create or
+# switch to a safe local feature branch and create one local commit, but it never
+# pushes and never opens a PR.
+
+PR_BRANCH_PREP_ARTIFACTS = [
+    "pr_branch_plan.md",
+    "pr_branch_state.json",
+    "local_pr_commit_summary.md",
+]
+
+
+def _parse_porcelain_paths(lines: list[str]) -> list[dict]:
+    entries: list[dict] = []
+    for line in lines:
+        if not line.strip() or len(line) < 4:
+            continue
+        code = line[:2]
+        raw_path = line[3:].strip()
+        paths = [raw_path]
+        if " -> " in raw_path:
+            paths = [p.strip() for p in raw_path.split(" -> ", 1)]
+        entries.append({"code": code, "path": raw_path, "paths": paths})
+    return entries
+
+
+def _changed_paths_from_status(status: dict) -> list[str]:
+    paths: list[str] = []
+    for entry in _parse_porcelain_paths(status.get("porcelain") or []):
+        paths.extend(entry["paths"])
+    return sorted(set(p for p in paths if p))
+
+
+def _changed_files_by_status(status: dict) -> dict:
+    added: list[str] = []
+    modified: list[str] = []
+    deleted: list[str] = []
+    for entry in _parse_porcelain_paths(status.get("porcelain") or []):
+        code = entry["code"]
+        path = entry["paths"][-1]
+        old_path = entry["paths"][0]
+        if code == "??" or "A" in code:
+            added.append(path)
+        if "D" in code:
+            deleted.append(old_path)
+        if any(ch in code for ch in ("M", "R", "C", "U")):
+            modified.append(path)
+    return {
+        "added": sorted(set(added)),
+        "modified": sorted(set(modified)),
+        "deleted": sorted(set(deleted)),
+    }
+
+
+def _path_matches_expected(path: str, expected: list[str]) -> bool:
+    return any(path == e.rstrip("/") or path.startswith(e.rstrip("/") + "/") for e in expected)
+
+
+def _check_pr_branch_boundary(changed: dict, boundary: dict | None) -> dict:
+    if not boundary:
+        return {"status": "not_applicable", "violations": [], "unexpected_files": [], "unauthorized_deletions": []}
+
+    expected_create = boundary.get("expected_files_create") or []
+    expected_modify = boundary.get("expected_files_modify") or []
+    allowed_dirs = boundary.get("allowed_directories") or []
+    expected_deletions = set(boundary.get("expected_deletions") or [])
+
+    def new_file_allowed(path: str) -> bool:
+        if _path_matches_expected(path, expected_create):
+            return True
+        return any(path == d.rstrip("/") or path.startswith(d.rstrip("/") + "/") for d in allowed_dirs)
+
+    unexpected = sorted(
+        [p for p in changed.get("added", []) if not new_file_allowed(p)]
+        + [p for p in changed.get("modified", []) if not _path_matches_expected(p, expected_modify)]
+    )
+    unauthorized_deletions = sorted(p for p in changed.get("deleted", []) if p not in expected_deletions)
+    violations = [{"file": p, "type": "unexpected_change", "severity": "high"} for p in unexpected]
+    violations += [{"file": p, "type": "unauthorized_deletion", "severity": "high"} for p in unauthorized_deletions]
+    return {
+        "status": "FAIL" if violations else "PASS",
+        "violations": violations,
+        "unexpected_files": unexpected,
+        "unauthorized_deletions": unauthorized_deletions,
+    }
+
+
+def _branch_exists(repo_path, branch_name: str) -> bool:
+    result = run_git_command(repo_path, ["branch", "--list", branch_name], check=False)
+    return bool(result.stdout.strip())
+
+
+def _ahead_behind_ref(repo_path, left_ref: str, right_ref: str) -> dict:
+    verify_left = run_git_command(repo_path, ["rev-parse", "--verify", "--quiet", left_ref], check=False)
+    verify_right = run_git_command(repo_path, ["rev-parse", "--verify", "--quiet", right_ref], check=False)
+    if verify_left.returncode != 0 or verify_right.returncode != 0:
+        return {"exists": False, "ahead": 0, "behind": 0}
+    result = run_git_command(repo_path, ["rev-list", "--left-right", "--count", f"{left_ref}...{right_ref}"], check=False)
+    if result.returncode != 0:
+        return {"exists": True, "ahead": 0, "behind": 0}
+    parts = result.stdout.strip().split()
+    return {
+        "exists": True,
+        "ahead": int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0,
+        "behind": int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0,
+    }
+
+
+def _load_pr_branch_boundary(run_dir) -> dict | None:
+    if run_dir is None:
+        return None
+    return _read_json_if_exists(Path(run_dir) / "selected_feature_change_boundary.json")
+
+
+def _run_allows_dirty_pr_branch_prep(run_dir) -> bool:
+    if run_dir is None:
+        return False
+    context = read_pr_run_safety_context(run_dir)
+    if context["boundary_check_status"] == "failed":
+        return False
+    if context["smoke_mutation_status"] == "failed":
+        return False
+    if context["delivery_safety_status"] in ("failed", "blocked"):
+        return False
+    return (Path(run_dir) / "selected_feature_change_boundary.json").exists()
+
+
+def generate_pr_branch_plan_report(state: dict, output_path) -> str:
+    lines = ["# PR Branch Preparation", ""]
+    lines.append("**Local-only preparation.**")
+    lines.append("- No push was attempted.")
+    lines.append("- No PR was opened.")
+    lines.append("- No direct push to main was performed.")
+    lines.append("- No reset/stash/clean/discard was performed.")
+    lines.append("")
+    lines.append(f"**Repo path:** `{state['repo_path']}`")
+    lines.append(f"**Repo type:** `{state['repo_type']}`")
+    lines.append(f"**Base branch:** `{state['base_branch']}`")
+    lines.append(f"**Feature branch:** `{state['feature_branch']}`")
+    lines.append(f"**Current branch before:** `{state.get('current_branch_before') or '(unknown)'}`")
+    lines.append(f"**Current branch after:** `{state.get('current_branch_after') or '(unknown)'}`")
+    lines.append(f"**Company repo:** {state['company_repo']}")
+    lines.append(f"**Company local branch approval:** {state['allow_company_local_branch']}")
+    lines.append("")
+    lines.append(f"## Decision: `{state['decision']}`")
+    lines.append(f"- Branch created: {state['branch_created']}")
+    lines.append(f"- Branch switched: {state['branch_switched']}")
+    lines.append(f"- Commit attempted: {state['commit_attempted']}")
+    lines.append(f"- Commit created: {state['commit_created']}")
+    lines.append(f"- Commit hash: `{state.get('commit_hash') or '(none)'}`")
+    lines.append("")
+    lines.append("## Files Committed")
+    lines.extend(f"- `{p}`" for p in state.get("files_committed") or ["(none)"])
+    if state.get("block_reasons"):
+        lines.append("")
+        lines.append("## Block Reason(s)")
+        lines.extend(f"- {r}" for r in state["block_reasons"])
+    if state.get("warnings"):
+        lines.append("")
+        lines.append("## Warning(s)")
+        lines.extend(f"- {w}" for w in state["warnings"])
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_local_pr_commit_summary(state: dict, output_path) -> str:
+    lines = ["# Local PR Commit Summary", ""]
+    lines.append(f"**Decision:** `{state['decision']}`")
+    lines.append(f"**Feature branch:** `{state['feature_branch']}`")
+    lines.append(f"**Commit hash:** `{state.get('commit_hash') or '(none)'}`")
+    lines.append("")
+    lines.append("No push was attempted.")
+    lines.append("No PR was opened.")
+    lines.append("No direct push to main was performed.")
+    lines.append("No reset/stash/clean/discard was performed.")
+    lines.append("")
+    lines.append("## Files Committed")
+    lines.extend(f"- `{p}`" for p in state.get("files_committed") or ["(none)"])
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def run_prepare_pr_branch(
+    repo_path,
+    base_branch: str = "main",
+    branch_name: str | None = None,
+    pr_title: str | None = None,
+    commit_message: str | None = None,
+    allow_company_local_branch: bool = False,
+    run_dir=None,
+    output_dir=None,
+) -> dict:
+    repo_path = Path(repo_path).resolve()
+    output_dir = Path(output_dir) if output_dir is not None else None
+    block_reasons: list[str] = []
+    warnings: list[str] = []
+    boundary = _load_pr_branch_boundary(run_dir)
+    allow_dirty_from_run = _run_allows_dirty_pr_branch_prep(run_dir)
+
+    seed = pr_title or branch_name or Path(repo_path).name
+    branch_info = resolve_pr_branch_name(branch_name, seed, DEFAULT_PR_BRANCH_KIND)
+    feature_branch = branch_info["suggested_branch"]
+    if branch_info["was_sanitized"]:
+        block_reasons.append(
+            f"requested branch name '{branch_info['requested']}' was unsafe; re-run with safe branch '{feature_branch}'"
+        )
+    if not is_safe_branch_name(feature_branch):
+        block_reasons.append(f"feature branch '{feature_branch}' is not safe to use")
+
+    repo_is_git = repo_path.exists() and (repo_path / ".git").exists()
+    sync = analyze_git_sync(repo_path, base_branch, allow_branch_mismatch=True) if repo_is_git else {
+        "repo_type": "unknown", "is_company_repo": False, "current_branch": None,
+        "sync_status": "unknown", "origin_base_exists": False, "fetch_succeeded": None,
+        "is_dirty": None, "denied_dirty_paths": [], "commits_ahead": 0, "commits_behind": 0,
+    }
+    current_before = sync.get("current_branch")
+    branch_created = False
+    branch_switched = False
+    commit_attempted = False
+    commit_created = False
+    commit_hash = None
+    files_committed: list[str] = []
+    decision = "BLOCKED"
+
+    if not repo_is_git:
+        block_reasons.append("repo path is not a git repository")
+    else:
+        if sync.get("fetch_succeeded") is False:
+            block_reasons.append("git fetch origin failed")
+        if not sync.get("origin_base_exists"):
+            block_reasons.append(f"origin/{base_branch} was not found")
+        if sync.get("is_company_repo") and not allow_company_local_branch:
+            block_reasons.append("company repo requires --allow-company-local-branch for local branch preparation")
+        if current_before not in (base_branch, feature_branch):
+            block_reasons.append(
+                f"current branch '{current_before}' is not base branch '{base_branch}' or intended feature branch '{feature_branch}'"
+            )
+        if sync.get("denied_dirty_paths"):
+            block_reasons.append(f"denied paths are dirty: {sync['denied_dirty_paths']}")
+
+        if current_before == base_branch:
+            if sync.get("is_dirty") and not allow_dirty_from_run:
+                block_reasons.append("base branch is dirty before PR branch preparation")
+            if sync.get("sync_status") != "up_to_date":
+                block_reasons.append(
+                    f"base branch must be cleanly up to date with origin/{base_branch}; current sync status is {sync.get('sync_status')}"
+                )
+        elif current_before == feature_branch:
+            branch_ab = _ahead_behind_ref(repo_path, "HEAD", f"origin/{base_branch}")
+            if not branch_ab["exists"]:
+                block_reasons.append(f"could not verify feature branch against origin/{base_branch}")
+            elif branch_ab["behind"] > 0:
+                block_reasons.append(
+                    f"feature branch is behind/diverged from origin/{base_branch} ({branch_ab['ahead']} ahead, {branch_ab['behind']} behind)"
+                )
+
+        if sync.get("is_dirty"):
+            dirty_paths = _changed_paths_from_status(get_git_status(repo_path))
+            denied_dirty = scan_denied_paths(dirty_paths)
+            if denied_dirty:
+                block_reasons.append(f"denied paths are dirty: {denied_dirty}")
+
+        if repo_is_git and feature_branch:
+            branch_exists = _branch_exists(repo_path, feature_branch)
+            if branch_exists:
+                branch_ab = _ahead_behind_ref(repo_path, feature_branch, f"origin/{base_branch}")
+                if not branch_ab["exists"] or branch_ab["behind"] > 0:
+                    block_reasons.append(
+                        f"target branch '{feature_branch}' exists but does not point safely at origin/{base_branch}"
+                    )
+            elif current_before == feature_branch:
+                block_reasons.append(f"current feature branch '{feature_branch}' was not found by git branch --list")
+
+    if not block_reasons and current_before == base_branch:
+        branch_exists = _branch_exists(repo_path, feature_branch)
+        checkout_args = ["checkout", feature_branch] if branch_exists else ["checkout", "-b", feature_branch]
+        checkout = run_git_command(repo_path, checkout_args, check=False)
+        if checkout.returncode != 0:
+            decision = "FAILED"
+            block_reasons.append(checkout.stderr.strip() or f"git {' '.join(checkout_args)} failed")
+        else:
+            branch_created = not branch_exists
+            branch_switched = True
+
+    current_after = get_git_status(repo_path)["branch"] if repo_is_git else None
+
+    if not block_reasons:
+        if current_after in PROTECTED_BRANCHES or current_after == base_branch:
+            block_reasons.append(f"refusing to commit on protected/base branch '{current_after}'")
+        status_after = get_git_status(repo_path)
+        changed_paths = _changed_paths_from_status(status_after)
+        denied = scan_denied_paths(changed_paths)
+        if denied:
+            block_reasons.append(f"denied paths detected in changed files: {denied}")
+        boundary_result = _check_pr_branch_boundary(_changed_files_by_status(status_after), boundary)
+        if boundary_result["status"] == "FAIL":
+            block_reasons.append("changed files are outside the selected feature change boundary")
+            for violation in boundary_result["violations"]:
+                block_reasons.append(f"{violation['type']}: {violation['file']}")
+        if not changed_paths and not block_reasons:
+            decision = "NO_CHANGES"
+        elif changed_paths and not block_reasons:
+            if not commit_message:
+                block_reasons.append("--pr-commit-message is required when changed files are present")
+            else:
+                commit_attempted = True
+                add_result = run_git_command(repo_path, ["add", "--", *changed_paths], check=False)
+                if add_result.returncode != 0:
+                    decision = "FAILED"
+                    block_reasons.append(add_result.stderr.strip() or "git add failed")
+                else:
+                    commit_result = run_git_command(repo_path, ["commit", "-m", commit_message], check=False)
+                    if commit_result.returncode != 0:
+                        decision = "FAILED"
+                        block_reasons.append(commit_result.stderr.strip() or "git commit failed")
+                    else:
+                        commit_created = True
+                        commit_hash = run_git_command(repo_path, ["rev-parse", "HEAD"], check=False).stdout.strip()
+                        files_committed = changed_paths
+                        decision = "COMMITTED_LOCAL"
+
+    if block_reasons and decision != "FAILED":
+        decision = "BLOCKED"
+    elif decision == "NO_CHANGES" and (branch_created or branch_switched):
+        warnings.append("feature branch is ready locally; no changed files were present to commit")
+
+    current_after = get_git_status(repo_path)["branch"] if repo_is_git else current_after
+    state = {
+        "repo_path": str(repo_path),
+        "repo_type": sync.get("repo_type", "unknown"),
+        "base_branch": base_branch,
+        "feature_branch": feature_branch,
+        "current_branch_before": current_before,
+        "current_branch_after": current_after,
+        "company_repo": bool(sync.get("is_company_repo")),
+        "allow_company_local_branch": allow_company_local_branch,
+        "branch_created": branch_created,
+        "branch_switched": branch_switched,
+        "commit_attempted": commit_attempted,
+        "commit_created": commit_created,
+        "commit_hash": commit_hash,
+        "files_committed": files_committed,
+        "decision": decision,
+        "block_reasons": block_reasons,
+        "warnings": warnings,
+        "no_push_performed": True,
+        "no_pr_opened": True,
+        "no_reset_stash_clean_performed": True,
+        "timestamp": time.time(),
+    }
+
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        generate_pr_branch_plan_report(state, output_dir / "pr_branch_plan.md")
+        generate_local_pr_commit_summary(state, output_dir / "local_pr_commit_summary.md")
+        (output_dir / "pr_branch_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    return state

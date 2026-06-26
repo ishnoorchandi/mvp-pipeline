@@ -3,10 +3,11 @@ import type { ReactElement } from "react";
 import {
   getRuns, getRun, getArtifact, createUpgradeRun, createContinuationRun,
   getDeliveryInfo, getDeliveryPrecheck, createDeliveryCommit, pushDeliverySandbox,
-  getGitSyncState, getGitPullState, getPrDeliveryPlanState,
+  getGitSyncState, getGitPullState, getPrDeliveryPlanState, getPrBranchPrepState,
 } from "./api";
 import type {
-  RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState, PrDeliveryPlanState,
+  RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState,
+  PrDeliveryPlanState, PrBranchPrepState,
 } from "./api";
 import "./App.css";
 
@@ -1213,6 +1214,9 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "git_sync_after_pull.json", label: "Git Sync — After Pull" },
   { file: "pr_delivery_plan.md", label: "PR Delivery Plan" },
   { file: "pr_state.json", label: "PR State JSON" },
+  { file: "pr_branch_plan.md", label: "PR Branch Plan" },
+  { file: "pr_branch_state.json", label: "PR Branch State JSON" },
+  { file: "local_pr_commit_summary.md", label: "Local PR Commit Summary" },
   { file: "existing_app_inventory.md", label: "Existing App Inventory" },
   { file: "baseline_health_check.md", label: "Baseline Health Check" },
   { file: "baseline_behavior_checklist.md", label: "Baseline Behavior Checklist" },
@@ -1564,16 +1568,28 @@ function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
 // pr_state.json (written by delivery.run_pr_delivery_plan); falls back to the
 // summary fields on run_state.json if the artifact hasn't loaded yet. This card
 // never offers a branch/commit/push/PR action — it is plan only, always.
-function PrPlanCard({ runId, run }: { runId: string; run: RunDetail | null }) {
+function PrPlanCard({ runId, run, selectedArtifact, onSelectArtifact }: {
+  runId: string;
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
   const [plan, setPlan] = useState<PrDeliveryPlanState | null>(null);
+  const [prep, setPrep] = useState<PrBranchPrepState | null>(null);
   const hasArtifact = (run?.artifacts ?? []).includes("pr_state.json");
+  const hasPrepArtifact = (run?.artifacts ?? []).includes("pr_branch_state.json");
 
   useEffect(() => {
     if (!hasArtifact) { setPlan(null); return; }
     getPrDeliveryPlanState(runId).then(setPlan).catch(() => setPlan(null));
   }, [runId, hasArtifact]);
 
-  if (!run?.pr_plan_status && !plan) return null;
+  useEffect(() => {
+    if (!hasPrepArtifact) { setPrep(null); return; }
+    getPrBranchPrepState(runId).then(setPrep).catch(() => setPrep(null));
+  }, [runId, hasPrepArtifact]);
+
+  if (!run?.pr_plan_status && !plan && !run?.pr_branch_decision && !prep) return null;
 
   const readiness = plan?.pr_readiness ?? run?.pr_plan_status ?? "blocked";
   const readinessBadgeClass =
@@ -1585,6 +1601,15 @@ function PrPlanCard({ runId, run }: { runId: string; run: RunDetail | null }) {
     readiness === "blocked" ? "blocked"
     : plan?.future_push_approval_required ? "future approval required"
     : "allowed later";
+  const prepDecision = prep?.decision ?? run?.pr_branch_decision ?? null;
+  const prepBadgeClass =
+    prepDecision === "COMMITTED_LOCAL" || prepDecision === "BRANCH_READY" || prepDecision === "NO_CHANGES" ? "ok"
+    : prepDecision === "BLOCKED" || prepDecision === "FAILED" ? "fail"
+    : "warn";
+  const prepArtifacts = [
+    { file: "pr_branch_plan.md", label: "PR Branch Plan" },
+    { file: "local_pr_commit_summary.md", label: "Local PR Commit Summary" },
+  ].filter(a => (run?.artifacts ?? []).includes(a.file));
 
   return (
     <div className="delivery-card">
@@ -1641,6 +1666,66 @@ function PrPlanCard({ runId, run }: { runId: string; run: RunDetail | null }) {
         <div className="delivery-command-preview-label">Next safe step</div>
         <pre>{plan?.recommended_next_action ?? "Run --pr-delivery-plan to generate a recommendation."}</pre>
       </div>
+
+      {prepDecision && (
+        <div className="delivery-artifacts">
+          <div className="delivery-card-header">
+            <div>
+              <div className="delivery-card-title">PR Branch Preparation</div>
+              <div className="delivery-card-sub">
+                {run?.pr_branch_summary ?? "Local-only feature branch and commit preparation."}
+              </div>
+            </div>
+            <span className={`delivery-badge delivery-badge-${prepBadgeClass}`}>
+              {prepDecision.replace(/_/g, " ")}
+            </span>
+          </div>
+          <div className="delivery-repo-line">
+            Feature branch: <code>{prep?.feature_branch ?? run?.pr_branch_name ?? "(unknown)"}</code>
+          </div>
+          <div className="delivery-repo-line">
+            Decision: <code>{prepDecision}</code>
+            {" "}· Company local branch approval: <code>{prep?.allow_company_local_branch ? "yes" : "no"}</code>
+          </div>
+          {(prep?.commit_hash || run?.pr_commit_hash) && (
+            <div className="delivery-repo-line">
+              Local commit: <code>{prep?.commit_hash ?? run?.pr_commit_hash}</code>
+            </div>
+          )}
+          <div className="delivery-repo-line">
+            No push performed: <code>{String(prep?.no_push_performed ?? true)}</code>
+            {" "}· No PR opened: <code>{String(prep?.no_pr_opened ?? true)}</code>
+          </div>
+          {(prep?.files_committed?.length ?? 0) > 0 && (
+            <div className="delivery-warning-panel">
+              <strong>Files committed.</strong>
+              <ul>{prep!.files_committed.map(f => <li key={f}><code>{f}</code></li>)}</ul>
+            </div>
+          )}
+          {(prep?.block_reasons?.length ?? 0) > 0 && (
+            <div className="delivery-warning-panel delivery-warning-panel-severe">
+              <strong>Branch prep blocker(s).</strong>
+              <ul>{prep!.block_reasons.map(r => <li key={r}>{r}</li>)}</ul>
+            </div>
+          )}
+          {prepArtifacts.length > 0 && (
+            <>
+              <div className="delivery-artifacts-label">PR branch artifacts</div>
+              <div className="delivery-artifact-tabs">
+                {prepArtifacts.map(a => (
+                  <button
+                    key={a.file}
+                    className={`artifact-tab ${selectedArtifact === a.file ? "active" : ""}`}
+                    onClick={() => onSelectArtifact(a.file)}
+                  >
+                    {a.label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1979,7 +2064,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             <ChangeBoundaryBanner run={run} />
             <SmokeMutationBanner run={run} />
             <GitSyncCard runId={runId} run={run} />
-            <PrPlanCard runId={runId} run={run} />
+            <PrPlanCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />
           </div>
         </div>

@@ -72,6 +72,14 @@ export interface RunDetail {
   pr_plan_branch?: string;
   pr_plan_summary?: string;
   pr_plan_artifacts?: string[];
+  // PR Branch Preparation — set when --prepare-pr-branch was used. Local-only:
+  // may create/switch a feature branch and create a local commit, but never pushes
+  // and never opens a PR. Full detail lives in pr_branch_state.json.
+  pr_branch_decision?: "BRANCH_READY" | "COMMITTED_LOCAL" | "NO_CHANGES" | "BLOCKED" | "FAILED" | null;
+  pr_branch_name?: string;
+  pr_commit_hash?: string | null;
+  pr_branch_artifacts?: string[];
+  pr_branch_summary?: string;
 }
 
 export interface Artifact {
@@ -411,6 +419,39 @@ export async function getPrDeliveryPlanState(runId: string): Promise<PrDeliveryP
   try {
     const a = await getArtifact(runId, "pr_state.json");
     return JSON.parse(a.content) as PrDeliveryPlanState;
+  } catch {
+    return null;
+  }
+}
+
+export interface PrBranchPrepState {
+  repo_path: string;
+  repo_type: "company-protected" | "personal-sandbox" | "unknown";
+  base_branch: string;
+  feature_branch: string;
+  current_branch_before: string | null;
+  current_branch_after: string | null;
+  company_repo: boolean;
+  allow_company_local_branch: boolean;
+  branch_created: boolean;
+  branch_switched: boolean;
+  commit_attempted: boolean;
+  commit_created: boolean;
+  commit_hash: string | null;
+  files_committed: string[];
+  decision: "BRANCH_READY" | "COMMITTED_LOCAL" | "NO_CHANGES" | "BLOCKED" | "FAILED";
+  block_reasons: string[];
+  warnings: string[];
+  no_push_performed: boolean;
+  no_pr_opened: boolean;
+  no_reset_stash_clean_performed: boolean;
+  timestamp: number;
+}
+
+export async function getPrBranchPrepState(runId: string): Promise<PrBranchPrepState | null> {
+  try {
+    const a = await getArtifact(runId, "pr_branch_state.json");
+    return JSON.parse(a.content) as PrBranchPrepState;
   } catch {
     return null;
   }
