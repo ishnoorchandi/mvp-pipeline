@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -1909,5 +1910,322 @@ def run_prepare_pr_branch(
         generate_pr_branch_plan_report(state, output_dir / "pr_branch_plan.md")
         generate_local_pr_commit_summary(state, output_dir / "local_pr_commit_summary.md")
         (output_dir / "pr_branch_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    return state
+
+
+# ── Pull Request Remote Delivery ────────────────────────────────────────────────
+# Final remote layer: push an already-prepared local feature branch and optionally
+# open a PR. Strictly branch-only, never force, never main/base.
+
+PR_REMOTE_ARTIFACTS = [
+    "pr_remote_delivery_report.md",
+    "pr_remote_state.json",
+    "pr_push_result.md",
+    "pr_create_result.md",
+]
+
+
+def _github_repo_slug(remote_url: str) -> str | None:
+    if not remote_url:
+        return None
+    m = re.search(r"github\.com[:/]+([\w.-]+/[\w.-]+?)(?:\.git)?$", remote_url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _manual_pr_url(remote_url: str, base_branch: str, feature_branch: str) -> str | None:
+    slug = _github_repo_slug(remote_url)
+    if not slug:
+        return None
+    return f"https://github.com/{slug}/compare/{base_branch}...{feature_branch}?expand=1"
+
+
+def _remote_branch_exists(repo_path, branch_name: str) -> bool:
+    verify = run_git_command(repo_path, ["rev-parse", "--verify", "--quiet", f"origin/{branch_name}"], check=False)
+    return verify.returncode == 0
+
+
+def _run_gh_pr_create(
+    repo_path,
+    base_branch: str,
+    feature_branch: str,
+    title: str,
+    body: str | None,
+) -> dict:
+    gh = shutil.which("gh")
+    if not gh:
+        return {"attempted": False, "created": False, "url": None, "stdout": "", "stderr": "GitHub CLI not available"}
+    auth = subprocess.run([gh, "auth", "status"], cwd=str(repo_path), capture_output=True, text=True)
+    if auth.returncode != 0:
+        return {"attempted": False, "created": False, "url": None, "stdout": auth.stdout.strip(), "stderr": auth.stderr.strip() or "GitHub CLI not authenticated"}
+    args = [gh, "pr", "create", "--base", base_branch, "--head", feature_branch, "--title", title]
+    if body:
+        args.extend(["--body", body])
+    else:
+        args.extend(["--body", ""])
+    result = subprocess.run(args, cwd=str(repo_path), capture_output=True, text=True)
+    output = (result.stdout or result.stderr).strip()
+    url_match = re.search(r"https://\S+", output)
+    return {
+        "attempted": True,
+        "created": result.returncode == 0,
+        "url": url_match.group(0) if url_match else None,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+        "returncode": result.returncode,
+    }
+
+
+def generate_pr_remote_delivery_report(state: dict, output_path) -> str:
+    lines = ["# PR Remote Delivery Report", ""]
+    lines.append("**Remote delivery safety confirmation.**")
+    lines.append("No push to main was performed.")
+    lines.append("No force push was performed.")
+    lines.append("No reset/stash/clean/discard was performed.")
+    lines.append("")
+    lines.append(f"**Repo path:** `{state['repo_path']}`")
+    lines.append(f"**Repo type:** `{state['repo_type']}`")
+    lines.append(f"**Base branch:** `{state['base_branch']}`")
+    lines.append(f"**Feature branch:** `{state['feature_branch']}`")
+    lines.append(f"**Current branch:** `{state.get('current_branch') or '(unknown)'}`")
+    lines.append(f"**Remote allowed:** {state['remote_allowed']}")
+    lines.append(f"**Company approval:** {state['company_approval']}")
+    lines.append(f"**Sandbox allowlist matched:** {state['sandbox_allowlist_matched']}")
+    lines.append("")
+    lines.append(f"## Decision: `{state['decision']}`")
+    lines.append(f"- Push attempted: {state['push_attempted']}")
+    lines.append(f"- Push succeeded: {state['push_succeeded']}")
+    lines.append(f"- Push command: `{state.get('push_command') or '(none)'}`")
+    lines.append(f"- Open PR requested: {state['open_pr_requested']}")
+    lines.append(f"- PR attempted: {state['pr_attempted']}")
+    lines.append(f"- PR created: {state['pr_created']}")
+    lines.append(f"- PR URL: `{state.get('pr_url') or '(none)'}`")
+    if state.get("manual_pr_url"):
+        lines.append(f"- Manual PR URL: {state['manual_pr_url']}")
+    if state.get("manual_pr_instructions"):
+        lines.append("")
+        lines.append("## Manual PR Instructions")
+        lines.append(state["manual_pr_instructions"])
+    if state.get("block_reasons"):
+        lines.append("")
+        lines.append("## Block Reason(s)")
+        lines.extend(f"- {r}" for r in state["block_reasons"])
+    if state.get("warnings"):
+        lines.append("")
+        lines.append("## Warning(s)")
+        lines.extend(f"- {w}" for w in state["warnings"])
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_pr_push_result(state: dict, output_path) -> str:
+    lines = ["# PR Branch Push Result", ""]
+    lines.append("No push to main was performed.")
+    lines.append("No force push was performed.")
+    lines.append("No reset/stash/clean/discard was performed.")
+    lines.append("")
+    lines.append(f"**Push attempted:** {state['push_attempted']}")
+    lines.append(f"**Push succeeded:** {state['push_succeeded']}")
+    lines.append(f"**Command:** `{state.get('push_command') or '(none)'}`")
+    if state.get("push_stdout"):
+        lines += ["", "## stdout", "```", state["push_stdout"], "```"]
+    if state.get("push_stderr"):
+        lines += ["", "## stderr", "```", state["push_stderr"], "```"]
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_pr_create_result(state: dict, output_path) -> str:
+    lines = ["# PR Create Result", ""]
+    lines.append(f"**Open PR requested:** {state['open_pr_requested']}")
+    lines.append(f"**PR attempted:** {state['pr_attempted']}")
+    lines.append(f"**PR created:** {state['pr_created']}")
+    lines.append(f"**PR URL:** `{state.get('pr_url') or '(none)'}`")
+    if state.get("manual_pr_url"):
+        lines.append(f"**Manual PR URL:** {state['manual_pr_url']}")
+    if state.get("manual_pr_instructions"):
+        lines += ["", "## Manual PR Instructions", state["manual_pr_instructions"]]
+    if state.get("pr_stdout"):
+        lines += ["", "## stdout", "```", state["pr_stdout"], "```"]
+    if state.get("pr_stderr"):
+        lines += ["", "## stderr", "```", state["pr_stderr"], "```"]
+    lines += ["", "No push to main was performed.", "No force push was performed.", "No reset/stash/clean/discard was performed."]
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def run_pr_remote_delivery(
+    repo_path,
+    base_branch: str = "main",
+    branch_name: str | None = None,
+    pr_title: str | None = None,
+    pr_body: str | None = None,
+    push_pr_branch: bool = False,
+    open_pr: bool = False,
+    sandbox_allowlist=None,
+    allow_company_pr: bool = False,
+    run_dir=None,
+    output_dir=None,
+) -> dict:
+    repo_path = Path(repo_path).resolve()
+    output_dir = Path(output_dir) if output_dir is not None else None
+    sandbox_allowlist = set(sandbox_allowlist or DEFAULT_SANDBOX_ALLOWLIST)
+    block_reasons: list[str] = []
+    warnings: list[str] = []
+
+    branch_info = resolve_pr_branch_name(branch_name, branch_name or Path(repo_path).name, DEFAULT_PR_BRANCH_KIND)
+    feature_branch = branch_info["suggested_branch"]
+    if branch_info["was_sanitized"]:
+        block_reasons.append(
+            f"requested branch name '{branch_info['requested']}' was unsafe; re-run with safe branch '{feature_branch}'"
+        )
+    if not is_safe_branch_name(feature_branch):
+        block_reasons.append(f"feature branch '{feature_branch}' is not safe to use")
+
+    repo_is_git = repo_path.exists() and (repo_path / ".git").exists()
+    remote_info = get_git_remote_info(repo_path) if repo_is_git else {"fetch_url": "", "push_url": ""}
+    repo_type = detect_repo_type(repo_path, remote_info) if repo_is_git else "unknown"
+    is_company = repo_type == "company-protected"
+    fetch_result = fetch_origin(repo_path) if repo_is_git else {"success": False, "stderr": ""}
+    status = get_git_status(repo_path) if repo_is_git else {"branch": None, "clean": False, "porcelain": []}
+    current_branch = status.get("branch")
+    changed_paths = _changed_paths_from_status(status)
+    denied_dirty = scan_denied_paths(changed_paths)
+    base_verify = run_git_command(repo_path, ["rev-parse", "--verify", "--quiet", f"origin/{base_branch}"], check=False) if repo_is_git else None
+    base_exists = bool(base_verify and base_verify.returncode == 0)
+    ahead_base = _ahead_behind_ref(repo_path, "HEAD", f"origin/{base_branch}") if repo_is_git else {"exists": False, "ahead": 0, "behind": 0}
+    remote_branch_exists = _remote_branch_exists(repo_path, feature_branch) if repo_is_git and feature_branch else False
+    remote_branch_ab = _ahead_behind_ref(repo_path, "HEAD", f"origin/{feature_branch}") if remote_branch_exists else {"exists": False, "ahead": 0, "behind": 0}
+    sandbox_match = bool(not is_company and is_safe_sandbox_remote(remote_info.get("push_url") or remote_info.get("fetch_url") or "", sandbox_allowlist))
+    company_approval = bool(allow_company_pr)
+    remote_allowed = bool((is_company and company_approval) or sandbox_match)
+
+    if not repo_is_git:
+        block_reasons.append("repo path is not a git repository")
+    else:
+        if not fetch_result["success"]:
+            block_reasons.append(f"git fetch origin failed: {fetch_result['stderr'] or '(unknown error)'}")
+        if not base_exists:
+            block_reasons.append(f"origin/{base_branch} was not found")
+        if current_branch != feature_branch:
+            block_reasons.append(f"current branch '{current_branch}' must exactly equal feature branch '{feature_branch}'")
+        if current_branch in PROTECTED_BRANCHES or current_branch == base_branch:
+            block_reasons.append(f"refusing remote delivery from protected/base branch '{current_branch}'")
+        if not status["clean"]:
+            block_reasons.append(f"working tree is dirty ({len(changed_paths)} changed file(s))")
+        if denied_dirty:
+            block_reasons.append(f"denied paths are dirty: {denied_dirty}")
+        if ahead_base["ahead"] <= 0:
+            block_reasons.append(f"feature branch must contain at least one commit not on origin/{base_branch}")
+        if is_company:
+            if not allow_company_pr:
+                block_reasons.append("company repo requires --allow-company-pr before branch push or PR creation")
+            if remote_info.get("push_url") == DISABLED_PUSH_MARKER:
+                block_reasons.append(
+                    "company remote push is locally disabled (DISABLED_DO_NOT_PUSH_COMPANY_REPO); intentionally configure push URL before PR delivery"
+                )
+        elif not sandbox_match:
+            block_reasons.append("personal sandbox remote did not match --allow-sandbox-remote allowlist")
+        if not remote_allowed:
+            block_reasons.append("remote is not approved for PR delivery")
+
+    push_attempted = False
+    push_succeeded = False
+    push_command = f"git push -u origin {feature_branch}"
+    push_stdout = ""
+    push_stderr = ""
+    pr_attempted = False
+    pr_created = False
+    pr_url = None
+    pr_stdout = ""
+    pr_stderr = ""
+    manual_url = _manual_pr_url(remote_info.get("fetch_url") or remote_info.get("push_url") or "", base_branch, feature_branch)
+    manual_instructions = None
+    decision = "BLOCKED" if block_reasons else "NO_OP"
+
+    if not block_reasons and push_pr_branch:
+        if remote_branch_exists and remote_branch_ab["ahead"] == 0:
+            push_succeeded = True
+            decision = "NO_OP"
+            warnings.append(f"origin/{feature_branch} already matches the local branch; no push needed")
+        else:
+            push_attempted = True
+            push_result = run_git_command(repo_path, ["push", "-u", "origin", feature_branch], check=False)
+            push_stdout = push_result.stdout.strip()
+            push_stderr = push_result.stderr.strip()
+            push_succeeded = push_result.returncode == 0
+            decision = "PUSHED_BRANCH" if push_succeeded else "FAILED"
+            if not push_succeeded:
+                block_reasons.append(push_stderr or "git push failed")
+
+    if not block_reasons and open_pr:
+        if not pr_title:
+            decision = "BLOCKED"
+            block_reasons.append("--pr-title is required when --open-pr is used")
+        elif not (push_succeeded or remote_branch_exists):
+            decision = "BLOCKED"
+            block_reasons.append("branch push must succeed or remote branch must already exist before opening a PR")
+        else:
+            gh_result = _run_gh_pr_create(repo_path, base_branch, feature_branch, pr_title, pr_body)
+            pr_attempted = gh_result["attempted"]
+            pr_created = gh_result["created"]
+            pr_url = gh_result["url"]
+            pr_stdout = gh_result.get("stdout", "")
+            pr_stderr = gh_result.get("stderr", "")
+            if pr_created:
+                decision = "PR_CREATED"
+            else:
+                manual_instructions = (
+                    "GitHub CLI PR creation was unavailable or did not complete. "
+                    f"Create the PR manually from `{feature_branch}` into `{base_branch}`"
+                    + (f": {manual_url}" if manual_url else ".")
+                )
+                decision = "MANUAL_PR_REQUIRED"
+
+    if block_reasons and decision != "FAILED":
+        decision = "BLOCKED"
+
+    state = {
+        "repo_path": str(repo_path),
+        "repo_type": repo_type,
+        "base_branch": base_branch,
+        "feature_branch": feature_branch,
+        "current_branch": current_branch,
+        "remote_allowed": remote_allowed,
+        "company_approval": company_approval,
+        "sandbox_allowlist_matched": sandbox_match,
+        "push_attempted": push_attempted,
+        "push_succeeded": push_succeeded,
+        "push_command": push_command,
+        "push_stdout": push_stdout,
+        "push_stderr": push_stderr,
+        "open_pr_requested": open_pr,
+        "pr_attempted": pr_attempted,
+        "pr_created": pr_created,
+        "pr_url": pr_url,
+        "pr_stdout": pr_stdout,
+        "pr_stderr": pr_stderr,
+        "manual_pr_url": manual_url,
+        "manual_pr_instructions": manual_instructions,
+        "decision": decision,
+        "block_reasons": block_reasons,
+        "warnings": warnings,
+        "no_main_push_performed": True,
+        "no_force_push_performed": True,
+        "no_reset_stash_clean_performed": True,
+        "timestamp": time.time(),
+    }
+
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        generate_pr_remote_delivery_report(state, output_dir / "pr_remote_delivery_report.md")
+        generate_pr_push_result(state, output_dir / "pr_push_result.md")
+        generate_pr_create_result(state, output_dir / "pr_create_result.md")
+        (output_dir / "pr_remote_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     return state

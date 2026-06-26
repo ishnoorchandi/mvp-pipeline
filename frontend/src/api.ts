@@ -80,6 +80,13 @@ export interface RunDetail {
   pr_commit_hash?: string | null;
   pr_branch_artifacts?: string[];
   pr_branch_summary?: string;
+  // PR Remote Delivery — set when --push-pr-branch / --open-pr was used.
+  // Strictly branch-only remote delivery; never pushes main or force-pushes.
+  pr_remote_decision?: "PUSHED_BRANCH" | "PR_CREATED" | "MANUAL_PR_REQUIRED" | "BLOCKED" | "FAILED" | "NO_OP" | null;
+  pr_remote_branch?: string;
+  pr_remote_pr_url?: string | null;
+  pr_remote_artifacts?: string[];
+  pr_remote_summary?: string;
 }
 
 export interface Artifact {
@@ -452,6 +459,42 @@ export async function getPrBranchPrepState(runId: string): Promise<PrBranchPrepS
   try {
     const a = await getArtifact(runId, "pr_branch_state.json");
     return JSON.parse(a.content) as PrBranchPrepState;
+  } catch {
+    return null;
+  }
+}
+
+export interface PrRemoteDeliveryState {
+  repo_path: string;
+  repo_type: "company-protected" | "personal-sandbox" | "unknown";
+  base_branch: string;
+  feature_branch: string;
+  current_branch: string | null;
+  remote_allowed: boolean;
+  company_approval: boolean;
+  sandbox_allowlist_matched: boolean;
+  push_attempted: boolean;
+  push_succeeded: boolean;
+  push_command: string;
+  open_pr_requested: boolean;
+  pr_attempted: boolean;
+  pr_created: boolean;
+  pr_url: string | null;
+  manual_pr_url: string | null;
+  manual_pr_instructions: string | null;
+  decision: "PUSHED_BRANCH" | "PR_CREATED" | "MANUAL_PR_REQUIRED" | "BLOCKED" | "FAILED" | "NO_OP";
+  block_reasons: string[];
+  warnings: string[];
+  no_main_push_performed: boolean;
+  no_force_push_performed: boolean;
+  no_reset_stash_clean_performed: boolean;
+  timestamp: number;
+}
+
+export async function getPrRemoteDeliveryState(runId: string): Promise<PrRemoteDeliveryState | null> {
+  try {
+    const a = await getArtifact(runId, "pr_remote_state.json");
+    return JSON.parse(a.content) as PrRemoteDeliveryState;
   } catch {
     return null;
   }

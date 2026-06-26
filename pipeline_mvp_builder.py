@@ -411,6 +411,99 @@ def run_existing_app_pr_branch_prepare(
     return state
 
 
+# ── Pull Request Remote Delivery ────────────────────────────────────────────────
+# Remote PR delivery layer. May push the already-prepared feature branch and
+# optionally create a PR, but only after strict approval gates.
+
+def run_existing_app_pr_remote_delivery(
+    run_id: str,
+    existing_app_path,
+    base_branch: str = "main",
+    branch_name: str | None = None,
+    pr_title: str | None = None,
+    pr_body: str | None = None,
+    push_pr_branch: bool = False,
+    open_pr: bool = False,
+    sandbox_allowlist=None,
+    allow_company_pr: bool = False,
+) -> dict:
+    existing_app_path = Path(existing_app_path)
+    rdir = run_dir(run_id)
+    prep_state = _safe_read_json(rdir / "pr_branch_state.json")
+    if prep_state:
+        allowed_decisions = {"COMMITTED_LOCAL", "BRANCH_READY", "NO_CHANGES"}
+        if prep_state.get("decision") not in allowed_decisions:
+            state = {
+                "repo_path": str(existing_app_path.resolve()),
+                "repo_type": "unknown",
+                "base_branch": base_branch,
+                "feature_branch": branch_name or prep_state.get("feature_branch"),
+                "current_branch": None,
+                "remote_allowed": False,
+                "company_approval": allow_company_pr,
+                "sandbox_allowlist_matched": False,
+                "push_attempted": False,
+                "push_succeeded": False,
+                "push_command": f"git push -u origin {branch_name or prep_state.get('feature_branch')}",
+                "open_pr_requested": open_pr,
+                "pr_attempted": False,
+                "pr_created": False,
+                "pr_url": None,
+                "manual_pr_url": None,
+                "manual_pr_instructions": None,
+                "decision": "BLOCKED",
+                "block_reasons": [f"pr_branch_state.json decision is {prep_state.get('decision')}"],
+                "warnings": [],
+                "no_main_push_performed": True,
+                "no_force_push_performed": True,
+                "no_reset_stash_clean_performed": True,
+            }
+            delivery_mod.generate_pr_remote_delivery_report(state, rdir / "pr_remote_delivery_report.md")
+            delivery_mod.generate_pr_push_result(state, rdir / "pr_push_result.md")
+            delivery_mod.generate_pr_create_result(state, rdir / "pr_create_result.md")
+            (rdir / "pr_remote_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+        else:
+            state = delivery_mod.run_pr_remote_delivery(
+                existing_app_path,
+                base_branch=base_branch,
+                branch_name=branch_name or prep_state.get("feature_branch"),
+                pr_title=pr_title,
+                pr_body=pr_body,
+                push_pr_branch=push_pr_branch,
+                open_pr=open_pr,
+                sandbox_allowlist=sandbox_allowlist,
+                allow_company_pr=allow_company_pr,
+                run_dir=rdir,
+                output_dir=rdir,
+            )
+    else:
+        state = delivery_mod.run_pr_remote_delivery(
+            existing_app_path,
+            base_branch=base_branch,
+            branch_name=branch_name,
+            pr_title=pr_title,
+            pr_body=pr_body,
+            push_pr_branch=push_pr_branch,
+            open_pr=open_pr,
+            sandbox_allowlist=sandbox_allowlist,
+            allow_company_pr=allow_company_pr,
+            run_dir=rdir,
+            output_dir=rdir,
+        )
+    summary = (
+        f"{state['decision']} — {state['feature_branch']}"
+        + (f" PR {state['pr_url']}" if state.get("pr_url") else "")
+    )
+    _update_state(run_id, {
+        "pr_remote_decision": state["decision"],
+        "pr_remote_branch": state["feature_branch"],
+        "pr_remote_pr_url": state.get("pr_url"),
+        "pr_remote_artifacts": delivery_mod.PR_REMOTE_ARTIFACTS,
+        "pr_remote_summary": summary,
+    })
+    return state
+
+
 # ── LLM helpers ───────────────────────────────────────────────────────────────
 
 def gpt(messages: list[dict]) -> str:
@@ -6811,6 +6904,11 @@ def pipeline_existing_app_upgrade(
     prepare_pr_branch: bool = False,
     pr_commit_message: str | None = None,
     allow_company_local_branch: bool = False,
+    push_pr_branch: bool = False,
+    open_pr: bool = False,
+    pr_body: str | None = None,
+    allow_company_pr: bool = False,
+    sandbox_allowlist=None,
 ) -> str:
     """
     Existing App Upgrade mode entry point. Additive, not generative-from-scratch:
@@ -6999,6 +7097,24 @@ def pipeline_existing_app_upgrade(
         print(f"  PR branch prep   : {state['decision']} — feature branch "
               f"'{state['feature_branch']}' (see pr_branch_plan.md)")
 
+    def _maybe_push_pr_branch():
+        """Remote delivery — branch push only, optional PR creation, guarded."""
+        if not push_pr_branch and not open_pr:
+            return
+        state = run_existing_app_pr_remote_delivery(
+            run_id, existing_app_path,
+            base_branch=pr_base_branch or git_sync_base_branch,
+            branch_name=pr_branch_name,
+            pr_title=pr_title,
+            pr_body=pr_body,
+            push_pr_branch=push_pr_branch,
+            open_pr=open_pr,
+            sandbox_allowlist=sandbox_allowlist,
+            allow_company_pr=allow_company_pr,
+        )
+        print(f"  PR remote        : {state['decision']} — feature branch "
+              f"'{state['feature_branch']}' (see pr_remote_delivery_report.md)")
+
     if feature_plan_only:
         _update_state(run_id, {"status": "feature_plan_only_done", "current_step": "done"})
         log_event(run_id, "feature_plan_only_done")
@@ -7154,6 +7270,7 @@ def pipeline_existing_app_upgrade(
     _maybe_write_pr_delivery_plan()
     if not local_delivery_blocked:
         _maybe_prepare_pr_branch()
+        _maybe_push_pr_branch()
 
     print(f"\n{'='*60}")
     print("  Existing App Upgrade — Feature Sprint Complete")
@@ -9793,6 +9910,8 @@ if __name__ == "__main__":
     parser.add_argument("--pr-title", default=None, metavar="TITLE",
                          help="Suggested PR title; also used (slugified) as the feature-branch "
                               "name seed when --pr-branch is not given.")
+    parser.add_argument("--pr-body", default=None, metavar="BODY",
+                         help="Pull request body for --open-pr. If omitted, an empty body is used.")
     parser.add_argument("--prepare-pr-branch", action="store_true",
                          help="Prepare a local PR feature branch and, when safe changed files "
                               "exist, create a local commit. Local-only: never pushes and never "
@@ -9803,6 +9922,17 @@ if __name__ == "__main__":
     parser.add_argument("--allow-company-local-branch", action="store_true",
                          help="Allow --prepare-pr-branch to create/switch a local feature branch "
                               "in a company-protected repo. Still never pushes or opens a PR.")
+    parser.add_argument("--push-pr-branch", action="store_true",
+                         help="Push the already-prepared PR feature branch with exactly "
+                              "`git push -u origin <branch>`. Requires an approved sandbox remote "
+                              "or --allow-company-pr for company repos. Never pushes main or force-pushes.")
+    parser.add_argument("--open-pr", action="store_true",
+                         help="After the feature branch is pushed or already exists remotely, attempt "
+                              "to open a PR with GitHub CLI. If gh is unavailable, write manual PR "
+                              "instructions instead.")
+    parser.add_argument("--allow-company-pr", action="store_true",
+                         help="Allow branch push / PR creation for a company-protected repo. Does not "
+                              "re-enable disabled push URLs and still never pushes main.")
     args = parser.parse_args()
 
     run_id_arg = args.run_id  # may be None
@@ -9870,15 +10000,62 @@ if __name__ == "__main__":
             args.pr_delivery_plan
             and not args.git_sync_check and not args.git_pull_ff_only and not args.local_git_delivery
             and not args.prepare_pr_branch
+            and not args.push_pr_branch and not args.open_pr
             and not args.continue_run and not args.upgrade_mode
             and not args.resume and not args.jira and not args.input
         )
         standalone_pr_branch = (
             args.prepare_pr_branch
             and not args.git_sync_check and not args.git_pull_ff_only and not args.local_git_delivery
+            and not args.push_pr_branch and not args.open_pr
             and not args.continue_run and not args.upgrade_mode
             and not args.resume and not args.jira and not args.input
         )
+        standalone_pr_remote = (
+            (args.push_pr_branch or args.open_pr)
+            and not args.git_sync_check and not args.git_pull_ff_only and not args.local_git_delivery
+            and not args.prepare_pr_branch
+            and not args.continue_run and not args.upgrade_mode
+            and not args.resume and not args.jira and not args.input
+        )
+        if standalone_pr_remote:
+            repo_path = args.delivery_repo or args.existing_app
+            if not repo_path:
+                print("--push-pr-branch/--open-pr requires --existing-app PATH or --delivery-repo PATH.")
+                sys.exit(1)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path("pr_remote_runs") / f"pr_remote_{ts}"
+            pr_base_branch = args.pr_base_branch or args.base_branch
+            allowlist = set(delivery_mod.DEFAULT_SANDBOX_ALLOWLIST) | set(args.allow_sandbox_remote)
+            state = delivery_mod.run_pr_remote_delivery(
+                repo_path,
+                base_branch=pr_base_branch,
+                branch_name=args.pr_branch,
+                pr_title=args.pr_title,
+                pr_body=args.pr_body,
+                push_pr_branch=args.push_pr_branch,
+                open_pr=args.open_pr,
+                sandbox_allowlist=allowlist,
+                allow_company_pr=args.allow_company_pr,
+                output_dir=output_dir,
+            )
+            print(f"\n{'='*60}")
+            print("  PR Remote Delivery")
+            print(f"  Repo              : {state['repo_path']}")
+            print(f"  Repo type         : {state['repo_type']}")
+            print(f"  Base branch       : {state['base_branch']}")
+            print(f"  Feature branch    : {state['feature_branch']}")
+            print(f"  Decision          : {state['decision']}")
+            print(f"  Push attempted    : {state['push_attempted']}")
+            print(f"  Push succeeded    : {state['push_succeeded']}")
+            if state.get("pr_url"):
+                print(f"  PR URL            : {state['pr_url']}")
+            if state["block_reasons"]:
+                print(f"  Blocker(s)        : {'; '.join(state['block_reasons'])}")
+            print("  No push to main. No force push. No reset/stash/clean/discard.")
+            print(f"  Reports           : {output_dir}")
+            print(f"{'='*60}\n")
+            sys.exit(0 if state["decision"] in ("PUSHED_BRANCH", "PR_CREATED", "MANUAL_PR_REQUIRED", "NO_OP") else 1)
         if standalone_pr_branch:
             repo_path = args.delivery_repo or args.existing_app
             if not repo_path:
@@ -10023,6 +10200,11 @@ if __name__ == "__main__":
                 prepare_pr_branch=args.prepare_pr_branch,
                 pr_commit_message=args.pr_commit_message,
                 allow_company_local_branch=args.allow_company_local_branch,
+                push_pr_branch=args.push_pr_branch,
+                open_pr=args.open_pr,
+                pr_body=args.pr_body,
+                allow_company_pr=args.allow_company_pr,
+                sandbox_allowlist=set(delivery_mod.DEFAULT_SANDBOX_ALLOWLIST) | set(args.allow_sandbox_remote),
             )
             if args.local_git_delivery and not args.feature_plan_only:
                 upgrade_state = load_state(upgrade_run_id)

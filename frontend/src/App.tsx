@@ -4,10 +4,11 @@ import {
   getRuns, getRun, getArtifact, createUpgradeRun, createContinuationRun,
   getDeliveryInfo, getDeliveryPrecheck, createDeliveryCommit, pushDeliverySandbox,
   getGitSyncState, getGitPullState, getPrDeliveryPlanState, getPrBranchPrepState,
+  getPrRemoteDeliveryState,
 } from "./api";
 import type {
   RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState,
-  PrDeliveryPlanState, PrBranchPrepState,
+  PrDeliveryPlanState, PrBranchPrepState, PrRemoteDeliveryState,
 } from "./api";
 import "./App.css";
 
@@ -1217,6 +1218,10 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "pr_branch_plan.md", label: "PR Branch Plan" },
   { file: "pr_branch_state.json", label: "PR Branch State JSON" },
   { file: "local_pr_commit_summary.md", label: "Local PR Commit Summary" },
+  { file: "pr_remote_delivery_report.md", label: "PR Remote Delivery Report" },
+  { file: "pr_remote_state.json", label: "PR Remote State JSON" },
+  { file: "pr_push_result.md", label: "PR Push Result" },
+  { file: "pr_create_result.md", label: "PR Create Result" },
   { file: "existing_app_inventory.md", label: "Existing App Inventory" },
   { file: "baseline_health_check.md", label: "Baseline Health Check" },
   { file: "baseline_behavior_checklist.md", label: "Baseline Behavior Checklist" },
@@ -1576,8 +1581,10 @@ function PrPlanCard({ runId, run, selectedArtifact, onSelectArtifact }: {
 }) {
   const [plan, setPlan] = useState<PrDeliveryPlanState | null>(null);
   const [prep, setPrep] = useState<PrBranchPrepState | null>(null);
+  const [remote, setRemote] = useState<PrRemoteDeliveryState | null>(null);
   const hasArtifact = (run?.artifacts ?? []).includes("pr_state.json");
   const hasPrepArtifact = (run?.artifacts ?? []).includes("pr_branch_state.json");
+  const hasRemoteArtifact = (run?.artifacts ?? []).includes("pr_remote_state.json");
 
   useEffect(() => {
     if (!hasArtifact) { setPlan(null); return; }
@@ -1589,7 +1596,12 @@ function PrPlanCard({ runId, run, selectedArtifact, onSelectArtifact }: {
     getPrBranchPrepState(runId).then(setPrep).catch(() => setPrep(null));
   }, [runId, hasPrepArtifact]);
 
-  if (!run?.pr_plan_status && !plan && !run?.pr_branch_decision && !prep) return null;
+  useEffect(() => {
+    if (!hasRemoteArtifact) { setRemote(null); return; }
+    getPrRemoteDeliveryState(runId).then(setRemote).catch(() => setRemote(null));
+  }, [runId, hasRemoteArtifact]);
+
+  if (!run?.pr_plan_status && !plan && !run?.pr_branch_decision && !prep && !run?.pr_remote_decision && !remote) return null;
 
   const readiness = plan?.pr_readiness ?? run?.pr_plan_status ?? "blocked";
   const readinessBadgeClass =
@@ -1609,6 +1621,17 @@ function PrPlanCard({ runId, run, selectedArtifact, onSelectArtifact }: {
   const prepArtifacts = [
     { file: "pr_branch_plan.md", label: "PR Branch Plan" },
     { file: "local_pr_commit_summary.md", label: "Local PR Commit Summary" },
+  ].filter(a => (run?.artifacts ?? []).includes(a.file));
+  const remoteDecision = remote?.decision ?? run?.pr_remote_decision ?? null;
+  const remoteBadgeClass =
+    remoteDecision === "PR_CREATED" || remoteDecision === "PUSHED_BRANCH" || remoteDecision === "MANUAL_PR_REQUIRED" || remoteDecision === "NO_OP" ? "ok"
+    : remoteDecision === "BLOCKED" || remoteDecision === "FAILED" ? "fail"
+    : "warn";
+  const remoteArtifacts = [
+    { file: "pr_remote_delivery_report.md", label: "PR Remote Delivery Report" },
+    { file: "pr_push_result.md", label: "PR Push Result" },
+    { file: "pr_create_result.md", label: "PR Create Result" },
+    { file: "pr_remote_state.json", label: "PR Remote State" },
   ].filter(a => (run?.artifacts ?? []).includes(a.file));
 
   return (
@@ -1713,6 +1736,72 @@ function PrPlanCard({ runId, run, selectedArtifact, onSelectArtifact }: {
               <div className="delivery-artifacts-label">PR branch artifacts</div>
               <div className="delivery-artifact-tabs">
                 {prepArtifacts.map(a => (
+                  <button
+                    key={a.file}
+                    className={`artifact-tab ${selectedArtifact === a.file ? "active" : ""}`}
+                    onClick={() => onSelectArtifact(a.file)}
+                  >
+                    {a.label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {remoteDecision && (
+        <div className="delivery-artifacts">
+          <div className="delivery-card-header">
+            <div>
+              <div className="delivery-card-title">Remote PR Delivery</div>
+              <div className="delivery-card-sub">
+                {run?.pr_remote_summary ?? "Guarded feature-branch push and optional PR creation."}
+              </div>
+            </div>
+            <span className={`delivery-badge delivery-badge-${remoteBadgeClass}`}>
+              {remoteDecision.replace(/_/g, " ")}
+            </span>
+          </div>
+          <div className="delivery-repo-line">
+            Feature branch: <code>{remote?.feature_branch ?? run?.pr_remote_branch ?? "(unknown)"}</code>
+          </div>
+          <div className="delivery-repo-line">
+            Push attempted: <code>{String(remote?.push_attempted ?? false)}</code>
+            {" "}· Push succeeded: <code>{String(remote?.push_succeeded ?? false)}</code>
+          </div>
+          <div className="delivery-repo-line">
+            PR attempted: <code>{String(remote?.pr_attempted ?? false)}</code>
+            {" "}· PR created: <code>{String(remote?.pr_created ?? false)}</code>
+          </div>
+          {(remote?.pr_url || run?.pr_remote_pr_url) && (
+            <div className="delivery-repo-line">
+              PR URL: <a href={remote?.pr_url ?? run?.pr_remote_pr_url ?? "#"} target="_blank" rel="noreferrer">
+                {remote?.pr_url ?? run?.pr_remote_pr_url}
+              </a>
+            </div>
+          )}
+          {remote?.manual_pr_instructions && (
+            <div className="delivery-warning-panel">
+              <strong>Manual PR required.</strong> {remote.manual_pr_instructions}
+              {remote.manual_pr_url && <> <a href={remote.manual_pr_url} target="_blank" rel="noreferrer">Open compare page</a></>}
+            </div>
+          )}
+          <div className="delivery-repo-line">
+            No main push: <code>{String(remote?.no_main_push_performed ?? true)}</code>
+            {" "}· No force push: <code>{String(remote?.no_force_push_performed ?? true)}</code>
+          </div>
+          {(remote?.block_reasons?.length ?? 0) > 0 && (
+            <div className="delivery-warning-panel delivery-warning-panel-severe">
+              <strong>Remote delivery blocker(s).</strong>
+              <ul>{remote!.block_reasons.map(r => <li key={r}>{r}</li>)}</ul>
+            </div>
+          )}
+          {remoteArtifacts.length > 0 && (
+            <>
+              <div className="delivery-artifacts-label">Remote PR artifacts</div>
+              <div className="delivery-artifact-tabs">
+                {remoteArtifacts.map(a => (
                   <button
                     key={a.file}
                     className={`artifact-tab ${selectedArtifact === a.file ? "active" : ""}`}
