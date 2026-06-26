@@ -1237,6 +1237,13 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "backend_data_flow.md", label: "Backend Data Flow" },
   { file: "backend_env_requirements.md", label: "Backend Env Requirements" },
   { file: "backend_test_plan.md", label: "Backend Test Plan" },
+  { file: "backend_change_boundary.md", label: "Backend Change Boundary" },
+  { file: "backend_change_boundary.json", label: "Backend Change Boundary JSON" },
+  { file: "backend_boundary_summary.md", label: "Backend Boundary Summary" },
+  { file: "backend_smoke_plan.md", label: "Backend Smoke Plan" },
+  { file: "backend_smoke_plan.json", label: "Backend Smoke Plan JSON" },
+  { file: "backend_smoke_results.md", label: "Backend Smoke Results" },
+  { file: "backend_smoke_results.json", label: "Backend Smoke Results JSON" },
   { file: "existing_app_inventory.md", label: "Existing App Inventory" },
   { file: "baseline_health_check.md", label: "Baseline Health Check" },
   { file: "baseline_behavior_checklist.md", label: "Baseline Behavior Checklist" },
@@ -1563,6 +1570,90 @@ function BackendInventoryCard({ run, selectedArtifact, onSelectArtifact }: {
       {artifacts.length > 0 && (
         <div className="delivery-artifacts">
           <div className="delivery-artifacts-label">Backend inventory artifacts</div>
+          <div className="delivery-artifact-tabs">
+            {artifacts.map(a => (
+              <button
+                key={a.file}
+                className={`artifact-tab ${selectedArtifact === a.file ? "active" : ""}`}
+                onClick={() => onSelectArtifact(a.file)}
+              >
+                {a.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Backend Safety — Backend Change Boundary + Backend Smoke Checks. Safety layer
+// that reasons about backend changes BEFORE any backend bugfix/build step touches
+// code. Never makes a code change, commit, push, or PR by itself.
+function BackendSafetyCard({ runId, run, selectedArtifact, onSelectArtifact }: {
+  runId: string;
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
+  const [boundaryJson, setBoundaryJson] = useState<Record<string, unknown> | null>(null);
+  const hasBoundaryArtifact = (run?.artifacts ?? []).includes("backend_change_boundary.json");
+
+  useEffect(() => {
+    if (!hasBoundaryArtifact) { setBoundaryJson(null); return; }
+    getArtifact(runId, "backend_change_boundary.json")
+      .then(a => { try { setBoundaryJson(JSON.parse(a.content)); } catch { setBoundaryJson(null); } })
+      .catch(() => setBoundaryJson(null));
+  }, [runId, hasBoundaryArtifact]);
+
+  if (!run?.backend_boundary_status && !run?.backend_smoke_status) return null;
+
+  const boundaryStatus = run.backend_boundary_status ?? "(not generated)";
+  const smokeStatus = run.backend_smoke_status ?? "(not generated)";
+  const safeToEdit = run.backend_safe_to_edit;
+  const safeToRunChecks = run.backend_safe_to_run_checks;
+  const yesNoWarn = (v: boolean | undefined) => v === true ? "yes" : v === false ? "no" : "warn";
+  const badgeClass = (v: boolean | undefined) => v === true ? "ok" : v === false ? "fail" : "warn";
+
+  const artifacts = [
+    { file: "backend_change_boundary.md", label: "Backend Change Boundary" },
+    { file: "backend_boundary_summary.md", label: "Backend Boundary Summary" },
+    { file: "backend_smoke_plan.md", label: "Backend Smoke Plan" },
+    { file: "backend_smoke_results.md", label: "Backend Smoke Results" },
+  ].filter(a => (run.artifacts ?? []).includes(a.file));
+
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Backend Safety</div>
+          <div className="delivery-card-sub">
+            {run.backend_boundary_summary ?? run.backend_smoke_summary ?? "Backend boundary + smoke-check safety artifacts."}
+          </div>
+        </div>
+      </div>
+      <div className="delivery-warning-panel">
+        Backend safety only — no code changes, commits, pushes, or PRs were created.
+      </div>
+      <div className="delivery-repo-line">
+        Backend boundary: <code>{boundaryStatus}</code>
+        {" "}· Backend smoke: <code>{smokeStatus}</code>
+      </div>
+      <div className="delivery-repo-line">
+        Safe to edit backend: <span className={`delivery-badge delivery-badge-${badgeClass(safeToEdit)}`}>{yesNoWarn(safeToEdit)}</span>
+        {" "}· Safe to run backend checks: <span className={`delivery-badge delivery-badge-${badgeClass(safeToRunChecks)}`}>{yesNoWarn(safeToRunChecks)}</span>
+      </div>
+      {boundaryJson && (
+        <div className="delivery-repo-line">
+          DB/schema edits allowed: <code>{String(boundaryJson.db_schema_edits_allowed)}</code>
+          {" "}· Auth edits allowed: <code>{String(boundaryJson.auth_edits_allowed)}</code>
+          {" "}· Config/env edits allowed: <code>{String(boundaryJson.config_env_edits_allowed)}</code>
+          {" "}· Migration edits allowed: <code>{String(boundaryJson.migration_edits_allowed)}</code>
+        </div>
+      )}
+      {artifacts.length > 0 && (
+        <div className="delivery-artifacts">
+          <div className="delivery-artifacts-label">Backend safety artifacts</div>
           <div className="delivery-artifact-tabs">
             {artifacts.map(a => (
               <button
@@ -2307,6 +2398,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             <SmokeMutationBanner run={run} />
             <BugfixPlanCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <BackendInventoryCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            <BackendSafetyCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <GitSyncCard runId={runId} run={run} />
             <PrPlanCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />

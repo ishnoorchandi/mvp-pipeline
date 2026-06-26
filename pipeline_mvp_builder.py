@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 import requests
@@ -3358,9 +3359,13 @@ def build_bugfix_boundary(parsed: dict, investigation: dict) -> dict:
     }
 
 
-def _render_bugfix_artifacts(parsed: dict, investigation: dict, boundary: dict, readiness: str) -> dict[str, str]:
+def _render_bugfix_artifacts(
+    parsed: dict, investigation: dict, boundary: dict, readiness: str,
+    backend_boundary_status: str | None = None,
+) -> dict[str, str]:
     top = investigation.get("likely_files") or []
     category = parsed["likely_category"]
+    backend_relevant = category in ("backend", "api", "mixed")
     artifacts: dict[str, str] = {}
     artifacts["bug_report_summary.md"] = "\n".join([
         "# Bug Report Summary", "",
@@ -3390,9 +3395,14 @@ def _render_bugfix_artifacts(parsed: dict, investigation: dict, boundary: dict, 
             f"- Files to inspect: `{item['file']}`\n"
         )
     artifacts["bug_hypothesis.md"] = "# Bug Hypothesis\n\n" + ("\n".join(hypotheses) if hypotheses else "- No strong file-level hypothesis yet.\n")
-    rows = ["# Suspected Files", "", "rank | file | area | reason | confidence", "--- | --- | --- | --- | ---"]
+    rows = ["# Suspected Files", "", "rank | file | area | reason | confidence | backend boundary",
+            "--- | --- | --- | --- | --- | ---"]
     for idx, item in enumerate(top, 1):
-        rows.append(f"{idx} | `{item['file']}` | {item['area']} | {item['reason']} | {item['confidence']}")
+        boundary_note = "requires backend boundary enforcement" if item["area"] == "backend" else "-"
+        rows.append(f"{idx} | `{item['file']}` | {item['area']} | {item['reason']} | {item['confidence']} | {boundary_note}")
+    if backend_relevant:
+        rows += ["", f"Backend files in this list require enforcement against `backend_change_boundary.json` "
+                      f"(status: `{backend_boundary_status or 'not_generated'}`)."]
     artifacts["suspected_files.md"] = "\n".join(rows) + "\n"
     curl = ""
     if parsed["api_endpoint_clues"]:
@@ -3411,7 +3421,7 @@ def _render_bugfix_artifacts(parsed: dict, investigation: dict, boundary: dict, 
         "## Database",
         "- Read-only checks only unless an explicit schema/migration approval is given.",
     ]) + "\n"
-    artifacts["minimal_fix_plan.md"] = "\n".join([
+    minimal_fix_plan_lines = [
         "# Minimal Fix Plan", "",
         "- Smallest likely change: inspect the highest-confidence suspected files and patch only the failing code path.",
         f"- Files allowed to edit: {', '.join(f'`{f}`' for f in boundary['allowed_files']) or '(none yet)'}",
@@ -3420,7 +3430,17 @@ def _render_bugfix_artifacts(parsed: dict, investigation: dict, boundary: dict, 
         "- Tests/checks to run: targeted unit/integration test, app build/startup check, and reproduction steps above.",
         "- Risks: touching unrelated files, broad rewrites, hidden auth/config side effects.",
         "- Rollback plan: revert only the bugfix commit or restore changed files from git.",
-    ]) + "\n"
+    ]
+    if backend_relevant:
+        minimal_fix_plan_lines += [
+            "",
+            "## Backend Smoke Checks To Run",
+            f"- Backend boundary status: `{backend_boundary_status or 'not_generated'}` "
+            "(see backend_change_boundary.md if generated).",
+            "- Run `--backend-smoke-checks --backend-smoke-plan-only` against this repo before any backend fix, "
+            "then run the listed safe_automatic_checks once the fix is made.",
+        ]
+    artifacts["minimal_fix_plan.md"] = "\n".join(minimal_fix_plan_lines) + "\n"
     artifacts["bugfix_boundary.md"] = "\n".join([
         "# Bugfix Boundary", "",
         f"**Boundary status:** `{boundary['status']}`",
@@ -3457,6 +3477,8 @@ def _render_bugfix_artifacts(parsed: dict, investigation: dict, boundary: dict, 
         "suspected_files_count": len(top),
         "top_suspected_files": top[:5],
         "bugfix_boundary_status": boundary["status"],
+        "backend_relevant": backend_relevant,
+        "backend_boundary_status": backend_boundary_status,
         "parsed_report": {k: v for k, v in parsed.items() if k != "raw_report"},
         "investigation": investigation,
         "boundary": boundary,
@@ -3494,9 +3516,31 @@ def run_bugfix_planning(
         readiness = "blocked" if git_sync_state.get("is_dirty") else ("warning" if git_sync_state.get("sync_status") != "up_to_date" else boundary["status"])
     elif not existing_app_path.exists():
         readiness = "blocked"
-    artifacts = _render_bugfix_artifacts(parsed, investigation, boundary, readiness)
+
+    # Cheap and automatic when the bug looks backend/API-shaped — generates the
+    # backend_change_boundary.* artifacts alongside the bugfix artifacts so any
+    # later backend fix step has a boundary to enforce against. Must never break
+    # bugfix mode: any failure here downgrades to a warning, not an error.
+    backend_relevant = parsed["likely_category"] in ("backend", "api", "mixed")
+    backend_boundary_state = None
+    backend_boundary_warning: str | None = None
+    if backend_relevant and existing_app_path.exists():
+        try:
+            backend_boundary_state = run_backend_change_boundary(
+                existing_app_path, output_dir, bug_report_text=bug_report_text,
+                bugfix_state={"boundary": boundary, "parsed_report": parsed},
+            )
+        except Exception as e:
+            backend_boundary_warning = f"Backend boundary generation skipped: {e}"
+
+    artifacts = _render_bugfix_artifacts(
+        parsed, investigation, boundary, readiness,
+        backend_boundary_status=(backend_boundary_state or {}).get("status"),
+    )
     if inventory_warning:
         artifacts["bug_report_summary.md"] += f"\n**Warning:** {inventory_warning}\n"
+    if backend_boundary_warning:
+        artifacts["bug_report_summary.md"] += f"\n**Warning:** {backend_boundary_warning}\n"
     for name, content in artifacts.items():
         (output_dir / name).write_text(content, encoding="utf-8")
     state = json.loads(artifacts["bug_report_state.json"])
@@ -3504,6 +3548,8 @@ def run_bugfix_planning(
     state["git_sync_state"] = git_sync_state
     state["bugfix_artifacts"] = BUGFIX_ARTIFACTS
     state["bugfix_summary"] = f"{state['bug_category']} / {state['bug_severity']} — {state['suspected_files_count']} suspected file(s)"
+    if backend_boundary_state:
+        state["backend_boundary_artifacts"] = BACKEND_BOUNDARY_ARTIFACTS
     (output_dir / "bug_report_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
     return state
 
@@ -3516,7 +3562,7 @@ def run_existing_app_bugfix_planning(
 ) -> dict:
     rdir = run_dir(run_id)
     state = run_bugfix_planning(existing_app_path, bug_report_text, bug_title=bug_title, output_dir=rdir)
-    _update_state(run_id, {
+    updates = {
         "bugfix_mode": True,
         "bug_title": state["bug_title"],
         "bug_category": state["bug_category"],
@@ -3527,7 +3573,15 @@ def run_existing_app_bugfix_planning(
         "bugfix_boundary_status": state["bugfix_boundary_status"],
         "bugfix_build_readiness": state["build_readiness"],
         "bugfix_top_suspected_files": state.get("top_suspected_files", []),
-    })
+    }
+    if state.get("backend_boundary_artifacts"):
+        updates["backend_boundary_status"] = state.get("backend_boundary_status")
+        updates["backend_boundary_artifacts"] = state["backend_boundary_artifacts"]
+        updates["backend_boundary_summary"] = (
+            f"Generated automatically from bugfix mode ({state['bug_category']} bug) — "
+            f"status `{state.get('backend_boundary_status')}`"
+        )
+    _update_state(run_id, updates)
     return state
 
 
@@ -4318,6 +4372,614 @@ def run_existing_app_backend_inventory(
         "backend_inventory_summary": summary,
     })
     return inv
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Backend Change Boundary + Backend Smoke Checks
+# ═════════════════════════════════════════════════════════════════════════════
+# Safety layer that lets the pipeline reason about backend changes BEFORE any
+# backend bugfix/build step touches code. --backend-boundary writes boundary
+# artifacts only. --backend-smoke-checks defaults to plan-only; actual execution
+# only runs explicit, safe commands (an explicit --backend-test-command, or a
+# command this module classifies as auto_runnable). Never starts a server
+# without an explicit --backend-start-command (and always terminates it).
+# Never runs migrations, DB writes, or seed/reset commands automatically. Never
+# targets a production URL.
+
+BACKEND_BOUNDARY_ARTIFACTS = [
+    "backend_change_boundary.md",
+    "backend_change_boundary.json",
+    "backend_boundary_summary.md",
+]
+BACKEND_SMOKE_PLAN_ARTIFACTS = ["backend_smoke_plan.md", "backend_smoke_plan.json"]
+BACKEND_SMOKE_RESULTS_ARTIFACTS = ["backend_smoke_results.md", "backend_smoke_results.json"]
+
+BACKEND_BOUNDARY_FORBIDDEN_PATHS = [
+    ".env", "secrets", "node_modules", "venv", ".venv", "runs",
+    "delivery_runs", "git_sync_runs", "pr_branch_runs", "pr_delivery_runs", "pr_remote_runs",
+    "bugfix_runs", "backend_inventory_runs", "backend_boundary_runs", "backend_smoke_runs",
+    "dist", "build", "__pycache__", ".git",
+]
+
+_BACKEND_BOUNDARY_AUTH_RE = re.compile(r"\b(auth|login|logout|session|permission|jwt|token)\b", re.I)
+_BACKEND_BOUNDARY_DB_RE = re.compile(r"\b(database|schema|migration|sql|table|column)\b", re.I)
+_BACKEND_BOUNDARY_CONFIG_RE = re.compile(r"\b(config|environment variable|env var|\.env)\b", re.I)
+_BACKEND_BOUNDARY_NEW_ENDPOINT_RE = re.compile(
+    r"\bnew endpoint\b|\badd (an? )?(api|route|endpoint)\b|\bcreate (an? )?(api|route|endpoint)\b", re.I,
+)
+_BACKEND_BOUNDARY_DELETE_ENDPOINT_RE = re.compile(r"\b(delete|remove) (an? )?(api|route|endpoint)\b", re.I)
+_BACKEND_BOUNDARY_ROUTE_SIGNATURE_RE = re.compile(
+    r"\b(change|rename|update) (the )?(route|endpoint|signature|method) (path|name|signature)?\b", re.I,
+)
+_BACKEND_BOUNDARY_MIGRATION_RE = re.compile(r"\b(migration|alembic|schema change|db migration)\b", re.I)
+
+
+def detect_backend_change_clues(text: str) -> dict:
+    """Deterministic regex clues from a feature request / bug report. Every risky
+    backend boundary toggle defaults to False unless one of these clues fires."""
+    text = text or ""
+    return {
+        "db_clue": bool(_BACKEND_BOUNDARY_DB_RE.search(text)),
+        "auth_clue": bool(_BACKEND_BOUNDARY_AUTH_RE.search(text)),
+        "config_clue": bool(_BACKEND_BOUNDARY_CONFIG_RE.search(text)),
+        "migration_clue": bool(_BACKEND_BOUNDARY_MIGRATION_RE.search(text)),
+        "new_endpoint_clue": bool(_BACKEND_BOUNDARY_NEW_ENDPOINT_RE.search(text)),
+        "delete_endpoint_clue": bool(_BACKEND_BOUNDARY_DELETE_ENDPOINT_RE.search(text)),
+        "route_signature_clue": bool(_BACKEND_BOUNDARY_ROUTE_SIGNATURE_RE.search(text)),
+    }
+
+
+def build_backend_change_boundary(
+    existing_app_path,
+    backend_inventory: dict | None = None,
+    bugfix_state: dict | None = None,
+    feature_request_text: str | None = None,
+    bug_report_text: str | None = None,
+) -> dict:
+    """Combines backend inventory (route/API-client files), a bugfix boundary (if
+    present), and explicit clues from the feature request / bug report into one
+    backend-specific change boundary. Every risky toggle defaults to forbidden
+    unless explicitly required by a clue. Deleting an endpoint is always
+    forbidden; config/env edits are always forbidden — no clue overrides those."""
+    existing_app_path = Path(existing_app_path)
+    combined_text = "\n".join([t for t in (feature_request_text, bug_report_text) if t])
+    clues = detect_backend_change_clues(combined_text)
+
+    allowed_backend_files: list[str] = []
+    allowed_frontend_api_client_files: list[str] = []
+    allowed_test_files: list[str] = []
+    protected_files: list[str] = []
+
+    if backend_inventory:
+        allowed_backend_files = sorted({r["file"] for r in (backend_inventory.get("routes") or [])})
+        allowed_frontend_api_client_files = sorted({c["file"] for c in (backend_inventory.get("frontend_api_calls") or [])})
+
+    if bugfix_state:
+        bf_boundary = bugfix_state.get("boundary") or {}
+        for f in bf_boundary.get("allowed_files") or []:
+            lower = f.lower()
+            if re.search(r"(test|spec)\.", lower) or "/test" in lower or "/__tests__/" in lower:
+                if f not in allowed_test_files:
+                    allowed_test_files.append(f)
+            elif f not in allowed_backend_files and f not in allowed_frontend_api_client_files:
+                allowed_backend_files.append(f)
+        protected_files = list(bf_boundary.get("protected_files") or [])
+        parsed_report = bugfix_state.get("parsed_report") or {}
+        clues["db_clue"] = clues["db_clue"] or bool(parsed_report.get("database_clues"))
+        clues["auth_clue"] = clues["auth_clue"] or bool(parsed_report.get("auth_clues"))
+
+    allowed_directories = sorted({
+        str(Path(f).parent) for f in (allowed_backend_files + allowed_frontend_api_client_files + allowed_test_files)
+        if str(Path(f).parent) != "."
+    })
+
+    status = "ready" if (allowed_backend_files or allowed_frontend_api_client_files) else "warning"
+
+    return {
+        "repo_path": str(existing_app_path),
+        "allowed_backend_files": allowed_backend_files[:30],
+        "allowed_frontend_api_client_files": allowed_frontend_api_client_files[:30],
+        "allowed_test_files": allowed_test_files[:30],
+        "allowed_directories": allowed_directories[:30],
+        "protected_files": sorted(set(protected_files))[:30],
+        "forbidden_paths": BACKEND_BOUNDARY_FORBIDDEN_PATHS,
+        "db_schema_edits_allowed": clues["db_clue"],
+        "auth_edits_allowed": clues["auth_clue"],
+        "config_env_edits_allowed": False,
+        "migration_edits_allowed": clues["migration_clue"],
+        "route_signature_edits_allowed": clues["route_signature_clue"],
+        "new_endpoint_allowed": clues["new_endpoint_clue"],
+        "delete_endpoint_allowed": False,
+        "status": status,
+        "clues": clues,
+    }
+
+
+def generate_backend_boundary_reports(boundary: dict, output_dir) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Backend Change Boundary", "",
+        "Backend boundary only — no code changes, commits, pushes, or PRs were created.", "",
+        f"**Status:** `{boundary['status']}`",
+        f"**Repo path:** `{boundary['repo_path']}`", "",
+        "## Allowed Backend Files",
+        *[f"- `{f}`" for f in (boundary["allowed_backend_files"] or ["(none yet)"])], "",
+        "## Allowed Frontend API Client Files",
+        *[f"- `{f}`" for f in (boundary["allowed_frontend_api_client_files"] or ["(none)"])], "",
+        "## Allowed Test Files",
+        *[f"- `{f}`" for f in (boundary["allowed_test_files"] or ["(none)"])], "",
+        "## Allowed Directories",
+        *[f"- `{d}`" for d in (boundary["allowed_directories"] or ["(none)"])], "",
+        "## Protected Files",
+        *[f"- `{f}`" for f in (boundary["protected_files"] or ["(none explicitly)"])], "",
+        "## Forbidden Paths",
+        *[f"- `{p}`" for p in boundary["forbidden_paths"]], "",
+        "## Rules",
+        f"- DB/schema edits allowed: {boundary['db_schema_edits_allowed']}",
+        f"- Auth edits allowed: {boundary['auth_edits_allowed']}",
+        f"- Config/env edits allowed: {boundary['config_env_edits_allowed']}",
+        f"- Migration edits allowed: {boundary['migration_edits_allowed']}",
+        f"- Route signature edits allowed: {boundary['route_signature_edits_allowed']}",
+        f"- New endpoint allowed: {boundary['new_endpoint_allowed']}",
+        f"- Delete endpoint allowed: {boundary['delete_endpoint_allowed']}",
+    ]
+    (output_dir / "backend_change_boundary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (output_dir / "backend_change_boundary.json").write_text(json.dumps(boundary, indent=2), encoding="utf-8")
+    summary = "\n".join([
+        "# Backend Boundary Summary", "",
+        "Backend boundary only — no code changes, commits, pushes, or PRs were created.", "",
+        f"- Status: `{boundary['status']}`",
+        f"- Allowed backend files: {len(boundary['allowed_backend_files'])}",
+        f"- Allowed frontend API client files: {len(boundary['allowed_frontend_api_client_files'])}",
+        f"- DB/schema edits allowed: {boundary['db_schema_edits_allowed']}",
+        f"- Auth edits allowed: {boundary['auth_edits_allowed']}",
+        f"- Config/env edits allowed: {boundary['config_env_edits_allowed']}",
+        f"- Migration edits allowed: {boundary['migration_edits_allowed']}",
+    ]) + "\n"
+    (output_dir / "backend_boundary_summary.md").write_text(summary, encoding="utf-8")
+
+
+def run_backend_change_boundary(
+    existing_app_path, output_dir,
+    feature_request_text: str | None = None, bug_report_text: str | None = None,
+    bugfix_state: dict | None = None,
+) -> dict:
+    """Standalone orchestrator: cheap backend inventory subset + boundary build +
+    write the 3 boundary artifacts into output_dir. Read-only."""
+    existing_app_path = Path(existing_app_path).resolve()
+    inv = None
+    if existing_app_path.exists():
+        try:
+            inv = generate_backend_inventory_for_bugfix(existing_app_path)
+        except Exception:
+            inv = None
+    boundary = build_backend_change_boundary(
+        existing_app_path, backend_inventory=inv, bugfix_state=bugfix_state,
+        feature_request_text=feature_request_text, bug_report_text=bug_report_text,
+    )
+    generate_backend_boundary_reports(boundary, output_dir)
+    return boundary
+
+
+def run_existing_app_backend_change_boundary(
+    run_id: str, existing_app_path,
+    feature_request_text: str | None = None, bug_report_text: str | None = None,
+    bugfix_state: dict | None = None,
+) -> dict:
+    """Writes the 3 backend boundary artifacts into the run folder and records
+    backend_boundary_status/backend_boundary_artifacts/backend_boundary_summary/
+    backend_safe_to_edit on run_state.json. Read-only."""
+    rdir = run_dir(run_id)
+    boundary = run_backend_change_boundary(
+        existing_app_path, rdir, feature_request_text=feature_request_text,
+        bug_report_text=bug_report_text, bugfix_state=bugfix_state,
+    )
+    safe_to_edit = boundary["status"] == "ready"
+    summary = (
+        f"{boundary['status']} — {len(boundary['allowed_backend_files'])} backend file(s), "
+        f"{len(boundary['allowed_frontend_api_client_files'])} frontend API client file(s) in scope"
+    )
+    _update_state(run_id, {
+        "backend_boundary_status": boundary["status"],
+        "backend_boundary_artifacts": BACKEND_BOUNDARY_ARTIFACTS,
+        "backend_boundary_summary": summary,
+        "backend_safe_to_edit": safe_to_edit,
+    })
+    return boundary
+
+
+_BACKEND_SMOKE_FORBIDDEN_SCRIPT_RE = re.compile(r"\b(migrate|seed|reset|drop|destroy)\b", re.I)
+
+
+def detect_backend_smoke_plan(
+    existing_app_path, backend_inventory: dict | None = None,
+    health_endpoint: str | None = None, test_command: str | None = None,
+) -> dict:
+    """Suggested safe checks only — nothing here is ever run by this function.
+    run_backend_smoke_checks decides what actually executes, and only from
+    safe_automatic_checks marked auto_runnable (or an explicit test_command)."""
+    existing_app_path = Path(existing_app_path)
+    safe_automatic: list[dict] = []
+    manual: list[dict] = []
+    requires_env: list[dict] = []
+    db_read_only: list[dict] = []
+    forbidden_automatic: list[dict] = []
+
+    py_files = [str(p.relative_to(existing_app_path)) for p in _iter_repo_files(existing_app_path, exts=(".py",), max_files=200)]
+    if py_files:
+        safe_automatic.append({
+            "name": "Python compile check", "command": f"python -m py_compile {' '.join(py_files[:25])}",
+            "reason": "Syntax-only check; never imports or executes app code.",
+            "classification": "safe", "auto_runnable": True,
+        })
+
+    if test_command:
+        safe_automatic.append({
+            "name": "User-provided backend test command", "command": test_command,
+            "reason": "Explicitly provided via --backend-test-command.",
+            "classification": "safe", "auto_runnable": True,
+        })
+    else:
+        has_pytest_signal = any(
+            path.name in ("requirements.txt", "pyproject.toml") and re.search(r"\bpytest\b", _safe_read_text(path), re.I)
+            for path in _iter_repo_files(existing_app_path, exts=(".txt", ".toml"))
+        )
+        has_test_dir = any(
+            path.parent.name in ("tests", "test") for path in _iter_repo_files(existing_app_path, max_files=2000)
+        )
+        if has_pytest_signal or has_test_dir:
+            safe_automatic.append({
+                "name": "pytest", "command": "python -m pytest",
+                "reason": "pytest detected via requirements/pyproject or a tests/ directory.",
+                "classification": "safe", "auto_runnable": True,
+            })
+
+    frameworks = detect_backend_frameworks(existing_app_path)
+    if any(f["framework"] in ("Flask", "FastAPI") for f in frameworks):
+        manual.append({
+            "name": "Flask/FastAPI app import check", "command": "python -c \"import <app module>\"",
+            "reason": "Importing the app module may have side effects (DB connections, startup hooks) — run manually.",
+            "classification": "manual", "auto_runnable": False,
+        })
+
+    for path in _iter_repo_files(existing_app_path, exts=(".json",)):
+        if path.name != "package.json":
+            continue
+        pkg = _safe_read_json(path)
+        scripts = pkg.get("scripts", {}) if isinstance(pkg, dict) else {}
+        rel = str(path.parent.relative_to(existing_app_path))
+        prefix = f"cd {rel} && " if rel != "." else ""
+        for key, runner in (("test", "npm test"), ("build", "npm run build")):
+            if key not in scripts:
+                continue
+            cmd = f"{prefix}{runner}"
+            if _BACKEND_SMOKE_FORBIDDEN_SCRIPT_RE.search(scripts[key]):
+                forbidden_automatic.append({
+                    "name": f"npm {key} ({rel})", "command": cmd,
+                    "reason": f"Script body matches a destructive pattern: `{scripts[key]}`.",
+                    "classification": "forbidden", "auto_runnable": False,
+                })
+            else:
+                safe_automatic.append({
+                    "name": f"npm {key} ({rel})" if rel != "." else f"npm {key}", "command": cmd,
+                    "reason": f"`{key}` script detected in package.json.", "classification": "safe", "auto_runnable": True,
+                })
+        for key in ("typecheck", "type-check"):
+            if key in scripts:
+                safe_automatic.append({
+                    "name": f"npm run {key}", "command": f"{prefix}npm run {key}",
+                    "reason": f"`{key}` script detected in package.json.", "classification": "safe", "auto_runnable": True,
+                })
+        for key in ("migrate", "seed", "reset", "db:migrate", "db:seed", "db:reset"):
+            if key in scripts:
+                forbidden_automatic.append({
+                    "name": f"npm run {key}", "command": f"{prefix}npm run {key}",
+                    "reason": "Migration/seed/reset commands are never run automatically.",
+                    "classification": "forbidden", "auto_runnable": False,
+                })
+
+    for path in _iter_repo_files(existing_app_path, exts=(".py",)):
+        if path.name == "manage.py":
+            forbidden_automatic.append({
+                "name": "python manage.py migrate", "command": "python manage.py migrate",
+                "reason": "Django migrations are never run automatically — requires human approval.",
+                "classification": "forbidden", "auto_runnable": False,
+            })
+            break
+
+    routes = (backend_inventory or {}).get("routes") or []
+    resolved_health_endpoint = health_endpoint or next(
+        (r["path"] for r in routes if re.search(r"health|status|ping", r["path"], re.I)), None,
+    )
+    if resolved_health_endpoint:
+        requires_env.append({
+            "name": "Health endpoint check", "command": f"curl -i http://localhost:PORT{resolved_health_endpoint}",
+            "reason": "Requires a running server on a known port — only run with an explicit --backend-start-command.",
+            "classification": "requires_env", "auto_runnable": False,
+        })
+    for r in routes[:5]:
+        if r["path"] == resolved_health_endpoint:
+            continue
+        requires_env.append({
+            "name": f"Route check: {r['method']} {r['path']}", "command": f"curl -i http://localhost:PORT{r['path']}",
+            "reason": "Requires a running server — manual or requires an explicit --backend-start-command.",
+            "classification": "requires_env", "auto_runnable": False,
+        })
+
+    db_read_only.append({
+        "name": "Read-only DB check", "command": "(no DB connection configured)",
+        "reason": "Only a read-only SELECT/count query would ever be suggested here, and only when explicitly configured.",
+        "classification": "db_read_only", "auto_runnable": False,
+    })
+    forbidden_automatic.append({
+        "name": "Production commands/URLs", "command": "(none — never generated)",
+        "reason": "Production URLs/commands are never targeted by smoke checks.",
+        "classification": "forbidden", "auto_runnable": False,
+    })
+
+    return {
+        "safe_automatic_checks": safe_automatic,
+        "manual_checks": manual,
+        "requires_env_checks": requires_env,
+        "db_read_only_checks": db_read_only,
+        "forbidden_automatic_checks": forbidden_automatic,
+        "health_endpoint": resolved_health_endpoint,
+    }
+
+
+def generate_backend_smoke_plan_reports(plan: dict, output_dir) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["# Backend Smoke Plan", "", "Plan only — nothing in this file has been executed.", ""]
+    for title, key in (
+        ("Safe Automatic Checks", "safe_automatic_checks"),
+        ("Manual Checks", "manual_checks"),
+        ("Requires Environment Checks", "requires_env_checks"),
+        ("DB Read-Only Checks", "db_read_only_checks"),
+        ("Forbidden Automatic Checks", "forbidden_automatic_checks"),
+    ):
+        lines.append(f"## {title}")
+        items = plan.get(key) or []
+        if items:
+            lines.extend(f"- **{item['name']}** — `{item['command']}` — {item['reason']}" for item in items)
+        else:
+            lines.append("- (none)")
+        lines.append("")
+    (output_dir / "backend_smoke_plan.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (output_dir / "backend_smoke_plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
+
+
+def run_backend_smoke_checks(
+    existing_app_path, plan: dict,
+    test_command: str | None = None, start_command: str | None = None,
+    health_endpoint: str | None = None, timeout: int = 60,
+) -> list[dict]:
+    """Runs only an explicit test_command, or safe_automatic_checks marked
+    auto_runnable. Never runs anything from forbidden_automatic_checks — those
+    are recorded as 'skip'. Never starts a server unless start_command is
+    explicitly given, and always terminates it (with a timeout) before
+    returning."""
+    existing_app_path = Path(existing_app_path)
+    results: list[dict] = []
+
+    def _run(name: str, command: str, classification: str) -> dict:
+        try:
+            proc = subprocess.run(
+                command, shell=True, cwd=str(existing_app_path),
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return {
+                "check": name, "command": command, "exit_code": proc.returncode,
+                "status": "pass" if proc.returncode == 0 else "fail",
+                "stdout_excerpt": (proc.stdout or "")[-2000:], "stderr_excerpt": (proc.stderr or "")[-2000:],
+                "timed_out": False, "safety_classification": classification,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "check": name, "command": command, "exit_code": None, "status": "fail",
+                "stdout_excerpt": "", "stderr_excerpt": f"Timed out after {timeout}s.",
+                "timed_out": True, "safety_classification": classification,
+            }
+        except Exception as e:
+            return {
+                "check": name, "command": command, "exit_code": None, "status": "fail",
+                "stdout_excerpt": "", "stderr_excerpt": str(e),
+                "timed_out": False, "safety_classification": classification,
+            }
+
+    if test_command:
+        results.append(_run("User-provided backend test command", test_command, "safe"))
+    else:
+        for item in plan.get("safe_automatic_checks") or []:
+            if item.get("auto_runnable"):
+                results.append(_run(item["name"], item["command"], "safe"))
+
+    for item in plan.get("forbidden_automatic_checks") or []:
+        results.append({
+            "check": item["name"], "command": item["command"], "exit_code": None, "status": "skip",
+            "stdout_excerpt": "", "stderr_excerpt": "", "timed_out": False, "safety_classification": "forbidden",
+        })
+
+    resolved_health_endpoint = health_endpoint or plan.get("health_endpoint")
+    if start_command:
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                start_command, shell=True, cwd=str(existing_app_path),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            time.sleep(min(5, timeout))
+            check_status, excerpt = "skip", "no health endpoint configured"
+            if resolved_health_endpoint:
+                try:
+                    with urllib.request.urlopen(f"http://localhost:8000{resolved_health_endpoint}", timeout=5) as resp:
+                        check_status = "pass" if resp.status < 400 else "fail"
+                        excerpt = f"HTTP {resp.status}"
+                except Exception as e:
+                    check_status, excerpt = "fail", str(e)
+            results.append({
+                "check": "Backend start command + health check", "command": start_command,
+                "exit_code": None, "status": check_status, "stdout_excerpt": excerpt, "stderr_excerpt": "",
+                "timed_out": False, "safety_classification": "requires_env",
+            })
+        finally:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+    return results
+
+
+def generate_backend_smoke_results_reports(results: list[dict], output_dir) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["# Backend Smoke Results", "", "Results from explicitly safe checks only.", "",
+              "check | command | status | exit code | timed out | safety",
+              "--- | --- | --- | --- | --- | ---"]
+    for r in results:
+        lines.append(
+            f"{r['check']} | `{r['command']}` | {r['status']} | {r['exit_code']} | {r['timed_out']} | {r['safety_classification']}"
+        )
+    if not results:
+        lines.append("(no checks executed)")
+    (output_dir / "backend_smoke_results.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (output_dir / "backend_smoke_results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+
+
+def run_backend_smoke(
+    existing_app_path, output_dir, plan_only: bool = True,
+    health_endpoint: str | None = None, test_command: str | None = None, start_command: str | None = None,
+) -> dict:
+    """Standalone orchestrator: build the smoke plan, write its artifacts, and
+    (only if plan_only is False) run safe checks and write results artifacts."""
+    existing_app_path = Path(existing_app_path).resolve()
+    inv = generate_backend_inventory_for_bugfix(existing_app_path) if existing_app_path.exists() else None
+    plan = detect_backend_smoke_plan(existing_app_path, backend_inventory=inv, health_endpoint=health_endpoint, test_command=test_command)
+    generate_backend_smoke_plan_reports(plan, output_dir)
+    results = None
+    if not plan_only:
+        results = run_backend_smoke_checks(
+            existing_app_path, plan, test_command=test_command, start_command=start_command, health_endpoint=health_endpoint,
+        )
+        generate_backend_smoke_results_reports(results, output_dir)
+    return {"plan": plan, "results": results}
+
+
+def run_existing_app_backend_smoke(
+    run_id: str, existing_app_path, plan_only: bool = True,
+    health_endpoint: str | None = None, test_command: str | None = None, start_command: str | None = None,
+) -> dict:
+    """Writes backend smoke plan (and, if not plan_only, results) artifacts into
+    the run folder and records backend_smoke_status/backend_smoke_artifacts/
+    backend_smoke_summary/backend_safe_to_run_checks on run_state.json."""
+    rdir = run_dir(run_id)
+    outcome = run_backend_smoke(
+        existing_app_path, rdir, plan_only=plan_only,
+        health_endpoint=health_endpoint, test_command=test_command, start_command=start_command,
+    )
+    plan, results = outcome["plan"], outcome["results"]
+    artifacts = list(BACKEND_SMOKE_PLAN_ARTIFACTS)
+    if results is not None:
+        artifacts += BACKEND_SMOKE_RESULTS_ARTIFACTS
+        failed = sum(1 for r in results if r["status"] == "fail")
+        status = "fail" if failed else "pass"
+        summary = f"{len(results)} check(s) run — {failed} failed"
+        safe_to_run = not failed
+    else:
+        status = "plan_only"
+        summary = (
+            f"{len(plan['safe_automatic_checks'])} safe automatic check(s), "
+            f"{len(plan['forbidden_automatic_checks'])} forbidden automatic check(s) identified"
+        )
+        safe_to_run = len(plan["safe_automatic_checks"]) > 0
+    _update_state(run_id, {
+        "backend_smoke_status": status,
+        "backend_smoke_artifacts": artifacts,
+        "backend_smoke_summary": summary,
+        "backend_safe_to_run_checks": safe_to_run,
+    })
+    return outcome
+
+
+def _touches_forbidden_backend_path(f: str, forbidden_paths: list[str]) -> bool:
+    parts = Path(f).parts
+    name = Path(f).name
+    for forbidden in forbidden_paths:
+        if forbidden in parts or name == forbidden or name.startswith(forbidden):
+            return True
+    return False
+
+
+def check_backend_change_boundary(boundary: dict, changed_files: list[str]) -> dict:
+    """Compares changed backend files against a backend_change_boundary dict (as
+    produced by build_backend_change_boundary / loaded from
+    backend_change_boundary.json). Does not block any flow yet — exposed so a
+    future build/fix step can wire it in. Never raises on unexpected input."""
+    allowed = (
+        set(boundary.get("allowed_backend_files") or [])
+        | set(boundary.get("allowed_frontend_api_client_files") or [])
+        | set(boundary.get("allowed_test_files") or [])
+    )
+    allowed_dirs = boundary.get("allowed_directories") or []
+    protected = set(boundary.get("protected_files") or [])
+    forbidden_paths = boundary.get("forbidden_paths") or []
+
+    violations: list[str] = []
+    allowed_files_matched: list[str] = []
+    forbidden_paths_touched: list[str] = []
+    protected_files_touched: list[str] = []
+    db_schema_violation = False
+    auth_violation = False
+    config_env_violation = False
+    route_signature_violation = False
+
+    for f in changed_files:
+        if _touches_forbidden_backend_path(f, forbidden_paths):
+            forbidden_paths_touched.append(f)
+            violations.append(f"forbidden path touched: {f}")
+            continue
+        if f in protected:
+            protected_files_touched.append(f)
+            violations.append(f"protected file touched: {f}")
+            continue
+
+        in_allowed_dir = any(f == d or f.startswith(f"{d}/") for d in allowed_dirs)
+        if f in allowed or in_allowed_dir:
+            allowed_files_matched.append(f)
+        else:
+            violations.append(f"file not in backend boundary: {f}")
+
+        lower = f.lower()
+        if (lower.endswith(".sql") or "migration" in lower or "schema" in lower) and not boundary.get("db_schema_edits_allowed"):
+            db_schema_violation = True
+            violations.append(f"DB/schema edit not allowed: {f}")
+        if re.search(r"auth|login|session|jwt", lower) and not boundary.get("auth_edits_allowed"):
+            auth_violation = True
+            violations.append(f"auth edit not allowed: {f}")
+        if (lower.endswith(".env") or ".env." in lower or "/config" in lower or lower.startswith("config")) and not boundary.get("config_env_edits_allowed"):
+            config_env_violation = True
+            violations.append(f"config/env edit not allowed: {f}")
+
+    hard_fail = bool(
+        forbidden_paths_touched or protected_files_touched
+        or db_schema_violation or auth_violation or config_env_violation or route_signature_violation
+    )
+    status = "fail" if hard_fail else ("warn" if violations else "pass")
+
+    return {
+        "status": status,
+        "violations": violations,
+        "allowed_files_matched": allowed_files_matched,
+        "forbidden_paths_touched": forbidden_paths_touched,
+        "protected_files_touched": protected_files_touched,
+        "db_schema_violation": db_schema_violation,
+        "auth_violation": auth_violation,
+        "config_env_violation": config_env_violation,
+        "route_signature_violation": route_signature_violation,
+    }
 
 
 def _detect_frontend_framework(deps: dict) -> str | None:
@@ -8104,6 +8766,12 @@ def pipeline_existing_app_upgrade(
     backend_inventory: bool = False,
     backend_root: str | None = None,
     frontend_root: str | None = None,
+    backend_boundary: bool = False,
+    backend_smoke_checks: bool = False,
+    backend_smoke_plan_only: bool = True,
+    backend_health_endpoint: str | None = None,
+    backend_test_command: str | None = None,
+    backend_start_command: str | None = None,
 ) -> str:
     """
     Existing App Upgrade mode entry point. Additive, not generative-from-scratch:
@@ -8210,6 +8878,48 @@ def pipeline_existing_app_upgrade(
         print("  Inventory only — no code changes, commits, pushes, or PRs were created.")
         print(f"\n{'='*60}")
         print("  Backend inventory complete")
+        print(f"  Run folder : {rdir}")
+        print(f"{'='*60}\n")
+        return run_id
+
+    if backend_boundary or backend_smoke_checks:
+        repo_dirty = bool(git_sync_state and git_sync_state.get("is_dirty"))
+        if backend_boundary:
+            print("▶ Backend Boundary  Writing backend change boundary artifacts (read-only)...")
+            t0 = time.time()
+            boundary = run_existing_app_backend_change_boundary(
+                run_id, existing_app_path, feature_request_text=feature_request_text,
+            )
+            record_step_time(run_id, "backend_boundary", t0)
+            print(f"  Boundary status: {boundary['status']} — "
+                  f"{len(boundary['allowed_backend_files'])} backend file(s) in scope.")
+            print("  Backend boundary only — no code changes, commits, pushes, or PRs were created.")
+        if backend_smoke_checks:
+            # Plan-only analysis is always safe even with a dirty repo. Actual command
+            # execution is blocked unless the repo is clean — smoke commands must never
+            # run against an uncommitted, unreviewed working tree.
+            effective_plan_only = backend_smoke_plan_only or repo_dirty
+            if repo_dirty and not backend_smoke_plan_only:
+                print("  ⛔ Target repo is dirty — blocking smoke command execution; writing plan only.")
+            print("▶ Backend Smoke Checks  Writing backend smoke-check plan"
+                  f"{'' if effective_plan_only else ' and running safe checks'}...")
+            t0 = time.time()
+            outcome = run_existing_app_backend_smoke(
+                run_id, existing_app_path, plan_only=effective_plan_only,
+                health_endpoint=backend_health_endpoint, test_command=backend_test_command,
+                start_command=backend_start_command,
+            )
+            record_step_time(run_id, "backend_smoke_checks", t0)
+            plan = outcome["plan"]
+            print(f"  Safe automatic checks: {len(plan['safe_automatic_checks'])} — "
+                  f"forbidden automatic checks: {len(plan['forbidden_automatic_checks'])}")
+            if outcome["results"] is not None:
+                failed = sum(1 for r in outcome["results"] if r["status"] == "fail")
+                print(f"  Checks executed: {len(outcome['results'])} ({failed} failed)")
+            print("  No migrations, DB writes, seed/reset, or production commands were run.")
+        _update_state(run_id, {"status": "backend_safety_done", "current_step": "done"})
+        print(f"\n{'='*60}")
+        print("  Backend safety analysis complete")
         print(f"  Run folder : {rdir}")
         print(f"{'='*60}\n")
         return run_id
@@ -11069,6 +11779,37 @@ if __name__ == "__main__":
                               "API-client scan to, e.g. frontend. Defaults to scanning the "
                               "whole repo.")
 
+    # ── Backend Change Boundary + Backend Smoke Checks ──────────────────────
+    parser.add_argument("--backend-boundary", action="store_true",
+                         help="Generate backend_change_boundary.md/.json + "
+                              "backend_boundary_summary.md for --existing-app: allowed backend/"
+                              "frontend-API-client/test files, protected files, and DB/auth/"
+                              "config/migration/route-signature/endpoint edit toggles (all "
+                              "forbidden by default unless explicitly required). Artifacts only "
+                              "— no code changes, commits, pushes, or PRs.")
+    parser.add_argument("--backend-smoke-checks", action="store_true",
+                         help="Generate a backend smoke-check plan for --existing-app "
+                              "(backend_smoke_plan.md/.json). Defaults to plan-only; pass without "
+                              "--backend-smoke-plan-only to also execute safe checks and write "
+                              "backend_smoke_results.md/.json. Never runs migrations, DB writes, "
+                              "seed/reset commands, or production commands.")
+    parser.add_argument("--backend-smoke-plan-only", action="store_true",
+                         help="With --backend-smoke-checks: write the smoke-check plan only, "
+                              "never execute any command.")
+    parser.add_argument("--backend-health-endpoint", default=None, metavar="PATH",
+                         help="Health endpoint path (e.g. /health) used by the backend smoke "
+                              "plan/execution. Only ever curled against localhost, and only when "
+                              "an explicit --backend-start-command is also given.")
+    parser.add_argument("--backend-start-command", default=None, metavar="COMMAND",
+                         help="Explicit command to start the backend for a smoke check. Only run "
+                              "when --backend-smoke-checks is used without --backend-smoke-plan-"
+                              "only. Always terminated (with a timeout) before the pipeline exits "
+                              "— never left running.")
+    parser.add_argument("--backend-test-command", default=None, metavar="COMMAND",
+                         help="Explicit backend test command (e.g. 'python -m pytest') to run as "
+                              "part of --backend-smoke-checks. Explicit commands are always "
+                              "treated as safe to run.")
+
     # ── Multi-Sprint Continuation mode ───────────────────────────────────────
     parser.add_argument("--continue-run", default=None, metavar="PATH",
                          help="Continue a previous run: runs/run_NNN. The source run's preserved "
@@ -11276,6 +12017,70 @@ if __name__ == "__main__":
             and not args.upgrade_mode and not args.continue_run
             and not args.resume and not args.jira and not args.input
         )
+        standalone_backend_boundary = (
+            args.backend_boundary
+            and not args.bugfix_mode and not args.backend_inventory
+            and not args.upgrade_mode and not args.continue_run
+            and not args.resume and not args.jira and not args.input
+        )
+        standalone_backend_smoke = (
+            args.backend_smoke_checks
+            and not args.bugfix_mode and not args.backend_inventory
+            and not args.upgrade_mode and not args.continue_run
+            and not args.resume and not args.jira and not args.input
+        )
+        if standalone_backend_boundary:
+            if not args.existing_app:
+                print("--backend-boundary requires --existing-app PATH.")
+                sys.exit(1)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path("backend_boundary_runs") / f"backend_boundary_{ts}"
+            feature_text = Path(args.feature_request).read_text(encoding="utf-8").strip() if args.feature_request else None
+            boundary = run_backend_change_boundary(
+                args.existing_app, output_dir, feature_request_text=feature_text,
+            )
+            print(f"\n{'='*60}")
+            print("  Backend Change Boundary")
+            print(f"  Repo                     : {boundary['repo_path']}")
+            print(f"  Status                   : {boundary['status']}")
+            print(f"  Allowed backend files    : {len(boundary['allowed_backend_files'])}")
+            print(f"  Allowed frontend API files: {len(boundary['allowed_frontend_api_client_files'])}")
+            print(f"  DB/schema edits allowed  : {boundary['db_schema_edits_allowed']}")
+            print(f"  Auth edits allowed       : {boundary['auth_edits_allowed']}")
+            print(f"  Config/env edits allowed : {boundary['config_env_edits_allowed']}")
+            print("  Backend boundary only — no code changes, commits, pushes, or PRs were created.")
+            print(f"  Reports                  : {output_dir}")
+            print(f"{'='*60}\n")
+            sys.exit(0)
+        if standalone_backend_smoke:
+            if not args.existing_app:
+                print("--backend-smoke-checks requires --existing-app PATH.")
+                sys.exit(1)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path("backend_smoke_runs") / f"backend_smoke_{ts}"
+            outcome = run_backend_smoke(
+                args.existing_app, output_dir,
+                plan_only=args.backend_smoke_plan_only,
+                health_endpoint=args.backend_health_endpoint,
+                test_command=args.backend_test_command,
+                start_command=args.backend_start_command,
+            )
+            plan, results = outcome["plan"], outcome["results"]
+            print(f"\n{'='*60}")
+            print("  Backend Smoke Checks")
+            print(f"  Plan only                : {args.backend_smoke_plan_only}")
+            print(f"  Safe automatic checks    : {len(plan['safe_automatic_checks'])}")
+            print(f"  Forbidden automatic checks: {len(plan['forbidden_automatic_checks'])}")
+            if results is not None:
+                failed = sum(1 for r in results if r["status"] == "fail")
+                print(f"  Checks executed          : {len(results)} ({failed} failed)")
+                print("  Only explicit safe checks were executed. No migrations, DB writes, "
+                      "seed/reset, or production commands were run.")
+            else:
+                print("  Plan only — no command was executed.")
+            print(f"  Reports                  : {output_dir}")
+            print(f"{'='*60}\n")
+            sys.exit(1 if (results is not None and any(r["status"] == "fail" for r in results)) else 0)
         if standalone_backend_inventory:
             if not args.existing_app:
                 print("--backend-inventory requires --existing-app PATH.")
@@ -11489,14 +12294,16 @@ if __name__ == "__main__":
                 sys.exit(1)
             if not args.existing_app or (
                 not args.feature_request and not args.bugfix_mode and not args.backend_inventory
+                and not args.backend_boundary and not args.backend_smoke_checks
             ):
                 print("--upgrade-mode requires --existing-app PATH and one of --feature-request, "
-                      "--bug-report (with --bugfix-mode), or --backend-inventory.")
+                      "--bug-report (with --bugfix-mode), --backend-inventory, --backend-boundary, "
+                      "or --backend-smoke-checks.")
                 sys.exit(1)
             feature_request_text = (
                 Path(args.feature_request).read_text(encoding="utf-8").strip() if args.feature_request
                 else Path(args.bug_report).read_text(encoding="utf-8").strip() if args.bug_report
-                else f"Backend Inventory — {args.existing_app}"
+                else f"Backend Safety — {args.existing_app}"
             )
             upgrade_run_id = pipeline_existing_app_upgrade(
                 args.existing_app,
@@ -11525,6 +12332,12 @@ if __name__ == "__main__":
                 backend_inventory=args.backend_inventory,
                 backend_root=args.backend_root,
                 frontend_root=args.frontend_root,
+                backend_boundary=args.backend_boundary,
+                backend_smoke_checks=args.backend_smoke_checks,
+                backend_smoke_plan_only=args.backend_smoke_plan_only,
+                backend_health_endpoint=args.backend_health_endpoint,
+                backend_test_command=args.backend_test_command,
+                backend_start_command=args.backend_start_command,
             )
             if args.local_git_delivery and not args.feature_plan_only:
                 upgrade_state = load_state(upgrade_run_id)

@@ -115,6 +115,16 @@ export interface RunDetail {
   backend_inventory_warnings?: string[];
   backend_inventory_artifacts?: string[];
   backend_inventory_summary?: string;
+  // Backend Change Boundary + Backend Smoke Checks — safety layer that reasons
+  // about backend changes before any backend bugfix/build step touches code.
+  backend_boundary_status?: "ready" | "warning" | string;
+  backend_boundary_artifacts?: string[];
+  backend_boundary_summary?: string;
+  backend_safe_to_edit?: boolean;
+  backend_smoke_status?: "pass" | "fail" | "plan_only" | string;
+  backend_smoke_artifacts?: string[];
+  backend_smoke_summary?: string;
+  backend_safe_to_run_checks?: boolean;
 }
 
 export interface Artifact {
