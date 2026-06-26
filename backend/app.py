@@ -156,6 +156,8 @@ def run_pipeline_upgrade_async(
     selected_feature_sprint: int,
     feature_plan_only: bool,
     no_deepseek: bool,
+    bugfix_mode: bool = False,
+    bug_title: str = "",
 ):
     """Existing App Upgrade mode — maps to --existing-app/--feature-request/--upgrade-mode."""
     def _run():
@@ -164,14 +166,19 @@ def run_pipeline_upgrade_async(
             "--existing-app", existing_app,
             "--feature-request", feature_request_path,
             "--upgrade-mode",
-            "--feature-sprint-plan",
             "--selected-feature-sprint", str(selected_feature_sprint),
             "--run-id", run_id,
         ]
+        if not bugfix_mode:
+            cmd += ["--feature-sprint-plan"]
         if feature_plan_only:
             cmd += ["--feature-plan-only"]
         if no_deepseek:
             cmd += ["--no-deepseek"]
+        if bugfix_mode:
+            cmd += ["--bugfix-mode", "--bug-report", feature_request_path]
+            if bug_title:
+                cmd += ["--bug-title", bug_title]
         _spawn_pipeline(run_id, cmd)
 
     t = threading.Thread(target=_run, daemon=True)
@@ -293,6 +300,11 @@ def create_upgrade_run(body: dict):
     """
     existing_app = (body.get("existing_app") or "").strip()
     feature_request_text = (body.get("feature_request_text") or body.get("feature_request") or "").strip()
+    bugfix_mode = bool(body.get("bugfix_mode", False))
+    bug_title = (body.get("bug_title") or "").strip()
+    bug_report_text = (body.get("bug_report_text") or body.get("bug_report") or "").strip()
+    if bugfix_mode and bug_report_text:
+        feature_request_text = bug_report_text
     if not existing_app or not feature_request_text:
         abort(400, "existing_app and feature_request_text are required")
     try:
@@ -316,6 +328,8 @@ def create_upgrade_run(body: dict):
         "fix_iteration": 0,
         "artifacts": [],
         "upgrade_mode": True,
+        "bugfix_mode": bugfix_mode,
+        "bug_title": bug_title or None,
         "existing_app": existing_app,
         "selected_feature_sprint": selected_feature_sprint,
         "feature_plan_only": feature_plan_only,
@@ -326,6 +340,7 @@ def create_upgrade_run(body: dict):
     run_pipeline_upgrade_async(
         run_id, existing_app, str(feature_request_path),
         selected_feature_sprint, feature_plan_only, no_deepseek,
+        bugfix_mode=bugfix_mode, bug_title=bug_title,
     )
 
     return jsonify({"run_id": run_id, "status": "queued"}), 201

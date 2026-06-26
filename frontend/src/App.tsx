@@ -1222,6 +1222,14 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "pr_remote_state.json", label: "PR Remote State JSON" },
   { file: "pr_push_result.md", label: "PR Push Result" },
   { file: "pr_create_result.md", label: "PR Create Result" },
+  { file: "bug_report_summary.md", label: "Bug Report Summary" },
+  { file: "bug_report_state.json", label: "Bug Report State JSON" },
+  { file: "bug_hypothesis.md", label: "Bug Hypothesis" },
+  { file: "suspected_files.md", label: "Suspected Files" },
+  { file: "reproduction_plan.md", label: "Reproduction Plan" },
+  { file: "minimal_fix_plan.md", label: "Minimal Fix Plan" },
+  { file: "bugfix_boundary.md", label: "Bugfix Boundary" },
+  { file: "bugfix_completion_report.md", label: "Bugfix Completion Report" },
   { file: "existing_app_inventory.md", label: "Existing App Inventory" },
   { file: "baseline_health_check.md", label: "Baseline Health Check" },
   { file: "baseline_behavior_checklist.md", label: "Baseline Behavior Checklist" },
@@ -1423,6 +1431,75 @@ function SmokeMutationBanner({ run }: { run: RunDetail | null }) {
             + `build change. See smoke_mutation_report.md.`}
         {status === "FAIL" && " This is outside the selected feature boundary and blocks Local Delivery."}
       </div>
+    </div>
+  );
+}
+
+function BugfixPlanCard({ run, selectedArtifact, onSelectArtifact }: {
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
+  if (!run?.bugfix_mode) return null;
+  const readiness = run.bugfix_build_readiness ?? "planning_only";
+  const badgeClass = readiness === "ready" ? "ok" : readiness === "blocked" ? "fail" : "warn";
+  const artifacts = [
+    { file: "bug_report_summary.md", label: "Bug Report Summary" },
+    { file: "bug_hypothesis.md", label: "Bug Hypothesis" },
+    { file: "suspected_files.md", label: "Suspected Files" },
+    { file: "reproduction_plan.md", label: "Reproduction Plan" },
+    { file: "minimal_fix_plan.md", label: "Minimal Fix Plan" },
+    { file: "bugfix_boundary.md", label: "Bugfix Boundary" },
+    { file: "bugfix_completion_report.md", label: "Bugfix Completion Report" },
+  ].filter(a => (run.artifacts ?? []).includes(a.file));
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Bugfix Plan</div>
+          <div className="delivery-card-sub">
+            {run.bugfix_summary ?? "Bugfix planning artifacts generated from the supplied report."}
+          </div>
+        </div>
+        <span className={`delivery-badge delivery-badge-${badgeClass}`}>{readiness.replace(/_/g, " ")}</span>
+      </div>
+      <div className="delivery-warning-panel">
+        Planning only — no code changes, commits, pushes, or PRs were created by bugfix mode.
+      </div>
+      <div className="delivery-repo-line">
+        Bug title: <code>{run.bug_title ?? "(unknown)"}</code>
+      </div>
+      <div className="delivery-repo-line">
+        Category: <code>{run.bug_category ?? "unknown"}</code>
+        {" "}· Severity: <code>{run.bug_severity ?? "unknown"}</code>
+        {" "}· Suspected files: <code>{run.suspected_files_count ?? 0}</code>
+      </div>
+      {(run.bugfix_top_suspected_files?.length ?? 0) > 0 && (
+        <div className="delivery-warning-panel">
+          <strong>Top suspected files.</strong>
+          <ul>
+            {run.bugfix_top_suspected_files!.slice(0, 5).map(item => (
+              <li key={item.file}><code>{item.file}</code> — {item.area}, {item.confidence}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {artifacts.length > 0 && (
+        <div className="delivery-artifacts">
+          <div className="delivery-artifacts-label">Bugfix artifacts</div>
+          <div className="delivery-artifact-tabs">
+            {artifacts.map(a => (
+              <button
+                key={a.file}
+                className={`artifact-tab ${selectedArtifact === a.file ? "active" : ""}`}
+                onClick={() => onSelectArtifact(a.file)}
+              >
+                {a.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2152,6 +2229,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             {plan && <FeatureSprintRoadmap plan={plan} onBuild={planReady ? buildFromPlan : undefined} launching={launching} />}
             <ChangeBoundaryBanner run={run} />
             <SmokeMutationBanner run={run} />
+            <BugfixPlanCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <GitSyncCard runId={runId} run={run} />
             <PrPlanCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />

@@ -3131,6 +3131,394 @@ def _truncate_for_prompt(text: str, limit: int = 3000) -> str:
     return text if len(text) <= limit else text[:limit] + "\n...(truncated)"
 
 
+BUGFIX_ARTIFACTS = [
+    "bug_report_summary.md",
+    "bug_report_state.json",
+    "bug_hypothesis.md",
+    "suspected_files.md",
+    "reproduction_plan.md",
+    "minimal_fix_plan.md",
+    "bugfix_boundary.md",
+    "bugfix_completion_report.md",
+]
+
+BUGFIX_FORBIDDEN_PATHS = [
+    ".env",
+    "secrets",
+    "node_modules",
+    "venv",
+    ".venv",
+    "runs",
+    "delivery_runs",
+    "git_sync_runs",
+    "pr_branch_runs",
+    "pr_delivery_runs",
+    "pr_remote_runs",
+    "dist",
+    "build",
+    "__pycache__",
+    ".git",
+]
+
+
+def parse_bug_report(text: str, bug_title: str | None = None) -> dict:
+    """Deterministic markdown/text parser for bugfix planning. Missing fields are
+    marked unknown rather than treated as errors."""
+    fields = {
+        "title": "unknown",
+        "expected": "unknown",
+        "actual": "unknown",
+        "steps_to_reproduce": "unknown",
+        "console_error": "unknown",
+        "backend_error": "unknown",
+        "affected_page": "unknown",
+        "affected_endpoint": "unknown",
+        "screenshot_notes": "unknown",
+    }
+    aliases = {
+        "title": "title",
+        "expected": "expected",
+        "expected behavior": "expected",
+        "actual": "actual",
+        "actual behavior": "actual",
+        "steps to reproduce": "steps_to_reproduce",
+        "steps": "steps_to_reproduce",
+        "console error": "console_error",
+        "frontend error": "console_error",
+        "backend error": "backend_error",
+        "server error": "backend_error",
+        "affected page": "affected_page",
+        "affected route": "affected_page",
+        "affected endpoint": "affected_endpoint",
+        "endpoint": "affected_endpoint",
+        "screenshot notes": "screenshot_notes",
+    }
+    current: str | None = None
+    collected = {k: [] for k in fields}
+    for raw_line in (text or "").splitlines():
+        line = raw_line.rstrip()
+        m = re.match(r"^\s{0,3}#{0,3}\s*([A-Za-z][A-Za-z /_-]{1,40})\s*:\s*(.*)$", line)
+        if m:
+            key = aliases.get(m.group(1).strip().lower())
+            if key:
+                current = key
+                if m.group(2).strip():
+                    collected[key].append(m.group(2).strip())
+                continue
+        if current and line.strip():
+            collected[current].append(line.strip())
+    for key, lines in collected.items():
+        if lines:
+            fields[key] = "\n".join(lines).strip()
+    if bug_title:
+        fields["title"] = bug_title.strip()
+    elif fields["title"] == "unknown":
+        first = next((l.strip("# ").strip() for l in text.splitlines() if l.strip()), "")
+        if first:
+            fields["title"] = first[:120]
+
+    combined = "\n".join([text or "", *fields.values()])
+    file_mentions = sorted(set(re.findall(r"[\w./-]+\.(?:tsx|ts|jsx|js|py|rb|go|java|css|scss|json|yml|yaml|sql)", combined)))
+    endpoints = sorted(set(re.findall(r"/[A-Za-z0-9_./{}:-]+", combined)))
+    frontend_clues = sorted(set(re.findall(r"\b(?:React|Vue|component|page|route|button|form|console|frontend|dashboard|browser)\b", combined, re.I)))
+    backend_clues = sorted(set(re.findall(r"\b(?:API|backend|server|endpoint|500|traceback|exception|import error|startup)\b", combined, re.I)))
+    auth_clues = sorted(set(re.findall(r"\b(?:auth|login|logout|session|permission|redirect|token)\b", combined, re.I)))
+    db_clues = sorted(set(re.findall(r"\b(?:database|schema|migration|SQL|query|table|column)\b", combined, re.I)))
+    config_clues = sorted(set(re.findall(r"\b(?:config|environment|env var|\.env)\b", combined, re.I)))
+
+    categories = []
+    if frontend_clues or fields["console_error"] != "unknown" or fields["affected_page"] != "unknown":
+        categories.append("frontend")
+    if backend_clues or fields["backend_error"] != "unknown":
+        categories.append("backend")
+    if endpoints or fields["affected_endpoint"] != "unknown":
+        categories.append("api")
+    if db_clues:
+        categories.append("database")
+    if auth_clues:
+        categories.append("auth")
+    if config_clues:
+        categories.append("config")
+    category = "mixed" if len(set(categories)) > 1 else (categories[0] if categories else "unknown")
+    severity = "high" if re.search(r"\b(crash|500|startup|data loss|cannot load|does not load)\b", combined, re.I) else (
+        "medium" if re.search(r"\b(error|fails|broken|exception)\b", combined, re.I) else "unknown"
+    )
+    return {
+        **fields,
+        "bug_title": fields["title"],
+        "expected_behavior": fields["expected"],
+        "actual_behavior": fields["actual"],
+        "frontend_clues": frontend_clues,
+        "backend_clues": backend_clues,
+        "api_endpoint_clues": endpoints if endpoints else ([] if fields["affected_endpoint"] == "unknown" else [fields["affected_endpoint"]]),
+        "console_log_snippets": [v for v in (fields["console_error"], fields["backend_error"]) if v != "unknown"],
+        "affected_files_mentioned": file_mentions,
+        "severity_guess": severity,
+        "likely_category": category,
+        "auth_clues": auth_clues,
+        "database_clues": db_clues,
+        "config_clues": config_clues,
+        "raw_report": text,
+    }
+
+
+def _bugfix_search_terms(parsed: dict) -> list[str]:
+    terms: list[str] = []
+    terms += parsed.get("affected_files_mentioned") or []
+    terms += parsed.get("api_endpoint_clues") or []
+    for value in (parsed.get("affected_page"), parsed.get("console_error"), parsed.get("backend_error"), parsed.get("actual")):
+        if value and value != "unknown":
+            terms += re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}|/[A-Za-z0-9_./{}:-]+", value)
+    return list(dict.fromkeys(t.strip() for t in terms if len(t.strip()) >= 3))[:30]
+
+
+def investigate_bugfix_repo(existing_app_path: Path, parsed: dict, max_files: int = 1200) -> dict:
+    """Lightweight bounded repo investigation for likely bugfix files."""
+    buckets = {k: [] for k in (
+        "frontend_candidates", "backend_candidates", "api_client_candidates",
+        "database_candidates", "test_candidates", "unknown_candidates",
+    )}
+    terms = _bugfix_search_terms(parsed)
+    scored: dict[str, dict] = {}
+    allowed_suffixes = set(CODE_EXTS) | {".json", ".yml", ".yaml", ".css", ".scss", ".sql", ".md"}
+    files_seen = 0
+    for path in existing_app_path.rglob("*"):
+        if files_seen >= max_files:
+            break
+        if not path.is_file():
+            continue
+        rel = path.relative_to(existing_app_path)
+        rel_str = str(rel)
+        if any(part in _SCAN_IGNORE_DIRS or part in {"runs", "delivery_runs", "git_sync_runs", "pr_branch_runs", "pr_delivery_runs", "pr_remote_runs"} for part in rel.parts):
+            continue
+        if path.suffix.lower() not in allowed_suffixes:
+            continue
+        files_seen += 1
+        text = _safe_read_text(path, max_chars=6000)
+        haystack = f"{rel_str}\n{text}".lower()
+        reasons: list[str] = []
+        score = 0
+        for term in terms:
+            if term and term.lower() in haystack:
+                score += 3 if term in (parsed.get("affected_files_mentioned") or []) else 1
+                reasons.append(f"matches `{term}`")
+        if any(endpoint.lower() in haystack for endpoint in parsed.get("api_endpoint_clues") or []):
+            score += 3
+            reasons.append("matches endpoint clue")
+        if score <= 0:
+            continue
+        area = "unknown_candidates"
+        lower_rel = rel_str.lower()
+        if re.search(r"(test|spec)\.", lower_rel) or "/test" in lower_rel or "/__tests__/" in lower_rel:
+            area = "test_candidates"
+        elif path.suffix.lower() == ".sql" or any(x in lower_rel for x in ("migration", "schema", "model")):
+            area = "database_candidates"
+        elif any(x in lower_rel for x in ("api", "client", "service", "fetch", "axios")):
+            area = "api_client_candidates"
+        elif path.suffix.lower() == ".py" or any(x in lower_rel for x in ("server", "backend", "routes", "controllers")):
+            area = "backend_candidates"
+        elif path.suffix.lower() in {".tsx", ".jsx", ".ts", ".js", ".css", ".scss"} or any(x in lower_rel for x in ("component", "page", "frontend", "src")):
+            area = "frontend_candidates"
+        scored[rel_str] = {
+            "file": rel_str,
+            "area": area.replace("_candidates", ""),
+            "reason": "; ".join(dict.fromkeys(reasons))[:220],
+            "confidence": "high" if score >= 5 else ("medium" if score >= 2 else "low"),
+            "score": score,
+        }
+    ranked = sorted(scored.values(), key=lambda item: (-item["score"], item["file"]))[:40]
+    for item in ranked:
+        bucket = f"{item['area']}_candidates"
+        if bucket not in buckets:
+            bucket = "unknown_candidates"
+        buckets[bucket].append(item)
+    return {"terms": terms, "likely_files": ranked, **buckets, "files_scanned": files_seen}
+
+
+def build_bugfix_boundary(parsed: dict, investigation: dict) -> dict:
+    likely = investigation.get("likely_files") or []
+    allowed_files = [item["file"] for item in likely[:12]]
+    allowed_dirs = sorted({str(Path(f).parent) for f in allowed_files if str(Path(f).parent) != "."})
+    backend_allowed = parsed["likely_category"] in ("backend", "api", "mixed")
+    frontend_allowed = parsed["likely_category"] in ("frontend", "api", "mixed")
+    db_allowed = bool(parsed.get("database_clues"))
+    auth_allowed = bool(parsed.get("auth_clues"))
+    return {
+        "allowed_files": allowed_files,
+        "allowed_directories": allowed_dirs[:12],
+        "protected_files": sorted(set((parsed.get("affected_files_mentioned") or [])[:20]) - set(allowed_files)),
+        "forbidden_paths": BUGFIX_FORBIDDEN_PATHS,
+        "backend_edits_allowed": backend_allowed,
+        "frontend_edits_allowed": frontend_allowed,
+        "db_schema_edits_allowed": db_allowed,
+        "auth_edits_allowed": auth_allowed,
+        "config_env_edits_allowed": False,
+        "company_repo_direct_push_forbidden": True,
+        "status": "ready" if allowed_files else "warning",
+    }
+
+
+def _render_bugfix_artifacts(parsed: dict, investigation: dict, boundary: dict, readiness: str) -> dict[str, str]:
+    top = investigation.get("likely_files") or []
+    category = parsed["likely_category"]
+    artifacts: dict[str, str] = {}
+    artifacts["bug_report_summary.md"] = "\n".join([
+        "# Bug Report Summary", "",
+        f"**Bug title:** {parsed['bug_title']}",
+        f"**Expected:** {parsed['expected_behavior']}",
+        f"**Actual:** {parsed['actual_behavior']}",
+        f"**Steps to reproduce:** {parsed['steps_to_reproduce']}",
+        f"**Affected page/route:** {parsed['affected_page']}",
+        f"**Affected endpoint:** {parsed['affected_endpoint']}",
+        f"**Severity guess:** {parsed['severity_guess']}",
+        f"**Likely category:** {category}",
+        "",
+        "## Clues",
+        f"- Frontend clues: {', '.join(parsed['frontend_clues']) or '(none)'}",
+        f"- Backend clues: {', '.join(parsed['backend_clues']) or '(none)'}",
+        f"- API endpoint clues: {', '.join(parsed['api_endpoint_clues']) or '(none)'}",
+        f"- Files mentioned: {', '.join(parsed['affected_files_mentioned']) or '(none)'}",
+    ]) + "\n"
+    hypotheses = []
+    for item in top[:5]:
+        hypotheses.append(
+            f"## Hypothesis: `{item['file']}`\n"
+            f"- Cause: bug may live in {item['area']} code near this file.\n"
+            f"- Why it might fit: {item['reason']}.\n"
+            f"- Evidence: matched bug report clues during repo search.\n"
+            f"- Confidence: {item['confidence']}\n"
+            f"- Files to inspect: `{item['file']}`\n"
+        )
+    artifacts["bug_hypothesis.md"] = "# Bug Hypothesis\n\n" + ("\n".join(hypotheses) if hypotheses else "- No strong file-level hypothesis yet.\n")
+    rows = ["# Suspected Files", "", "rank | file | area | reason | confidence", "--- | --- | --- | --- | ---"]
+    for idx, item in enumerate(top, 1):
+        rows.append(f"{idx} | `{item['file']}` | {item['area']} | {item['reason']} | {item['confidence']}")
+    artifacts["suspected_files.md"] = "\n".join(rows) + "\n"
+    curl = ""
+    if parsed["api_endpoint_clues"]:
+        curl = "\n".join(f"- `curl -i http://localhost:3000{ep}`" for ep in parsed["api_endpoint_clues"][:5])
+    artifacts["reproduction_plan.md"] = "\n".join([
+        "# Reproduction Plan", "",
+        "Planning only. Run these locally and read-only where possible.",
+        "",
+        "## Frontend",
+        f"- Navigate to: `{parsed['affected_page']}`" if parsed["affected_page"] != "unknown" else "- Reproduce the UI steps from the bug report.",
+        "- Watch browser console/network tab for matching errors.",
+        "",
+        "## Backend/API",
+        curl or "- No concrete endpoint clue found.",
+        "",
+        "## Database",
+        "- Read-only checks only unless an explicit schema/migration approval is given.",
+    ]) + "\n"
+    artifacts["minimal_fix_plan.md"] = "\n".join([
+        "# Minimal Fix Plan", "",
+        "- Smallest likely change: inspect the highest-confidence suspected files and patch only the failing code path.",
+        f"- Files allowed to edit: {', '.join(f'`{f}`' for f in boundary['allowed_files']) or '(none yet)'}",
+        f"- Directories allowed for nearby fixes: {', '.join(f'`{d}`' for d in boundary['allowed_directories']) or '(none)'}",
+        f"- Files not allowed to edit: {', '.join(f'`{p}`' for p in boundary['protected_files']) or '(none explicitly)'}",
+        "- Tests/checks to run: targeted unit/integration test, app build/startup check, and reproduction steps above.",
+        "- Risks: touching unrelated files, broad rewrites, hidden auth/config side effects.",
+        "- Rollback plan: revert only the bugfix commit or restore changed files from git.",
+    ]) + "\n"
+    artifacts["bugfix_boundary.md"] = "\n".join([
+        "# Bugfix Boundary", "",
+        f"**Boundary status:** `{boundary['status']}`",
+        "",
+        "## Allowed Files",
+        *[f"- `{f}`" for f in (boundary["allowed_files"] or ["(none yet)"])],
+        "",
+        "## Allowed Directories",
+        *[f"- `{d}`" for d in (boundary["allowed_directories"] or ["(none)"])],
+        "",
+        "## Protected Files",
+        *[f"- `{f}`" for f in (boundary["protected_files"] or ["(none explicitly)"])],
+        "",
+        "## Forbidden Paths",
+        *[f"- `{p}`" for p in boundary["forbidden_paths"]],
+        "",
+        f"- Backend edits allowed: {boundary['backend_edits_allowed']}",
+        f"- Frontend edits allowed: {boundary['frontend_edits_allowed']}",
+        f"- DB/schema edits allowed: {boundary['db_schema_edits_allowed']}",
+        f"- Auth edits allowed: {boundary['auth_edits_allowed']}",
+        f"- Config/env edits allowed: {boundary['config_env_edits_allowed']}",
+        f"- Company repo direct push forbidden: {boundary['company_repo_direct_push_forbidden']}",
+    ]) + "\n"
+    artifacts["bugfix_completion_report.md"] = (
+        "# Bugfix Completion Report\n\n"
+        "Bugfix planning completed. No code changes were made by bugfix mode in this step.\n"
+    )
+    state = {
+        "bugfix_mode": True,
+        "bug_title": parsed["bug_title"],
+        "bug_category": category,
+        "bug_severity": parsed["severity_guess"],
+        "build_readiness": readiness,
+        "suspected_files_count": len(top),
+        "top_suspected_files": top[:5],
+        "bugfix_boundary_status": boundary["status"],
+        "parsed_report": {k: v for k, v in parsed.items() if k != "raw_report"},
+        "investigation": investigation,
+        "boundary": boundary,
+    }
+    artifacts["bug_report_state.json"] = json.dumps(state, indent=2)
+    return artifacts
+
+
+def run_bugfix_planning(
+    existing_app_path,
+    bug_report_text: str,
+    bug_title: str | None = None,
+    output_dir=None,
+) -> dict:
+    existing_app_path = Path(existing_app_path).resolve()
+    output_dir = Path(output_dir) if output_dir is not None else Path("bugfix_runs") / f"bugfix_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    parsed = parse_bug_report(bug_report_text, bug_title)
+    investigation = investigate_bugfix_repo(existing_app_path, parsed) if existing_app_path.exists() else {"likely_files": [], "files_scanned": 0}
+    boundary = build_bugfix_boundary(parsed, investigation)
+    git_sync_state = None
+    readiness = "planning_only"
+    if (existing_app_path / ".git").exists():
+        git_sync_state = delivery_mod.analyze_git_sync(existing_app_path, "main", allow_branch_mismatch=True)
+        readiness = "blocked" if git_sync_state.get("is_dirty") else ("warning" if git_sync_state.get("sync_status") != "up_to_date" else boundary["status"])
+    elif not existing_app_path.exists():
+        readiness = "blocked"
+    artifacts = _render_bugfix_artifacts(parsed, investigation, boundary, readiness)
+    for name, content in artifacts.items():
+        (output_dir / name).write_text(content, encoding="utf-8")
+    state = json.loads(artifacts["bug_report_state.json"])
+    state["repo_path"] = str(existing_app_path)
+    state["git_sync_state"] = git_sync_state
+    state["bugfix_artifacts"] = BUGFIX_ARTIFACTS
+    state["bugfix_summary"] = f"{state['bug_category']} / {state['bug_severity']} — {state['suspected_files_count']} suspected file(s)"
+    (output_dir / "bug_report_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return state
+
+
+def run_existing_app_bugfix_planning(
+    run_id: str,
+    existing_app_path,
+    bug_report_text: str,
+    bug_title: str | None = None,
+) -> dict:
+    rdir = run_dir(run_id)
+    state = run_bugfix_planning(existing_app_path, bug_report_text, bug_title=bug_title, output_dir=rdir)
+    _update_state(run_id, {
+        "bugfix_mode": True,
+        "bug_title": state["bug_title"],
+        "bug_category": state["bug_category"],
+        "bug_severity": state["bug_severity"],
+        "bugfix_artifacts": BUGFIX_ARTIFACTS,
+        "bugfix_summary": state["bugfix_summary"],
+        "suspected_files_count": state["suspected_files_count"],
+        "bugfix_boundary_status": state["bugfix_boundary_status"],
+        "bugfix_build_readiness": state["build_readiness"],
+        "bugfix_top_suspected_files": state.get("top_suspected_files", []),
+    })
+    return state
+
+
 def _detect_frontend_framework(deps: dict) -> str | None:
     if "next" in deps:
         return "Next.js"
@@ -6909,6 +7297,9 @@ def pipeline_existing_app_upgrade(
     pr_body: str | None = None,
     allow_company_pr: bool = False,
     sandbox_allowlist=None,
+    bugfix_mode: bool = False,
+    bug_report_text: str | None = None,
+    bug_title: str | None = None,
 ) -> str:
     """
     Existing App Upgrade mode entry point. Additive, not generative-from-scratch:
@@ -6987,6 +7378,20 @@ def pipeline_existing_app_upgrade(
         if git_sync_state["is_dirty"]:
             print(f"  ⛔ Target repo has {git_sync_state['dirty_file_count']} uncommitted change(s) — "
                   "the build will be blocked before Step 12 unless this is resolved.")
+
+    if bugfix_mode:
+        print("▶ Bugfix Mode  Writing bugfix planning artifacts...")
+        bug_state = run_existing_app_bugfix_planning(
+            run_id, existing_app_path, bug_report_text or feature_request_text, bug_title=bug_title,
+        )
+        _update_state(run_id, {"status": "bugfix_plan_done", "current_step": "done"})
+        print(f"  Bugfix plan: {bug_state['bugfix_summary']} (see bug_report_summary.md)")
+        print("  Planning only — no code changes, commits, pushes, or PRs were created by bugfix mode.")
+        print(f"\n{'='*60}")
+        print("  Bugfix planning complete")
+        print(f"  Run folder : {rdir}")
+        print(f"{'='*60}\n")
+        return run_id
 
     print("▶ Step 1  Scanning existing app...")
     t0 = time.time()
@@ -9821,6 +10226,13 @@ if __name__ == "__main__":
                               "(inventory, health check, summary, requirements, gap analysis, "
                               "additive architecture, feature sprint plan) then stop before sprint "
                               "selection. Skips Claude Code and DeepSeek entirely.")
+    parser.add_argument("--bugfix-mode", action="store_true",
+                         help="Generate bugfix planning artifacts for --existing-app from a bug report. "
+                              "Planning only: no code changes, commits, pushes, or PRs.")
+    parser.add_argument("--bug-report", default=None, metavar="PATH",
+                         help="Path to a markdown/text bug report for --bugfix-mode.")
+    parser.add_argument("--bug-title", default=None, metavar="TITLE",
+                         help="Optional bug title override for --bugfix-mode.")
 
     # ── Multi-Sprint Continuation mode ───────────────────────────────────────
     parser.add_argument("--continue-run", default=None, metavar="PATH",
@@ -10018,6 +10430,30 @@ if __name__ == "__main__":
             and not args.continue_run and not args.upgrade_mode
             and not args.resume and not args.jira and not args.input
         )
+        standalone_bugfix = (
+            args.bugfix_mode
+            and not args.upgrade_mode and not args.continue_run
+            and not args.resume and not args.jira and not args.input
+        )
+        if standalone_bugfix:
+            if not args.existing_app or not args.bug_report:
+                print("--bugfix-mode requires --existing-app PATH and --bug-report PATH.")
+                sys.exit(1)
+            bug_report_text = Path(args.bug_report).read_text(encoding="utf-8").strip()
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path("bugfix_runs") / f"bugfix_{ts}"
+            state = run_bugfix_planning(args.existing_app, bug_report_text, bug_title=args.bug_title, output_dir=output_dir)
+            print(f"\n{'='*60}")
+            print("  Bugfix Planning (planning only)")
+            print(f"  Repo               : {state['repo_path']}")
+            print(f"  Bug title          : {state['bug_title']}")
+            print(f"  Category/severity  : {state['bug_category']} / {state['bug_severity']}")
+            print(f"  Suspected files    : {state['suspected_files_count']}")
+            print(f"  Build readiness    : {state['build_readiness']}")
+            print("  No code changes, commits, pushes, or PRs were created by bugfix mode.")
+            print(f"  Reports            : {output_dir}")
+            print(f"{'='*60}\n")
+            sys.exit(0 if state["build_readiness"] != "blocked" else 1)
         if standalone_pr_remote:
             repo_path = args.delivery_repo or args.existing_app
             if not repo_path:
@@ -10180,10 +10616,20 @@ if __name__ == "__main__":
                 run_id=run_id_arg,
             )
         elif args.upgrade_mode:
-            if not args.existing_app or not args.feature_request:
+            if args.bugfix_mode and not args.bug_report:
+                print("--bugfix-mode requires --bug-report PATH.")
+                sys.exit(1)
+            if args.bugfix_mode and (args.feature_request or args.feature_sprint_plan or not args.feature_plan_only):
+                print("--bugfix-mode is separate from feature sprint mode. Run it with --existing-app, "
+                      "--bug-report, and --feature-plan-only/without feature sprint build flags.")
+                sys.exit(1)
+            if not args.existing_app or (not args.feature_request and not args.bugfix_mode):
                 print("--upgrade-mode requires both --existing-app PATH and --feature-request PATH.")
                 sys.exit(1)
-            feature_request_text = Path(args.feature_request).read_text(encoding="utf-8").strip()
+            feature_request_text = (
+                Path(args.feature_request).read_text(encoding="utf-8").strip()
+                if args.feature_request else Path(args.bug_report).read_text(encoding="utf-8").strip()
+            )
             upgrade_run_id = pipeline_existing_app_upgrade(
                 args.existing_app,
                 feature_request_text,
@@ -10205,6 +10651,9 @@ if __name__ == "__main__":
                 pr_body=args.pr_body,
                 allow_company_pr=args.allow_company_pr,
                 sandbox_allowlist=set(delivery_mod.DEFAULT_SANDBOX_ALLOWLIST) | set(args.allow_sandbox_remote),
+                bugfix_mode=args.bugfix_mode,
+                bug_report_text=feature_request_text,
+                bug_title=args.bug_title,
             )
             if args.local_git_delivery and not args.feature_plan_only:
                 upgrade_state = load_state(upgrade_run_id)

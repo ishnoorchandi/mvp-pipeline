@@ -87,6 +87,22 @@ export interface RunDetail {
   pr_remote_pr_url?: string | null;
   pr_remote_artifacts?: string[];
   pr_remote_summary?: string;
+  // Bugfix Mode — deterministic planning-only layer for real bug reports.
+  bugfix_mode?: boolean;
+  bug_title?: string | null;
+  bug_category?: string;
+  bug_severity?: "low" | "medium" | "high" | "unknown";
+  bugfix_artifacts?: string[];
+  bugfix_summary?: string;
+  suspected_files_count?: number;
+  bugfix_boundary_status?: "ready" | "warning" | "blocked" | string;
+  bugfix_build_readiness?: "ready" | "warning" | "blocked" | "planning_only" | string;
+  bugfix_top_suspected_files?: Array<{
+    file: string;
+    area: string;
+    reason: string;
+    confidence: string;
+  }>;
 }
 
 export interface Artifact {
@@ -152,6 +168,9 @@ export interface UpgradeRunPayload {
   selected_feature_sprint: number;
   feature_plan_only: boolean;
   no_deepseek: boolean;
+  bugfix_mode?: boolean;
+  bug_report_text?: string;
+  bug_title?: string;
 }
 
 export interface ContinuationRunPayload {
