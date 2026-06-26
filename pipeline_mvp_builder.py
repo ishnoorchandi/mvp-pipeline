@@ -337,6 +337,40 @@ def run_existing_app_git_pull_ff_only(run_id: str, existing_app_path, base_branc
     return {"pull_state": pull_state, "sync_state": sync_state}
 
 
+# ── Pull Request Delivery Plan ──────────────────────────────────────────────────
+# Planning-only layer for collaborative repos (e.g. OneHR/OneATS): sync now,
+# branch/commit/push-branch/open-PR LATER. Delegates to delivery.run_pr_delivery_plan,
+# which never creates a branch, commits, pushes, or opens a PR — it only inspects
+# the repo and this run's own prior safety artifacts and writes a plan.
+
+def run_existing_app_pr_delivery_plan(
+    run_id: str,
+    existing_app_path,
+    base_branch: str = "main",
+    branch_name: str | None = None,
+    pr_title: str | None = None,
+) -> dict:
+    """Writes pr_delivery_plan.md + pr_state.json into the run folder. Records
+    pr_plan_status/pr_plan_branch/pr_plan_summary/pr_plan_artifacts on run_state.json.
+    Reads (never mutates) this run's own git_sync_state.json / delivery state /
+    boundary / smoke-mutation artifacts if present — missing ones are reported as
+    missing/not_applicable, never raise. Never creates a branch, commits, pushes, or
+    opens a PR."""
+    existing_app_path = Path(existing_app_path)
+    rdir = run_dir(run_id)
+    plan = delivery_mod.run_pr_delivery_plan(
+        existing_app_path, base_branch=base_branch, branch_name=branch_name,
+        pr_title=pr_title, run_dir=rdir, output_dir=rdir,
+    )
+    _update_state(run_id, {
+        "pr_plan_status": plan["pr_readiness"],
+        "pr_plan_branch": plan["suggested_branch"],
+        "pr_plan_summary": f"{plan['pr_readiness']} — suggested branch {plan['suggested_branch']}",
+        "pr_plan_artifacts": ["pr_delivery_plan.md", "pr_state.json"],
+    })
+    return plan
+
+
 # ── LLM helpers ───────────────────────────────────────────────────────────────
 
 def gpt(messages: list[dict]) -> str:
@@ -6730,6 +6764,10 @@ def pipeline_existing_app_upgrade(
     use_deepseek: bool = True,
     git_sync_base_branch: str = "main",
     git_pull_ff_only: bool = False,
+    pr_delivery_plan: bool = False,
+    pr_base_branch: str | None = None,
+    pr_branch_name: str | None = None,
+    pr_title: str | None = None,
 ) -> str:
     """
     Existing App Upgrade mode entry point. Additive, not generative-from-scratch:
@@ -6891,9 +6929,22 @@ def pipeline_existing_app_upgrade(
         print(f"  ⚠️  Existing feature overlap warning(s): {len(plan_json['overlap_warnings'])} "
               "sprint(s) may duplicate existing work — see existing_feature_overlap_check.md")
 
+    def _maybe_write_pr_delivery_plan():
+        """Plan only — never creates a branch, commits, pushes, or opens a PR."""
+        if not pr_delivery_plan:
+            return
+        plan = run_existing_app_pr_delivery_plan(
+            run_id, existing_app_path,
+            base_branch=pr_base_branch or git_sync_base_branch,
+            branch_name=pr_branch_name, pr_title=pr_title,
+        )
+        print(f"  PR delivery plan : {plan['pr_readiness']} — suggested branch "
+              f"'{plan['suggested_branch']}' (see pr_delivery_plan.md)")
+
     if feature_plan_only:
         _update_state(run_id, {"status": "feature_plan_only_done", "current_step": "done"})
         log_event(run_id, "feature_plan_only_done")
+        _maybe_write_pr_delivery_plan()
         print(f"\n{'='*60}")
         print("  📝  Feature-plan-only run complete — planning artifacts generated. "
               "No Claude Code or DeepSeek calls made.")
@@ -7042,6 +7093,7 @@ def pipeline_existing_app_upgrade(
 
     _update_state(run_id, {"status": "done", "current_step": "done", "regression_status": regression_status})
     log_event(run_id, "done", f"regression={regression_status}")
+    _maybe_write_pr_delivery_plan()
 
     print(f"\n{'='*60}")
     print("  Existing App Upgrade — Feature Sprint Complete")
@@ -9661,6 +9713,26 @@ if __name__ == "__main__":
                               "merges, resets, stashes, checks out, or cleans. In --upgrade-mode "
                               "this runs before scanning/building; if the pull is blocked or fails, "
                               "the build does not proceed.")
+
+    # ── Pull Request Delivery Plan ───────────────────────────────────────────
+    parser.add_argument("--pr-delivery-plan", action="store_true",
+                         help="Generate a read-only PR readiness plan for --existing-app or "
+                              "--delivery-repo: sync status, suggested feature branch, changed "
+                              "files, denied files, and a summary of this run's own boundary / "
+                              "smoke-mutation / delivery-safety checks (if present). Writes "
+                              "pr_delivery_plan.md / pr_state.json only — never creates a "
+                              "branch, commits, pushes, or opens a PR.")
+    parser.add_argument("--pr-base-branch", default=None, metavar="BRANCH",
+                         help="Base branch the eventual PR would target. Defaults to "
+                              "--base-branch (or 'main' if that isn't set either).")
+    parser.add_argument("--pr-branch", default=None, metavar="BRANCH_NAME",
+                         help="Suggested feature branch name for the eventual PR, e.g. "
+                              "pipeline/fix-dashboard-loading. An unsafe name is sanitized, "
+                              "not rejected — the safe name is reported as suggested_branch "
+                              "in pr_state.json.")
+    parser.add_argument("--pr-title", default=None, metavar="TITLE",
+                         help="Suggested PR title; also used (slugified) as the feature-branch "
+                              "name seed when --pr-branch is not given.")
     args = parser.parse_args()
 
     run_id_arg = args.run_id  # may be None
@@ -9724,7 +9796,41 @@ if __name__ == "__main__":
             and not args.continue_run and not args.upgrade_mode
             and not args.resume and not args.jira and not args.input
         )
-        if standalone_git_sync:
+        standalone_pr_plan = (
+            args.pr_delivery_plan
+            and not args.git_sync_check and not args.git_pull_ff_only and not args.local_git_delivery
+            and not args.continue_run and not args.upgrade_mode
+            and not args.resume and not args.jira and not args.input
+        )
+        if standalone_pr_plan:
+            repo_path = args.delivery_repo or args.existing_app
+            if not repo_path:
+                print("--pr-delivery-plan requires --existing-app PATH or --delivery-repo PATH.")
+                sys.exit(1)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path("pr_delivery_runs") / f"pr_delivery_{ts}"
+            pr_base_branch = args.pr_base_branch or args.base_branch
+            plan = delivery_mod.run_pr_delivery_plan(
+                repo_path, base_branch=pr_base_branch, branch_name=args.pr_branch,
+                pr_title=args.pr_title, output_dir=output_dir,
+            )
+            print(f"\n{'='*60}")
+            print("  Pull Request Delivery Plan (plan only)")
+            print(f"  Repo               : {plan['repo_path']}")
+            print(f"  Repo type          : {plan['repo_type']}")
+            print(f"  Base branch        : {plan['base_branch']}")
+            print(f"  Suggested branch   : {plan['suggested_branch']}")
+            print(f"  PR readiness       : {plan['pr_readiness']}")
+            print(f"  Main push blocked  : {plan['direct_push_to_main_blocked']}")
+            if plan["block_reasons"]:
+                print(f"  Blocker(s)         : {'; '.join(plan['block_reasons'])}")
+            if plan["warnings"]:
+                print(f"  Warning(s)         : {'; '.join(plan['warnings'])}")
+            print("  No branch was created. No commit was made. No push was attempted. No PR was opened.")
+            print(f"  Reports            : {output_dir}")
+            print(f"{'='*60}\n")
+            sys.exit(1 if plan["pr_readiness"] == "blocked" else 0)
+        elif standalone_git_sync:
             repo_path = args.delivery_repo or args.existing_app
             if not repo_path:
                 print("--git-sync-check/--git-pull-ff-only requires --existing-app PATH or "
@@ -9801,6 +9907,10 @@ if __name__ == "__main__":
                 use_deepseek=not args.no_deepseek,
                 git_sync_base_branch=args.base_branch,
                 git_pull_ff_only=args.git_pull_ff_only,
+                pr_delivery_plan=args.pr_delivery_plan,
+                pr_base_branch=args.pr_base_branch or args.base_branch,
+                pr_branch_name=args.pr_branch,
+                pr_title=args.pr_title,
             )
             if args.local_git_delivery and not args.feature_plan_only:
                 upgrade_state = load_state(upgrade_run_id)
@@ -9814,6 +9924,14 @@ if __name__ == "__main__":
                     print(f"{'='*60}\n")
                     sys.exit(1)
                 _run_delivery_step(run_dir(upgrade_run_id) / "delivery", run_label=f"{upgrade_run_id}")
+                if args.pr_delivery_plan:
+                    # Regenerate the PR plan now that delivery/delivery_state.json exists, so
+                    # delivery_safety_status reflects the real outcome instead of "missing".
+                    run_existing_app_pr_delivery_plan(
+                        upgrade_run_id, args.existing_app,
+                        base_branch=args.pr_base_branch or args.base_branch,
+                        branch_name=args.pr_branch, pr_title=args.pr_title,
+                    )
         elif args.resume:
             resume_id = Path(args.resume).name
             raw = (run_dir(resume_id) / "raw_input.md").read_text()

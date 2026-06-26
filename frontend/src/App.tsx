@@ -3,9 +3,11 @@ import type { ReactElement } from "react";
 import {
   getRuns, getRun, getArtifact, createUpgradeRun, createContinuationRun,
   getDeliveryInfo, getDeliveryPrecheck, createDeliveryCommit, pushDeliverySandbox,
-  getGitSyncState, getGitPullState,
+  getGitSyncState, getGitPullState, getPrDeliveryPlanState,
 } from "./api";
-import type { RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState } from "./api";
+import type {
+  RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState, PrDeliveryPlanState,
+} from "./api";
 import "./App.css";
 
 // ── Pipeline definitions ───────────────────────────────────────────────────────
@@ -1209,6 +1211,8 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "git_pull_state.json", label: "Git Pull State JSON" },
   { file: "git_sync_before_pull.json", label: "Git Sync — Before Pull" },
   { file: "git_sync_after_pull.json", label: "Git Sync — After Pull" },
+  { file: "pr_delivery_plan.md", label: "PR Delivery Plan" },
+  { file: "pr_state.json", label: "PR State JSON" },
   { file: "existing_app_inventory.md", label: "Existing App Inventory" },
   { file: "baseline_health_check.md", label: "Baseline Health Check" },
   { file: "baseline_behavior_checklist.md", label: "Baseline Behavior Checklist" },
@@ -1555,6 +1559,92 @@ function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
   );
 }
 
+// Pull Request Plan — planning layer for collaborative repos (e.g. OneHR/OneATS):
+// sync now, branch/commit/push-branch/open-PR LATER. Pulls full detail from
+// pr_state.json (written by delivery.run_pr_delivery_plan); falls back to the
+// summary fields on run_state.json if the artifact hasn't loaded yet. This card
+// never offers a branch/commit/push/PR action — it is plan only, always.
+function PrPlanCard({ runId, run }: { runId: string; run: RunDetail | null }) {
+  const [plan, setPlan] = useState<PrDeliveryPlanState | null>(null);
+  const hasArtifact = (run?.artifacts ?? []).includes("pr_state.json");
+
+  useEffect(() => {
+    if (!hasArtifact) { setPlan(null); return; }
+    getPrDeliveryPlanState(runId).then(setPlan).catch(() => setPlan(null));
+  }, [runId, hasArtifact]);
+
+  if (!run?.pr_plan_status && !plan) return null;
+
+  const readiness = plan?.pr_readiness ?? run?.pr_plan_status ?? "blocked";
+  const readinessBadgeClass =
+    readiness === "ready" ? "ok"
+    : readiness === "pr_workflow_required" ? "warn"
+    : readiness === "warning" ? "warn"
+    : "fail";
+  const branchAction =
+    readiness === "blocked" ? "blocked"
+    : plan?.future_push_approval_required ? "future approval required"
+    : "allowed later";
+
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Pull Request Plan</div>
+          <div className="delivery-card-sub">
+            {run?.pr_plan_summary ?? "Read-only PR readiness plan — sync now, branch/commit/push/PR later."}
+          </div>
+        </div>
+        <span className={`delivery-badge delivery-badge-${readinessBadgeClass}`}>{readiness.replace(/_/g, " ")}</span>
+      </div>
+
+      <div className="delivery-warning-panel">
+        <strong>Plan only</strong> — no branch, commit, push, or PR was created.
+      </div>
+
+      <div className="delivery-repo-line">
+        Base branch: <code>{plan?.base_branch ?? "main"}</code>
+        {" "}· Suggested feature branch: <code>{plan?.suggested_branch ?? run?.pr_plan_branch ?? "(unknown)"}</code>
+      </div>
+      {plan?.pr_title && (
+        <div className="delivery-repo-line">PR title: <code>{plan.pr_title}</code></div>
+      )}
+      <div className="delivery-repo-line">
+        Repo type: <code>{plan?.repo_type ?? "unknown"}</code>
+        {" "}· Main push blocked: <code>{String(plan?.direct_push_to_main_blocked ?? true)}</code>
+        {" "}· Branch/PR action: <code>{branchAction}</code>
+      </div>
+
+      {plan?.is_company_repo && (
+        <div className="delivery-warning-panel">
+          Company repo detected. This plan prefers the PR workflow (feature branch + PR) over any
+          direct push to main. Branch push / PR creation will require an explicit future
+          approval/setup step — never performed automatically.
+        </div>
+      )}
+
+      {(plan?.block_reasons?.length ?? 0) > 0 && (
+        <div className="delivery-warning-panel delivery-warning-panel-severe">
+          <strong>Blocker(s).</strong>
+          <ul>{plan!.block_reasons.map(r => <li key={r}>{r}</li>)}</ul>
+        </div>
+      )}
+
+      {(plan?.warnings?.length ?? 0) > 0 && (
+        <div className="delivery-warning-panel">
+          <strong>Warning(s).</strong>
+          <ul>{plan!.warnings.map(w => <li key={w}>{w}</li>)}</ul>
+        </div>
+      )}
+
+      <div className="delivery-command-preview">
+        <div className="delivery-command-preview-label">Next safe step</div>
+        <pre>{plan?.recommended_next_action ?? "Run --pr-delivery-plan to generate a recommendation."}</pre>
+      </div>
+    </div>
+  );
+}
+
 function DeliveryCard({ runId, selectedArtifact, onSelectArtifact }: {
   runId: string;
   selectedArtifact?: string | null;
@@ -1889,6 +1979,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             <ChangeBoundaryBanner run={run} />
             <SmokeMutationBanner run={run} />
             <GitSyncCard runId={runId} run={run} />
+            <PrPlanCard runId={runId} run={run} />
             <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />
           </div>
         </div>

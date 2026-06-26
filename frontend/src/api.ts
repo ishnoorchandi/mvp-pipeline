@@ -66,6 +66,12 @@ export interface RunDetail {
   git_pull_blocked?: boolean;
   git_pull_summary?: string;
   git_pull_artifacts?: string[];
+  // Pull Request Delivery Plan — set when --pr-delivery-plan was used. Plan only:
+  // never creates a branch, commits, pushes, or opens a PR (see delivery.run_pr_delivery_plan).
+  pr_plan_status?: "ready" | "warning" | "pr_workflow_required" | "blocked" | null;
+  pr_plan_branch?: string;
+  pr_plan_summary?: string;
+  pr_plan_artifacts?: string[];
 }
 
 export interface Artifact {
@@ -353,6 +359,58 @@ export async function getGitPullState(runId: string): Promise<GitPullState | nul
   try {
     const a = await getArtifact(runId, "git_pull_state.json");
     return JSON.parse(a.content) as GitPullState;
+  } catch {
+    return null;
+  }
+}
+
+// ── Pull Request Delivery Plan ──────────────────────────────────────────────
+// Mirrors delivery.analyze_pr_delivery_plan's return shape. Plan only — the pipeline
+// never creates a branch, commits, pushes, or opens a PR for this feature; it only
+// inspects the repo (and this run's own prior safety artifacts) and writes a plan.
+// Stored as pr_state.json.
+
+export type PrSafetyArtifactStatus = "passed" | "failed" | "missing" | "not_applicable" | "blocked";
+
+export interface PrDeliveryPlanState {
+  repo_path: string;
+  repo_type: "company-protected" | "personal-sandbox" | "unknown";
+  is_company_repo: boolean;
+  current_branch: string | null;
+  base_branch: string;
+  fetch_url: string | null;
+  push_url: string | null;
+  direct_push_to_main_blocked: boolean;
+  pr_title: string | null;
+  suggested_branch: string;
+  requested_branch: string | null;
+  branch_name_safe: boolean;
+  branch_was_sanitized: boolean;
+  sync_status: "up_to_date" | "behind" | "ahead" | "diverged" | "unknown";
+  is_up_to_date: boolean;
+  is_dirty: boolean;
+  dirty_file_count: number;
+  commits_ahead: number;
+  commits_behind: number;
+  changed_files: string[];
+  denied_files: string[];
+  boundary_check_status: PrSafetyArtifactStatus;
+  smoke_mutation_status: PrSafetyArtifactStatus;
+  delivery_safety_status: PrSafetyArtifactStatus;
+  future_push_approval_required: boolean;
+  pr_creation_allowed_later: boolean;
+  pr_readiness: "ready" | "warning" | "pr_workflow_required" | "blocked";
+  block_reasons: string[];
+  warnings: string[];
+  recommended_next_action: string;
+  plan_only: true;
+  timestamp: number;
+}
+
+export async function getPrDeliveryPlanState(runId: string): Promise<PrDeliveryPlanState | null> {
+  try {
+    const a = await getArtifact(runId, "pr_state.json");
+    return JSON.parse(a.content) as PrDeliveryPlanState;
   } catch {
     return null;
   }

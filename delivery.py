@@ -1104,3 +1104,447 @@ def run_local_delivery(
 
     (output_dir / "delivery_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
     return state
+
+
+# ── Pull Request Delivery Plan ──────────────────────────────────────────────────
+# Planning layer for collaborative repos (e.g. OneHR/OneATS) where the correct
+# workflow is: (1) sync with origin/<base_branch>, (2) create a feature branch
+# LATER, (3) commit LATER, (4) push only the feature branch LATER, (5) open a PR
+# LATER. This module never performs any of steps 2-5 — it only ever inspects the
+# repo (and, optionally, this run's own prior safety artifacts) and writes a plan.
+# No branch is created, no commit is made, no push is attempted, no PR is opened.
+
+PR_BRANCH_KIND_PREFIXES = ("pipeline/", "bugfix/", "feature/", "demo/")
+DEFAULT_PR_BRANCH_KIND = "pipeline"
+
+# Characters/sequences that make a string unsafe as a git ref (branch) name. Not
+# exhaustive of every git-check-ref-format rule, but covers the realistic unsafe
+# inputs (spaces, shell-ish characters, traversal, protected names).
+_UNSAFE_BRANCH_CHARS = (" ", "~", "^", ":", "?", "*", "[", "\\", "..", "@{")
+
+
+def _slugify_branch_seed(text: str, max_len: int = 40) -> str:
+    """Lowercase, alnum/dash/underscore/dot only, collapsed dashes. Never empty."""
+    text = (text or "").strip().lower()
+    text = re.sub(r"[^a-z0-9._-]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-._")
+    return text[:max_len] or "update"
+
+
+def is_safe_branch_name(name: str | None) -> bool:
+    """True if `name` is a safe, non-protected git ref name we'd be willing to use."""
+    if not name or name in PROTECTED_BRANCHES:
+        return False
+    if any(seq in name for seq in _UNSAFE_BRANCH_CHARS):
+        return False
+    if name.startswith("/") or name.endswith("/") or name.startswith("-") or "//" in name:
+        return False
+    if name.endswith(".lock") or name.endswith("."):
+        return False
+    return True
+
+
+def suggest_pr_branch_name(seed: str, branch_kind: str = DEFAULT_PR_BRANCH_KIND) -> str:
+    """Builds `<kind>/<safe-slug>` — defaults to `pipeline/...`; bugfix/feature/demo
+    are also allowed kinds for future use, anything else falls back to pipeline."""
+    kind = branch_kind if f"{branch_kind}/" in PR_BRANCH_KIND_PREFIXES else DEFAULT_PR_BRANCH_KIND
+    return f"{kind}/{_slugify_branch_seed(seed)}"
+
+
+def resolve_pr_branch_name(
+    requested: str | None, seed: str, branch_kind: str = DEFAULT_PR_BRANCH_KIND,
+) -> dict:
+    """Never rejects outright — an unsafe requested branch name is sanitized into a
+    safe suggestion instead. Returns {requested, suggested_branch, branch_name_safe,
+    was_sanitized}. `suggested_branch` is always safe to actually use later."""
+    if not requested:
+        return {
+            "requested": None,
+            "suggested_branch": suggest_pr_branch_name(seed, branch_kind),
+            "branch_name_safe": True,
+            "was_sanitized": False,
+        }
+    if is_safe_branch_name(requested):
+        return {
+            "requested": requested,
+            "suggested_branch": requested,
+            "branch_name_safe": True,
+            "was_sanitized": False,
+        }
+    return {
+        "requested": requested,
+        "suggested_branch": suggest_pr_branch_name(requested, branch_kind),
+        "branch_name_safe": False,
+        "was_sanitized": True,
+    }
+
+
+def get_changed_files_for_pr(repo_path, base_branch: str) -> list[str]:
+    """Files that would end up in the eventual PR diff: current uncommitted (dirty)
+    files, plus any files already committed on HEAD ahead of origin/<base_branch>.
+    Read-only — `git status`/`git diff` only, never mutates anything."""
+    status = get_git_status(repo_path)
+    dirty_paths = [line[3:].strip() for line in status["porcelain"] if line.strip()]
+
+    ahead_files: list[str] = []
+    ref = f"origin/{base_branch}"
+    verify = run_git_command(repo_path, ["rev-parse", "--verify", "--quiet", ref], check=False)
+    if verify.returncode == 0:
+        diff = run_git_command(repo_path, ["diff", "--name-only", f"{ref}...HEAD"], check=False)
+        if diff.returncode == 0:
+            ahead_files = [l.strip() for l in diff.stdout.splitlines() if l.strip()]
+
+    return sorted(set(dirty_paths) | set(ahead_files))
+
+
+def _read_json_if_exists(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def read_pr_run_safety_context(run_dir) -> dict:
+    """Reads (never writes) this run's own prior safety artifacts, if any:
+      - git_sync_state.json
+      - delivery/delivery_state.json + delivery/delivery_safety_check.md
+      - run_state.json's change_boundary_status, or a boundary_validation.json /
+        selected_feature_change_boundary.json / boundary_violation_report.md if present
+      - smoke_mutation_report.json
+    Never raises on missing files — reports "missing" or "not_applicable" instead.
+    boundary_check_status / smoke_mutation_status: passed | failed | missing | not_applicable.
+    delivery_safety_status: passed | failed | blocked | missing.
+    """
+    context = {
+        "git_sync_state": None,
+        "delivery_state": None,
+        "boundary_check_status": "not_applicable",
+        "smoke_mutation_status": "not_applicable",
+        "delivery_safety_status": "missing",
+    }
+    if run_dir is None:
+        return context
+    run_dir = Path(run_dir)
+
+    context["git_sync_state"] = _read_json_if_exists(run_dir / "git_sync_state.json")
+
+    delivery_state = _read_json_if_exists(run_dir / "delivery" / "delivery_state.json")
+    context["delivery_state"] = delivery_state
+    decision = (delivery_state or {}).get("decision") if delivery_state else None
+    if decision in ("PASS_LOCAL_ONLY", "PASS_SANDBOX_PUSH"):
+        context["delivery_safety_status"] = "passed"
+    elif decision == "BLOCKED":
+        context["delivery_safety_status"] = "blocked"
+    elif (run_dir / "delivery" / "delivery_safety_check.md").exists():
+        context["delivery_safety_status"] = "failed"
+    else:
+        context["delivery_safety_status"] = "missing"
+
+    boundary_status = None
+    run_state = _read_json_if_exists(run_dir / "run_state.json")
+    if run_state:
+        boundary_status = run_state.get("change_boundary_status")
+    if boundary_status is None:
+        boundary_json = (
+            _read_json_if_exists(run_dir / "boundary_validation.json")
+            or _read_json_if_exists(run_dir / "selected_feature_change_boundary_result.json")
+        )
+        if boundary_json:
+            boundary_status = boundary_json.get("status")
+    if boundary_status == "PASS":
+        context["boundary_check_status"] = "passed"
+    elif boundary_status == "FAIL":
+        context["boundary_check_status"] = "failed"
+    elif (run_dir / "selected_feature_change_boundary.json").exists() or (run_dir / "boundary_violation_report.md").exists():
+        context["boundary_check_status"] = "missing"
+    else:
+        context["boundary_check_status"] = "not_applicable"
+
+    smoke_data = _read_json_if_exists(run_dir / "smoke_mutation_report.json")
+    if smoke_data is not None:
+        smoke_status = smoke_data.get("status")
+        if smoke_status in ("PASS", "WARN"):
+            context["smoke_mutation_status"] = "passed"
+        elif smoke_status == "FAIL":
+            context["smoke_mutation_status"] = "failed"
+        else:
+            context["smoke_mutation_status"] = "missing"
+    elif (run_dir / "smoke_mutation_report.md").exists():
+        context["smoke_mutation_status"] = "missing"
+    else:
+        context["smoke_mutation_status"] = "not_applicable"
+
+    return context
+
+
+def analyze_pr_delivery_plan(
+    repo_path,
+    base_branch: str = "main",
+    branch_name: str | None = None,
+    branch_kind: str = DEFAULT_PR_BRANCH_KIND,
+    pr_title: str | None = None,
+    run_dir=None,
+) -> dict:
+    """
+    Read-only PR readiness analysis. Plans the eventual sync -> branch -> commit ->
+    push-branch -> open-PR workflow but NEVER performs any of it — no branch is
+    created, no commit is made, no push is attempted, no PR is opened.
+
+    pr_readiness is one of:
+      "ready"               — clean, in sync, no safety-check failures.
+      "warning"             — recoverable issue (e.g. behind origin/<base_branch>);
+                               sync first, then re-plan.
+      "pr_workflow_required" — local changes are clean, but delivery is blocked only
+                               by company direct-push rules — not a fatal failure,
+                               just means the PR/branch-push workflow is required.
+      "blocked"             — dirty tree, denied files, ahead/diverged/unknown sync,
+                               unsafe-but-required branch name, or a failed boundary /
+                               smoke-mutation check.
+    """
+    repo_path = Path(repo_path).resolve()
+    block_reasons: list[str] = []
+    warnings: list[str] = []
+
+    repo_is_git = repo_path.exists() and (repo_path / ".git").exists()
+    sync = analyze_git_sync(repo_path, base_branch, allow_branch_mismatch=True)
+    context = read_pr_run_safety_context(run_dir)
+
+    changed_files: list[str] = []
+    denied_files: list[str] = []
+    if repo_is_git:
+        changed_files = get_changed_files_for_pr(repo_path, base_branch)
+        denied_files = scan_denied_paths(changed_files)
+
+    seed = pr_title or branch_name or Path(repo_path).name
+    branch_info = resolve_pr_branch_name(branch_name, seed, branch_kind)
+    if branch_info["was_sanitized"]:
+        warnings.append(
+            f"Requested branch name '{branch_info['requested']}' was not a safe git ref name; "
+            f"sanitized to '{branch_info['suggested_branch']}'."
+        )
+
+    future_push_approval_required = bool(sync.get("is_company_repo"))
+    if sync.get("is_company_repo"):
+        warnings.append(
+            "Company repo detected — prefer the PR workflow (feature branch + PR) over any "
+            "direct push to main. Pushing the feature branch and opening the PR will require "
+            "an explicit future approval/setup step; this plan does not perform that."
+        )
+        if sync.get("push_url") == DISABLED_PUSH_MARKER:
+            warnings.append(
+                f"Push URL is '{DISABLED_PUSH_MARKER}' — it is left disabled by this plan. "
+                "Branch push / PR creation will require an explicit future approval/setup step."
+            )
+
+    if not repo_is_git:
+        block_reasons.append("repo path is not a git repository")
+    else:
+        if sync["is_dirty"]:
+            block_reasons.append(
+                f"working tree is dirty ({sync['dirty_file_count']} changed file(s)) — commit or "
+                "stash your own changes before planning a PR"
+            )
+        if denied_files:
+            block_reasons.append(f"denied paths detected in changed files: {denied_files}")
+        if sync["sync_status"] == "ahead":
+            block_reasons.append(
+                f"local branch already has {sync['commits_ahead']} unpushed commit(s) ahead of "
+                f"origin/{base_branch} before a feature branch was created — investigate before "
+                "planning a PR"
+            )
+        elif sync["sync_status"] == "diverged":
+            block_reasons.append(
+                f"local branch has diverged from origin/{base_branch} "
+                f"({sync['commits_ahead']} ahead, {sync['commits_behind']} behind)"
+            )
+        elif sync["sync_status"] == "unknown":
+            block_reasons.append(f"origin/{base_branch} was not found — cannot confirm sync state")
+        elif sync["sync_status"] == "behind":
+            warnings.append(
+                f"local base branch is {sync['commits_behind']} commit(s) behind "
+                f"origin/{base_branch} — sync first (e.g. --git-pull-ff-only) before creating "
+                "the feature branch"
+            )
+        if not branch_info["branch_name_safe"] and not branch_info["was_sanitized"]:
+            block_reasons.append(f"branch name '{branch_name}' is not safe to use")
+
+    if context["boundary_check_status"] == "failed":
+        block_reasons.append("Selected Feature Change Boundary failed for this run — see boundary_violation_report.md")
+    if context["smoke_mutation_status"] == "failed":
+        block_reasons.append("Smoke Mutation check failed for this run — see smoke_mutation_report.md")
+
+    if block_reasons:
+        pr_readiness = "blocked"
+    elif context["delivery_safety_status"] == "blocked":
+        pr_readiness = "pr_workflow_required"
+    elif warnings:
+        pr_readiness = "warning"
+    else:
+        pr_readiness = "ready"
+
+    pr_creation_allowed_later = pr_readiness != "blocked"
+    direct_push_to_main_blocked = base_branch in PROTECTED_BRANCHES
+
+    if sync["is_dirty"]:
+        recommended_next_action = "Resolve or commit/stash local changes manually before planning PR delivery."
+    elif sync["sync_status"] == "behind":
+        recommended_next_action = f"Sync first with: git fetch origin && git pull --ff-only origin {base_branch}"
+    elif sync["sync_status"] in ("ahead", "diverged", "unknown"):
+        recommended_next_action = "Resolve branch state manually before PR delivery."
+    elif sync["sync_status"] == "up_to_date" and pr_readiness in ("warning", "pr_workflow_required"):
+        recommended_next_action = (
+            "Repo is up to date. Next safe step: implement the selected fix locally, "
+            "run checks, then generate a PR delivery plan again before any branch push "
+            "or PR creation."
+        )
+    elif pr_readiness == "blocked":
+        recommended_next_action = "Resolve the blocker(s) above before planning a PR."
+    elif pr_readiness == "warning":
+        recommended_next_action = (
+            f"git fetch origin && git pull --ff-only origin {base_branch}  "
+            "# sync first, then re-run --pr-delivery-plan"
+        )
+    elif pr_readiness == "pr_workflow_required":
+        recommended_next_action = (
+            "Local changes are clean, but this is a company-protected repo — pushing the "
+            "feature branch and opening a PR will require an explicit future approval/setup "
+            "step (not performed by this plan)."
+        )
+    else:
+        recommended_next_action = (
+            f"git checkout -b {branch_info['suggested_branch']}  "
+            "# create the feature branch when you're ready to start the change (not run automatically)"
+        )
+
+    return {
+        "repo_path": str(repo_path),
+        "repo_type": sync["repo_type"],
+        "is_company_repo": sync["is_company_repo"],
+        "current_branch": sync["current_branch"],
+        "base_branch": base_branch,
+        "fetch_url": sync["fetch_url"],
+        "push_url": sync["push_url"],
+        "direct_push_to_main_blocked": direct_push_to_main_blocked,
+        "pr_title": pr_title,
+        "suggested_branch": branch_info["suggested_branch"],
+        "requested_branch": branch_info["requested"],
+        "branch_name_safe": branch_info["branch_name_safe"],
+        "branch_was_sanitized": branch_info["was_sanitized"],
+        "sync_status": sync["sync_status"],
+        "is_up_to_date": sync["sync_status"] == "up_to_date",
+        "is_dirty": sync["is_dirty"],
+        "dirty_file_count": sync["dirty_file_count"],
+        "commits_ahead": sync["commits_ahead"],
+        "commits_behind": sync["commits_behind"],
+        "changed_files": changed_files,
+        "denied_files": denied_files,
+        "boundary_check_status": context["boundary_check_status"],
+        "smoke_mutation_status": context["smoke_mutation_status"],
+        "delivery_safety_status": context["delivery_safety_status"],
+        "future_push_approval_required": future_push_approval_required,
+        "pr_creation_allowed_later": pr_creation_allowed_later,
+        "pr_readiness": pr_readiness,
+        "block_reasons": block_reasons,
+        "warnings": warnings,
+        "recommended_next_action": recommended_next_action,
+        "plan_only": True,
+        "timestamp": time.time(),
+    }
+
+
+def generate_pr_delivery_plan_report(plan: dict, output_path) -> str:
+    """Writes pr_delivery_plan.md. Always states plainly that this is a plan only —
+    no branch/commit/push/PR was created — regardless of readiness."""
+    lines = ["# Pull Request Delivery Plan", ""]
+    lines.append("**This is a plan only.**")
+    lines.append("- No branch was created.")
+    lines.append("- No commit was made.")
+    lines.append("- No push was attempted.")
+    lines.append("- No PR was opened.")
+    lines.append("")
+    lines.append(f"**Repo path:** `{plan['repo_path']}`")
+    lines.append(f"**Repo type:** `{plan['repo_type']}`")
+    lines.append(f"**Current branch:** `{plan.get('current_branch') or '(unknown)'}`")
+    lines.append(f"**Base branch:** `{plan['base_branch']}`")
+    lines.append(f"**Fetch URL:** `{plan.get('fetch_url') or '(none)'}`")
+    lines.append(f"**Push URL:** `{plan.get('push_url') or '(none)'}`")
+    lines.append(f"**Direct push to base branch blocked:** {plan['direct_push_to_main_blocked']}")
+    lines.append("")
+    lines.append(f"**Suggested feature branch:** `{plan['suggested_branch']}`")
+    if plan.get("requested_branch"):
+        lines.append(f"**Requested branch:** `{plan['requested_branch']}` (safe: {plan['branch_name_safe']})")
+    if plan.get("pr_title"):
+        lines.append(f"**PR title:** {plan['pr_title']}")
+    lines.append("")
+    lines.append(f"## Sync Status: `{plan['sync_status']}`")
+    lines.append(f"- Up to date with origin/{plan['base_branch']}: {plan['is_up_to_date']}")
+    lines.append(f"- Ahead/behind: {plan['commits_ahead']}/{plan['commits_behind']}")
+    lines.append(f"- Working tree dirty: {plan['is_dirty']} ({plan['dirty_file_count']} changed file(s))")
+    lines.append("")
+    lines.append(f"## Changed Files Intended For PR ({len(plan['changed_files'])})")
+    if plan["changed_files"]:
+        lines.extend(f"- `{f}`" for f in plan["changed_files"])
+    else:
+        lines.append("- (none yet)")
+    if plan["denied_files"]:
+        lines.append("")
+        lines.append("**Denied files detected (would never be staged/pushed):**")
+        lines.extend(f"- `{f}`" for f in plan["denied_files"])
+    lines.append("")
+    lines.append("## Prior Safety Checks (read-only, from this run if available)")
+    lines.append(f"- Selected Feature Change Boundary: `{plan['boundary_check_status']}`")
+    lines.append(f"- Smoke Mutation Check: `{plan['smoke_mutation_status']}`")
+    lines.append(f"- Local Delivery Safety: `{plan['delivery_safety_status']}`")
+    lines.append("")
+    if plan.get("is_company_repo"):
+        lines.append(
+            "**Company repo detected.** This plan prefers the PR workflow (feature branch + PR) "
+            "over any direct push to main. Branch push / PR creation will require an explicit "
+            "future approval/setup step — never performed automatically."
+        )
+        lines.append("")
+    lines.append(f"## PR Readiness: `{plan['pr_readiness']}`")
+    lines.append(f"- PR creation allowed later: {plan['pr_creation_allowed_later']}")
+    lines.append(f"- Future push approval required: {plan['future_push_approval_required']}")
+    if plan["block_reasons"]:
+        lines.append("")
+        lines.append("**Blocker(s):**")
+        lines.extend(f"- {r}" for r in plan["block_reasons"])
+    if plan["warnings"]:
+        lines.append("")
+        lines.append("**Warning(s):**")
+        lines.extend(f"- {w}" for w in plan["warnings"])
+    lines.append("")
+    lines.append("## Next Safe Step")
+    lines.append("```bash")
+    lines.append(plan["recommended_next_action"])
+    lines.append("```")
+
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def run_pr_delivery_plan(
+    repo_path,
+    base_branch: str = "main",
+    branch_name: str | None = None,
+    branch_kind: str = DEFAULT_PR_BRANCH_KIND,
+    pr_title: str | None = None,
+    run_dir=None,
+    output_dir=None,
+) -> dict:
+    """Orchestrator: analyze_pr_delivery_plan + write pr_delivery_plan.md / pr_state.json
+    into output_dir, if given. Never creates a branch, commits, pushes, or opens a PR."""
+    plan = analyze_pr_delivery_plan(
+        repo_path, base_branch=base_branch, branch_name=branch_name,
+        branch_kind=branch_kind, pr_title=pr_title, run_dir=run_dir,
+    )
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        generate_pr_delivery_plan_report(plan, output_dir / "pr_delivery_plan.md")
+        (output_dir / "pr_state.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
+    return plan
