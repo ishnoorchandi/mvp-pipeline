@@ -3476,6 +3476,16 @@ def run_bugfix_planning(
     output_dir.mkdir(parents=True, exist_ok=True)
     parsed = parse_bug_report(bug_report_text, bug_title)
     investigation = investigate_bugfix_repo(existing_app_path, parsed) if existing_app_path.exists() else {"likely_files": [], "files_scanned": 0}
+    inventory_warning: str | None = None
+    if existing_app_path.exists() and parsed.get("api_endpoint_clues"):
+        # Cheap, bounded, regex-only — only attempted when the bug report actually
+        # mentions an endpoint, so the common case never pays this cost. Any failure
+        # here must not break bugfix mode — it only ever improves ranking.
+        try:
+            inventory = generate_backend_inventory_for_bugfix(existing_app_path)
+            investigation = enrich_bugfix_investigation_with_inventory(parsed, investigation, inventory)
+        except Exception as e:
+            inventory_warning = f"Backend inventory enrichment skipped: {e}"
     boundary = build_bugfix_boundary(parsed, investigation)
     git_sync_state = None
     readiness = "planning_only"
@@ -3485,6 +3495,8 @@ def run_bugfix_planning(
     elif not existing_app_path.exists():
         readiness = "blocked"
     artifacts = _render_bugfix_artifacts(parsed, investigation, boundary, readiness)
+    if inventory_warning:
+        artifacts["bug_report_summary.md"] += f"\n**Warning:** {inventory_warning}\n"
     for name, content in artifacts.items():
         (output_dir / name).write_text(content, encoding="utf-8")
     state = json.loads(artifacts["bug_report_state.json"])
@@ -3517,6 +3529,795 @@ def run_existing_app_bugfix_planning(
         "bugfix_top_suspected_files": state.get("top_suspected_files", []),
     })
     return state
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Backend Inventory + Backend Route Map
+# ═════════════════════════════════════════════════════════════════════════════
+# Read-only static analysis: detects backend framework(s), scans for route
+# declarations, frontend API client calls, env/config variable NAMES (never
+# values), and recommends (never runs) safe smoke checks. Lightweight regex/
+# file-walk only — no GPT calls, no heavy AST parsing, no app code is ever
+# modified, no commit/push/PR is ever made by this feature.
+
+BACKEND_INVENTORY_ARTIFACTS = [
+    "backend_inventory.md",
+    "backend_inventory_state.json",
+    "backend_route_map.md",
+    "frontend_api_client_map.md",
+    "backend_data_flow.md",
+    "backend_env_requirements.md",
+    "backend_test_plan.md",
+]
+
+_BACKEND_INVENTORY_MAX_FILES = 3000
+_ROUTE_SCAN_EXTS = (".py", ".js", ".jsx", ".ts", ".tsx")
+
+_FLASK_ROUTE_RE = re.compile(r'@(\w+)\.route\(\s*["\']([^"\']+)["\'](?:[^)]*?methods\s*=\s*\[([^\]]*)\])?')
+_FASTAPI_ROUTE_RE = re.compile(r'@(\w+)\.(get|post|put|delete|patch|options|head)\(\s*["\']([^"\']+)["\']', re.I)
+_EXPRESS_ROUTE_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\.(get|post|put|delete|patch)\(\s*["\'`]([^"\'`]+)["\'`]', re.I)
+_HANDLER_DEF_RE = re.compile(r'^\s*(?:async\s+)?def\s+(\w+)\s*\(')
+_AUTH_WINDOW_RE = re.compile(
+    r'\b(login_required|jwt_required|requireAuth|authMiddleware|verifyToken|isAuthenticated|'
+    r'get_current_user|@auth|permission_required|requires_auth)\b', re.I,
+)
+_SERVICE_MODEL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*(?:Service|Repository|Model|Schema))\b')
+
+_FETCH_CALL_RE = re.compile(r'fetch\(\s*[`"\']([^`"\']+)[`"\']')
+_AXIOS_CALL_RE = re.compile(r'\baxios\.(get|post|put|delete|patch)\(\s*[`"\']([^`"\']+)[`"\']', re.I)
+_CLIENT_CALL_RE = re.compile(r'\b(\w*[Cc]lient)\.(get|post|put|delete|patch)\(\s*[`"\']([^`"\']+)[`"\']', re.I)
+_METHOD_HINT_RE = re.compile(r'method\s*:\s*[`"\'](\w+)[`"\']', re.I)
+_FUNC_NAME_RE = re.compile(r'(?:function\s+(\w+)\s*\(|const\s+(\w+)\s*=\s*(?:async\s*)?\(|export\s+default\s+function\s+(\w+))')
+
+_ENV_PATTERNS = [
+    re.compile(r"os\.environ\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]"),
+    re.compile(r"os\.environ\.get\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]"),
+    re.compile(r"os\.getenv\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]"),
+    re.compile(r"process\.env\.([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"process\.env\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]"),
+    re.compile(r"import\.meta\.env\.([A-Za-z_][A-Za-z0-9_]*)"),
+]
+
+
+def _iter_repo_files(root: Path, max_files: int = _BACKEND_INVENTORY_MAX_FILES, exts: tuple[str, ...] | None = None):
+    """Bounded, ignore-dir-aware file walk shared by every backend-inventory scanner."""
+    count = 0
+    root = Path(root)
+    if not root.exists():
+        return
+    for r, dirs, files in os.walk(root):
+        dirs[:] = [d for d in sorted(dirs) if d not in _SCAN_IGNORE_DIRS and not d.startswith(".")]
+        for fname in sorted(files):
+            if count >= max_files:
+                return
+            p = Path(r) / fname
+            if exts and p.suffix.lower() not in exts:
+                continue
+            count += 1
+            yield p
+
+
+def detect_backend_frameworks(existing_app_path: Path) -> list[dict]:
+    """Detects likely backend framework(s) with a confidence per framework. Returns
+    [{"framework": "unknown", "confidence": "low", "evidence": []}] when nothing
+    matches — never raises, never invents a framework without evidence."""
+    existing_app_path = Path(existing_app_path)
+    findings: dict[str, dict] = {}
+    rank = {"low": 0, "medium": 1, "high": 2}
+
+    def _add(framework: str, confidence: str, evidence: str):
+        entry = findings.setdefault(framework, {"framework": framework, "confidence": confidence, "evidence": []})
+        if evidence not in entry["evidence"]:
+            entry["evidence"].append(evidence)
+        if rank[confidence] > rank[entry["confidence"]]:
+            entry["confidence"] = confidence
+
+    for path in _iter_repo_files(existing_app_path, exts=(".txt", ".toml", ".json")):
+        name = path.name
+        rel = str(path.relative_to(existing_app_path))
+        if name in ("requirements.txt", "pyproject.toml"):
+            text = _safe_read_text(path, max_chars=8000)
+            if re.search(r"\bflask\b", text, re.I):
+                _add("Flask", "high", f"`{name}` lists flask ({rel})")
+            if re.search(r"\bfastapi\b", text, re.I):
+                _add("FastAPI", "high", f"`{name}` lists fastapi ({rel})")
+            if re.search(r"\bdjango\b", text, re.I):
+                _add("Django", "high", f"`{name}` lists django ({rel})")
+        elif name == "package.json":
+            pkg = _safe_read_json(path)
+            deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})} if isinstance(pkg, dict) else {}
+            if "express" in deps:
+                _add("Express", "high", f"package.json dependency `express` ({rel})")
+            if any(d.startswith("@nestjs/") for d in deps):
+                _add("NestJS", "high", f"package.json dependency `@nestjs/*` ({rel})")
+            if "next" in deps:
+                api_dirs = [p for p in (path.parent / "pages" / "api", path.parent / "app" / "api") if p.exists()]
+                if api_dirs:
+                    _add("Next.js API routes", "high",
+                         f"`next` dependency + `{api_dirs[0].relative_to(existing_app_path)}` ({rel})")
+                else:
+                    _add("Next.js API routes", "low", f"`next` dependency, no pages/api or app/api found yet ({rel})")
+
+    for path in _iter_repo_files(existing_app_path, exts=(".py",)):
+        rel = str(path.relative_to(existing_app_path))
+        if path.name == "manage.py":
+            _add("Django", "high", f"`manage.py` present ({rel})")
+        text = _safe_read_text(path, max_chars=3000)
+        if re.search(r"from\s+flask\s+import|import\s+flask\b", text):
+            _add("Flask", "high", f"`from flask import ...` in {rel}")
+        if re.search(r"from\s+fastapi\s+import|import\s+fastapi\b", text):
+            _add("FastAPI", "high", f"`from fastapi import ...` in {rel}")
+        if re.search(r"from\s+django\b|import\s+django\b", text):
+            _add("Django", "high", f"django import in {rel}")
+
+    for path in _iter_repo_files(existing_app_path, exts=(".js", ".ts")):
+        rel = str(path.relative_to(existing_app_path))
+        text = _safe_read_text(path, max_chars=3000)
+        if re.search(r"require\(\s*['\"]express['\"]\s*\)|from\s+['\"]express['\"]", text):
+            _add("Express", "high", f"express import in {rel}")
+        if re.search(r"@nestjs/core", text):
+            _add("NestJS", "high", f"@nestjs/core import in {rel}")
+
+    if not findings:
+        return [{"framework": "unknown", "confidence": "low", "evidence": []}]
+    return sorted(findings.values(), key=lambda f: (-rank[f["confidence"]], f["framework"]))
+
+
+def detect_likely_roots(existing_app_path: Path, max_files: int = _BACKEND_INVENTORY_MAX_FILES) -> dict:
+    """Best-effort likely backend/frontend root directories. Purely a hint for the
+    inventory report — route/API-call scanning itself still covers the whole repo
+    (or an explicit --backend-root/--frontend-root) regardless of this guess."""
+    existing_app_path = Path(existing_app_path)
+    backend_roots, frontend_roots = set(), set()
+    backend_signal_files = {"requirements.txt", "pyproject.toml", "manage.py", "app.py", "main.py", "server.js"}
+    for path in _iter_repo_files(existing_app_path, max_files=max_files):
+        rel_dir = str(path.parent.relative_to(existing_app_path))
+        if path.name in backend_signal_files:
+            backend_roots.add(rel_dir)
+        if path.name == "package.json":
+            pkg = _safe_read_json(path)
+            deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})} if isinstance(pkg, dict) else {}
+            if any(d in deps for d in ("express", "@nestjs/core")):
+                backend_roots.add(rel_dir)
+            if any(d in deps for d in ("react", "vue", "next", "vite")):
+                frontend_roots.add(rel_dir)
+        parent_name = path.parent.name.lower()
+        if parent_name in ("routes", "routers", "controllers", "api"):
+            backend_roots.add(rel_dir)
+        if parent_name in ("components", "pages", "views"):
+            frontend_roots.add(rel_dir)
+    return {
+        "backend_roots": sorted(backend_roots)[:10] or ["."],
+        "frontend_roots": sorted(frontend_roots)[:10] or ["."],
+    }
+
+
+def _window_text(lines: list[str], idx: int, before: int = 3, after: int = 3) -> str:
+    lo, hi = max(0, idx - before), min(len(lines), idx + after + 1)
+    return "\n".join(lines[lo:hi])
+
+
+def _nearby_handler_name(lines: list[str], idx: int, max_lookahead: int = 4) -> str | None:
+    for j in range(idx + 1, min(len(lines), idx + 1 + max_lookahead)):
+        m = _HANDLER_DEF_RE.match(lines[j])
+        if m:
+            return m.group(1)
+        if lines[j].strip() and not lines[j].lstrip().startswith("@"):
+            break
+    return None
+
+
+def _next_pages_api_route(rel: str, text: str) -> dict:
+    api_part = rel.split("pages/api/", 1)[1] if "pages/api/" in rel else rel
+    api_part = re.sub(r"\.(t|j)sx?$", "", api_part)
+    api_part = re.sub(r"/index$", "", api_part)
+    path = "/api/" + re.sub(r"\[(\.\.\.)?([A-Za-z0-9_]+)\]", lambda mm: "*" if mm.group(1) else f":{mm.group(2)}", api_part)
+    methods = sorted(set(m.upper() for m in re.findall(r"req\.method\s*===?\s*['\"](\w+)['\"]", text)))
+    return {
+        "method": "/".join(methods) if methods else "ANY", "path": path, "file": rel,
+        "line": 1, "handler": "default export handler", "framework": "Next.js API routes",
+        "auth_clue": bool(_AUTH_WINDOW_RE.search(text)),
+        "service_model_clue": sorted(set(_SERVICE_MODEL_RE.findall(text)))[:3],
+    }
+
+
+def _next_app_api_routes(rel: str, text: str, lines: list[str]) -> list[dict]:
+    api_part = rel.split("app/", 1)[1] if "app/" in rel else rel
+    api_part = re.sub(r"/route\.(t|j)sx?$", "", api_part)
+    path = "/" + re.sub(r"\[(\.\.\.)?([A-Za-z0-9_]+)\]", lambda mm: "*" if mm.group(1) else f":{mm.group(2)}", api_part)
+    out: list[dict] = []
+    for idx, line in enumerate(lines):
+        m = re.search(r"export\s+(?:async\s+)?function\s+(GET|POST|PUT|DELETE|PATCH)\b", line)
+        if m:
+            window = _window_text(lines, idx)
+            out.append({
+                "method": m.group(1), "path": path, "file": rel, "line": idx + 1,
+                "handler": m.group(1), "framework": "Next.js API routes",
+                "auth_clue": bool(_AUTH_WINDOW_RE.search(window)),
+                "service_model_clue": sorted(set(_SERVICE_MODEL_RE.findall(window)))[:3],
+            })
+    if not out:
+        out.append({
+            "method": "ANY", "path": path, "file": rel, "line": 1, "handler": None,
+            "framework": "Next.js API routes", "auth_clue": False, "service_model_clue": [],
+        })
+    return out
+
+
+def scan_backend_routes(scan_root, repo_root, max_files: int = _BACKEND_INVENTORY_MAX_FILES) -> list[dict]:
+    """Lightweight regex scan for Flask/FastAPI/Express route declarations, plus
+    Next.js pages/api and app/api/.../route.* file-based routes. Intentionally
+    simple — never parses an AST. `repo_root` is used only to compute repo-relative
+    file paths, so route file paths line up with frontend_api_client_map.md."""
+    routes: list[dict] = []
+    scan_root, repo_root = Path(scan_root), Path(repo_root)
+    if not scan_root.exists():
+        return routes
+
+    for path in _iter_repo_files(scan_root, max_files=max_files, exts=_ROUTE_SCAN_EXTS):
+        rel = str(path.relative_to(repo_root))
+        lower_rel = rel.lower()
+        text = _safe_read_text(path, max_chars=20000)
+        if not text:
+            continue
+        lines = text.splitlines()
+
+        if path.suffix == ".py":
+            for idx, line in enumerate(lines):
+                m = _FLASK_ROUTE_RE.search(line)
+                if m:
+                    methods_raw = (m.group(3) or "GET").strip()
+                    methods = [mm.strip(" '\"") for mm in methods_raw.split(",")] if methods_raw else ["GET"]
+                    window = _window_text(lines, idx)
+                    handler = _nearby_handler_name(lines, idx)
+                    for method in methods:
+                        routes.append({
+                            "method": (method.upper().strip() or "GET"), "path": m.group(2), "file": rel,
+                            "line": idx + 1, "handler": handler, "framework": "Flask",
+                            "auth_clue": bool(_AUTH_WINDOW_RE.search(window)),
+                            "service_model_clue": sorted(set(_SERVICE_MODEL_RE.findall(window)))[:3],
+                        })
+                    continue
+                m = _FASTAPI_ROUTE_RE.search(line)
+                if m:
+                    window = _window_text(lines, idx)
+                    handler = _nearby_handler_name(lines, idx)
+                    routes.append({
+                        "method": m.group(2).upper(), "path": m.group(3), "file": rel,
+                        "line": idx + 1, "handler": handler, "framework": "FastAPI",
+                        "auth_clue": bool(_AUTH_WINDOW_RE.search(window)),
+                        "service_model_clue": sorted(set(_SERVICE_MODEL_RE.findall(window)))[:3],
+                    })
+        elif path.suffix in (".js", ".jsx", ".ts", ".tsx"):
+            if re.search(r"(^|/)pages/api/", lower_rel):
+                routes.append(_next_pages_api_route(rel, text))
+            elif re.search(r"(^|/)app/.*api/.*route\.(t|j)sx?$", lower_rel):
+                routes.extend(_next_app_api_routes(rel, text, lines))
+            else:
+                for idx, line in enumerate(lines):
+                    m = _EXPRESS_ROUTE_RE.search(line)
+                    if not m:
+                        continue
+                    var = m.group(1)
+                    if not re.search(r"router|app|express", var, re.I):
+                        continue
+                    window = _window_text(lines, idx)
+                    handler_match = re.search(r",\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\)\s*;?\s*$", line)
+                    routes.append({
+                        "method": m.group(2).upper(), "path": m.group(3), "file": rel,
+                        "line": idx + 1, "handler": handler_match.group(1) if handler_match else None,
+                        "framework": "Express", "auth_clue": bool(_AUTH_WINDOW_RE.search(window)),
+                        "service_model_clue": sorted(set(_SERVICE_MODEL_RE.findall(window)))[:3],
+                    })
+    return routes
+
+
+def _nearby_caller_name(lines: list[str], idx: int, max_lookback: int = 60) -> str | None:
+    for j in range(idx, max(-1, idx - max_lookback), -1):
+        m = _FUNC_NAME_RE.search(lines[j])
+        if m:
+            return next((g for g in m.groups() if g), None)
+    return None
+
+
+def scan_frontend_api_calls(scan_root, repo_root, max_files: int = _BACKEND_INVENTORY_MAX_FILES) -> list[dict]:
+    """Lightweight regex scan for fetch()/axios/apiClient/client.* calls and bare
+    `/api/...` endpoint string literals. Never parses an AST."""
+    calls: list[dict] = []
+    scan_root, repo_root = Path(scan_root), Path(repo_root)
+    if not scan_root.exists():
+        return calls
+    for path in _iter_repo_files(scan_root, max_files=max_files, exts=(".js", ".jsx", ".ts", ".tsx")):
+        rel = str(path.relative_to(repo_root))
+        text = _safe_read_text(path, max_chars=20000)
+        if not text or not re.search(r"fetch\(|axios|[Cc]lient\.(get|post|put|delete|patch)|/api/", text):
+            continue
+        lines = text.splitlines()
+        for idx, line in enumerate(lines):
+            for regex, method_group, path_group in (
+                (_FETCH_CALL_RE, None, 1), (_AXIOS_CALL_RE, 1, 2), (_CLIENT_CALL_RE, 2, 3),
+            ):
+                m = regex.search(line)
+                if not m:
+                    continue
+                endpoint = m.group(path_group)
+                if not endpoint.startswith(("/", "http")):
+                    continue
+                method = m.group(method_group).upper() if method_group else None
+                if not method:
+                    hint = _METHOD_HINT_RE.search(_window_text(lines, idx, before=0, after=4))
+                    method = hint.group(1).upper() if hint else "GET"
+                calls.append({
+                    "method": method, "endpoint": endpoint, "file": rel, "line": idx + 1,
+                    "caller": _nearby_caller_name(lines, idx) or "unknown",
+                })
+    return calls
+
+
+def _normalize_api_path(p: str) -> str:
+    p = (p or "").split("?")[0]
+    p = re.sub(r"\$\{[^}]+\}", "*", p)
+    p = re.sub(r"<[^>]+>|\{[^}]+\}|:[A-Za-z_][A-Za-z0-9_]*", "*", p)
+    if p.startswith("http"):
+        m = re.search(r"https?://[^/]+(/.*)?", p)
+        p = (m.group(1) or "/") if m else p
+    return p.rstrip("/") or "/"
+
+
+def match_frontend_calls_to_routes(frontend_calls: list[dict], routes: list[dict]) -> None:
+    """Mutates frontend_calls in place: adds matched_backend_route + match_confidence."""
+    normalized_routes = [(r, _normalize_api_path(r["path"])) for r in routes]
+    for call in frontend_calls:
+        f_norm = _normalize_api_path(call["endpoint"])
+        f_bare = f_norm.replace("*", "")
+        best, best_conf = None, None
+        for route, r_norm in normalized_routes:
+            r_bare = r_norm.replace("*", "")
+            if f_norm == r_norm:
+                conf = "high" if call["method"] in (route["method"], "ANY") or route["method"] == "ANY" else "medium"
+                if best_conf != "high":
+                    best, best_conf = route, conf
+                if conf == "high":
+                    break
+            elif f_bare and r_bare and (f_bare in r_bare or r_bare in f_bare) and best_conf is None:
+                best, best_conf = route, "low"
+        call["matched_backend_route"] = f"{best['method']} {best['path']} ({best['file']})" if best else None
+        call["match_confidence"] = best_conf
+
+
+def scan_env_requirements(existing_app_path: Path, max_files: int = _BACKEND_INVENTORY_MAX_FILES) -> dict:
+    """Names only — values are NEVER read, stored, or printed. `.env*` files are
+    split on the first `=`; only the left-hand side (the variable name) is kept."""
+    existing_app_path = Path(existing_app_path)
+    found: dict[str, set] = {}
+
+    def _record(name: str, source: str):
+        found.setdefault(name, set()).add(source)
+
+    for path in _iter_repo_files(existing_app_path, max_files=max_files, exts=(".py", ".js", ".jsx", ".ts", ".tsx")):
+        text = _safe_read_text(path, max_chars=20000)
+        if not text or "env" not in text.lower():
+            continue
+        rel = str(path.relative_to(existing_app_path))
+        for pattern in _ENV_PATTERNS:
+            for name in pattern.findall(text):
+                _record(name, rel)
+
+    for path in _iter_repo_files(existing_app_path, max_files=max_files):
+        if not (path.name.startswith(".env") or path.name == "env.example"):
+            continue
+        rel = str(path.relative_to(existing_app_path))
+        for line in _safe_read_text(path, max_chars=8000).splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name = line.split("=", 1)[0].strip()
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+                _record(name, rel)
+
+    return {name: sorted(sources) for name, sources in sorted(found.items())}
+
+
+def detect_backend_test_plan(existing_app_path: Path, routes: list[dict], max_files: int = _BACKEND_INVENTORY_MAX_FILES) -> dict:
+    """Suggested safe checks only — nothing here is ever run automatically."""
+    existing_app_path = Path(existing_app_path)
+    frontend_checks: set[str] = set()
+    backend_checks: set[str] = set()
+    api_checks: list[str] = []
+    human_setup: set[str] = set()
+
+    for path in _iter_repo_files(existing_app_path, max_files=max_files, exts=(".json",)):
+        if path.name != "package.json":
+            continue
+        pkg = _safe_read_json(path)
+        scripts = pkg.get("scripts", {}) if isinstance(pkg, dict) else {}
+        rel = str(path.parent.relative_to(existing_app_path))
+        prefix = f"cd {rel} && " if rel != "." else ""
+        if "build" in scripts:
+            frontend_checks.add(f"`{prefix}npm run build`")
+        if "test" in scripts:
+            frontend_checks.add(f"`{prefix}npm test`")
+        if "lint" in scripts:
+            frontend_checks.add(f"`{prefix}npm run lint`")
+        for key in ("typecheck", "type-check"):
+            if key in scripts:
+                frontend_checks.add(f"`{prefix}npm run {key}`")
+        if "migrate" in scripts:
+            human_setup.add(f"`{prefix}npm run migrate` (DB migration — requires human approval)")
+
+    has_pytest_signal = False
+    for path in _iter_repo_files(existing_app_path, max_files=max_files, exts=(".txt", ".toml")):
+        if path.name in ("requirements.txt", "pyproject.toml") and re.search(r"\bpytest\b", _safe_read_text(path), re.I):
+            has_pytest_signal = True
+    has_test_dir = False
+    for path in _iter_repo_files(existing_app_path, max_files=max_files):
+        if path.is_dir():
+            continue
+        if path.parent.name in ("tests", "test"):
+            has_test_dir = True
+            break
+    if has_pytest_signal or has_test_dir:
+        backend_checks.add("`pytest`")
+
+    for path in _iter_repo_files(existing_app_path, max_files=max_files, exts=(".ini",)):
+        if "alembic" in path.name.lower():
+            human_setup.add("`alembic upgrade head` (DB migration — requires human approval)")
+    for path in _iter_repo_files(existing_app_path, max_files=max_files, exts=(".py",)):
+        if path.name == "manage.py":
+            backend_checks.add("`python manage.py check`")
+            human_setup.add("`python manage.py migrate` (DB migration — requires human approval)")
+
+    health_routes = [r for r in routes if re.search(r"health|status|ping", r["path"], re.I)]
+    for r in health_routes:
+        api_checks.append(f"`curl -i http://localhost:PORT{r['path']}` (health endpoint, {r['file']})")
+    if not health_routes and routes:
+        sample = routes[0]
+        api_checks.append(f"`curl -i http://localhost:PORT{sample['path']}` (no dedicated health endpoint found — sample route, {sample['file']})")
+
+    return {
+        "frontend_checks": sorted(frontend_checks),
+        "backend_checks": sorted(backend_checks),
+        "api_smoke_checks": api_checks,
+        "db_read_only_checks": [
+            "Read-only DB checks only (e.g. a SELECT/count query) unless explicit schema/migration approval is given.",
+        ],
+        "human_setup_required": sorted(human_setup),
+    }
+
+
+def generate_backend_inventory(
+    existing_app_path, backend_root: str | None = None, frontend_root: str | None = None,
+    max_files: int = _BACKEND_INVENTORY_MAX_FILES,
+) -> dict:
+    """Read-only static analysis. Never rewrites backend code, never makes app
+    changes. Regex/lightweight scan only — no GPT calls, no heavy AST parsing."""
+    existing_app_path = Path(existing_app_path).resolve()
+    warnings: list[str] = []
+    if not existing_app_path.exists():
+        return {
+            "repo_path": str(existing_app_path), "backend_root": backend_root, "frontend_root": frontend_root,
+            "frameworks": [{"framework": "unknown", "confidence": "low", "evidence": []}],
+            "backend_roots": [], "frontend_roots": [], "routes": [], "route_count": 0,
+            "frontend_api_calls": [], "frontend_api_call_count": 0, "matched_call_count": 0,
+            "unmatched_calls": [], "unused_routes": [], "auth_sensitive_routes": [], "db_sensitive_routes": [],
+            "env_vars": {}, "env_var_count": 0,
+            "test_plan": {"frontend_checks": [], "backend_checks": [], "api_smoke_checks": [],
+                          "db_read_only_checks": [], "human_setup_required": []},
+            "warnings": ["existing app path does not exist"], "timestamp": time.time(),
+        }
+
+    likely_roots = detect_likely_roots(existing_app_path, max_files=max_files)
+    backend_scan_root = (existing_app_path / backend_root) if backend_root else existing_app_path
+    frontend_scan_root = (existing_app_path / frontend_root) if frontend_root else existing_app_path
+    if backend_root and not backend_scan_root.exists():
+        warnings.append(f"--backend-root '{backend_root}' does not exist under the existing app — scanned the full repo instead.")
+        backend_scan_root = existing_app_path
+    if frontend_root and not frontend_scan_root.exists():
+        warnings.append(f"--frontend-root '{frontend_root}' does not exist under the existing app — scanned the full repo instead.")
+        frontend_scan_root = existing_app_path
+
+    frameworks = detect_backend_frameworks(existing_app_path)
+    routes = scan_backend_routes(backend_scan_root, existing_app_path, max_files=max_files)
+    frontend_calls = scan_frontend_api_calls(frontend_scan_root, existing_app_path, max_files=max_files)
+    match_frontend_calls_to_routes(frontend_calls, routes)
+    env_vars = scan_env_requirements(existing_app_path, max_files=max_files)
+    test_plan = detect_backend_test_plan(existing_app_path, routes, max_files=max_files)
+
+    matched_route_keys = {c["matched_backend_route"] for c in frontend_calls if c.get("matched_backend_route")}
+    unused_routes = [r for r in routes if f"{r['method']} {r['path']} ({r['file']})" not in matched_route_keys]
+    unmatched_calls = [c for c in frontend_calls if not c.get("matched_backend_route")]
+    auth_routes = [r for r in routes if r.get("auth_clue")]
+    db_routes = [r for r in routes if r.get("service_model_clue")]
+
+    if frameworks[0]["framework"] == "unknown":
+        warnings.append("No backend framework signal detected — route scan may be incomplete.")
+    if not routes:
+        warnings.append("No backend routes detected.")
+    if not frontend_calls:
+        warnings.append("No frontend API client calls detected.")
+
+    return {
+        "repo_path": str(existing_app_path),
+        "backend_root": backend_root, "frontend_root": frontend_root,
+        "backend_roots": likely_roots["backend_roots"], "frontend_roots": likely_roots["frontend_roots"],
+        "frameworks": frameworks,
+        "routes": routes, "route_count": len(routes),
+        "frontend_api_calls": frontend_calls, "frontend_api_call_count": len(frontend_calls),
+        "matched_call_count": len(frontend_calls) - len(unmatched_calls),
+        "unmatched_calls": unmatched_calls, "unused_routes": unused_routes,
+        "auth_sensitive_routes": auth_routes, "db_sensitive_routes": db_routes,
+        "env_vars": env_vars, "env_var_count": len(env_vars),
+        "test_plan": test_plan,
+        "warnings": warnings,
+        "timestamp": time.time(),
+    }
+
+
+def generate_backend_inventory_for_bugfix(existing_app_path, max_files: int = 800) -> dict:
+    """Cheap subset of generate_backend_inventory used only by bugfix mode, to rank
+    suspected files against matched routes/API client calls. Skips framework/env/
+    test-plan/likely-roots detection entirely so bugfix mode never gets slower."""
+    existing_app_path = Path(existing_app_path)
+    routes = scan_backend_routes(existing_app_path, existing_app_path, max_files=max_files)
+    frontend_calls = scan_frontend_api_calls(existing_app_path, existing_app_path, max_files=max_files)
+    return {"routes": routes, "frontend_api_calls": frontend_calls}
+
+
+def enrich_bugfix_investigation_with_inventory(parsed: dict, investigation: dict, inventory: dict) -> dict:
+    """Cheap, best-effort: if the bug report mentions an endpoint, boost suspected
+    files that match a backend route or frontend API client call for that endpoint
+    — even if they didn't already score via term matching — and annotate the
+    reason so suspected_files.md explains the route/API evidence. Never raises;
+    any error here must not break bugfix mode (caller wraps this in try/except)."""
+    endpoint_clues = [e for e in (parsed.get("api_endpoint_clues") or []) if e.startswith("/")]
+    if not endpoint_clues:
+        return investigation
+    scored = {item["file"]: dict(item) for item in investigation.get("likely_files") or []}
+
+    def _matches(clue: str, candidate: str) -> bool:
+        c, cand = _normalize_api_path(clue), _normalize_api_path(candidate)
+        c_bare, cand_bare = c.replace("*", ""), cand.replace("*", "")
+        return c == cand or (bool(c_bare) and bool(cand_bare) and (c_bare in cand_bare or cand_bare in c_bare))
+
+    matched_endpoints: set[str] = set()
+    for route in inventory.get("routes") or []:
+        if not any(_matches(clue, route["path"]) for clue in endpoint_clues):
+            continue
+        matched_endpoints.add(route["path"])
+        entry = scored.get(route["file"], {"file": route["file"], "area": "backend", "reason": "", "confidence": "low", "score": 0})
+        entry["score"] = entry.get("score", 0) + 5
+        entry["confidence"] = "high"
+        entry["area"] = entry.get("area") or "backend"
+        existing_reasons = entry["reason"].split("; ") if entry["reason"] else []
+        entry["reason"] = "; ".join(dict.fromkeys([*existing_reasons, f"matches backend route {route['method']} {route['path']}"]))[:220]
+        scored[route["file"]] = entry
+
+    for call in inventory.get("frontend_api_calls") or []:
+        if not any(_matches(clue, call["endpoint"]) for clue in endpoint_clues):
+            continue
+        entry = scored.get(call["file"], {"file": call["file"], "area": "frontend", "reason": "", "confidence": "low", "score": 0})
+        entry["score"] = entry.get("score", 0) + 4
+        entry["confidence"] = "high"
+        entry["area"] = entry.get("area") or "frontend"
+        existing_reasons = entry["reason"].split("; ") if entry["reason"] else []
+        entry["reason"] = "; ".join(dict.fromkeys([*existing_reasons, f"matches frontend API client call {call['method']} {call['endpoint']}"]))[:220]
+        scored[call["file"]] = entry
+
+    ranked = sorted(scored.values(), key=lambda item: (-item.get("score", 0), item["file"]))[:40]
+    enriched = dict(investigation)
+    enriched["likely_files"] = ranked
+    enriched["matched_endpoints_from_inventory"] = sorted(matched_endpoints)
+    return enriched
+
+
+def generate_backend_inventory_report(inv: dict, output_path) -> str:
+    lines = ["# Backend Inventory", ""]
+    lines.append("**Inventory only** — no code changes, commits, pushes, or PRs were created.")
+    lines.append("")
+    lines.append(f"**Repo path:** `{inv['repo_path']}`")
+    lines.append("")
+    lines.append("## Detected Frameworks")
+    for f in inv["frameworks"]:
+        lines.append(f"- **{f['framework']}** (confidence: {f['confidence']})")
+        for ev in f.get("evidence", [])[:3]:
+            lines.append(f"  - {ev}")
+    lines.append("")
+    lines.append(f"**Likely backend root(s):** {', '.join(f'`{r}`' for r in inv['backend_roots']) or '(none detected)'}")
+    lines.append(f"**Likely frontend root(s):** {', '.join(f'`{r}`' for r in inv['frontend_roots']) or '(none detected)'}")
+    lines.append("")
+    lines.append("## Counts")
+    lines.append(f"- Route files/handlers detected: {inv['route_count']}")
+    lines.append(f"- Frontend API client calls detected: {inv['frontend_api_call_count']}")
+    lines.append(f"- Env/config variable names detected: {inv['env_var_count']}")
+    lines.append(f"- Auth-sensitive routes: {len(inv['auth_sensitive_routes'])}")
+    lines.append(f"- DB-sensitive routes: {len(inv['db_sensitive_routes'])}")
+    lines.append(f"- Unmatched frontend calls: {len(inv['unmatched_calls'])}")
+    lines.append(f"- Unused backend routes: {len(inv['unused_routes'])}")
+    if inv["warnings"]:
+        lines.append("")
+        lines.append("## Warnings")
+        lines.extend(f"- {w}" for w in inv["warnings"])
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_backend_route_map_report(inv: dict, output_path) -> str:
+    lines = ["# Backend Route Map", "", "method | path | file | line | handler | framework | notes",
+              "--- | --- | --- | --- | --- | --- | ---"]
+    for r in inv["routes"]:
+        notes = []
+        if r.get("auth_clue"):
+            notes.append("auth-sensitive")
+        if r.get("service_model_clue"):
+            notes.append("uses " + ", ".join(r["service_model_clue"]))
+        lines.append(
+            f"{r['method']} | `{r['path']}` | `{r['file']}` | {r['line']} | "
+            f"{r.get('handler') or '(unknown)'} | {r['framework']} | {'; '.join(notes) or '-'}"
+        )
+    if not inv["routes"]:
+        lines.append("(no routes detected) | | | | | | ")
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_frontend_api_client_map_report(inv: dict, output_path) -> str:
+    lines = ["# Frontend API Client Map", "",
+              "method | endpoint | file | line | caller/component | matched backend route | confidence",
+              "--- | --- | --- | --- | --- | --- | ---"]
+    for c in inv["frontend_api_calls"]:
+        lines.append(
+            f"{c['method']} | `{c['endpoint']}` | `{c['file']}` | {c['line']} | {c.get('caller') or '(unknown)'} | "
+            f"{c.get('matched_backend_route') or '(none)'} | {c.get('match_confidence') or '-'}"
+        )
+    if not inv["frontend_api_calls"]:
+        lines.append("(no frontend API client calls detected) | | | | | | ")
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_backend_data_flow_report(inv: dict, output_path) -> str:
+    lines = ["# Backend Data Flow", "",
+              "Only includes links backed by evidence found in the repo — nothing here is invented.", ""]
+    lines.append("## Known API Flows")
+    matched = [c for c in inv["frontend_api_calls"] if c.get("matched_backend_route")]
+    if matched:
+        for c in matched:
+            route = next((r for r in inv["routes"] if f"{r['method']} {r['path']} ({r['file']})" == c["matched_backend_route"]), None)
+            service = ", ".join(route["service_model_clue"]) if route and route.get("service_model_clue") else "(no service/model clue found)"
+            lines.append(
+                f"- `{c.get('caller') or 'unknown'}` ({c['file']}) → {c['method']} `{c['endpoint']}` → "
+                f"{c['matched_backend_route']} → {service}"
+            )
+    else:
+        lines.append("- (no matched frontend-to-backend flows detected)")
+    lines.append("")
+    lines.append("## Unmatched Frontend Calls")
+    if inv["unmatched_calls"]:
+        for c in inv["unmatched_calls"]:
+            lines.append(f"- {c['method']} `{c['endpoint']}` ({c['file']}:{c['line']}) — no matching backend route found")
+    else:
+        lines.append("- (none)")
+    lines.append("")
+    lines.append("## Unused Backend Routes")
+    if inv["unused_routes"]:
+        for r in inv["unused_routes"]:
+            lines.append(f"- {r['method']} `{r['path']}` ({r['file']}:{r['line']}) — no frontend call matched this route")
+    else:
+        lines.append("- (none)")
+    lines.append("")
+    lines.append("## Auth-Sensitive Flows")
+    if inv["auth_sensitive_routes"]:
+        for r in inv["auth_sensitive_routes"]:
+            lines.append(f"- {r['method']} `{r['path']}` ({r['file']}:{r['line']})")
+    else:
+        lines.append("- (none detected)")
+    lines.append("")
+    lines.append("## DB-Sensitive Flows")
+    if inv["db_sensitive_routes"]:
+        for r in inv["db_sensitive_routes"]:
+            lines.append(f"- {r['method']} `{r['path']}` ({r['file']}:{r['line']}) — {', '.join(r['service_model_clue'])}")
+    else:
+        lines.append("- (none detected)")
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_backend_env_requirements_report(inv: dict, output_path) -> str:
+    lines = ["# Backend Env Requirements", "", "Variable names only — values are never read, stored, or printed.", ""]
+    if inv["env_vars"]:
+        for name, sources in inv["env_vars"].items():
+            lines.append(f"- `{name}` — referenced in: {', '.join(sources)}")
+    else:
+        lines.append("- (no env/config variable names detected)")
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def generate_backend_test_plan_report(inv: dict, output_path) -> str:
+    tp = inv["test_plan"]
+    lines = ["# Backend Test Plan", "",
+              "Suggested safe checks only — none of these are run automatically by this inventory.", ""]
+    lines.append("## Frontend Checks")
+    if tp["frontend_checks"]:
+        lines.extend(f"- {c}" for c in tp["frontend_checks"])
+    else:
+        lines.append("- (none detected)")
+    lines.append("")
+    lines.append("## Backend Checks")
+    if tp["backend_checks"]:
+        lines.extend(f"- {c}" for c in tp["backend_checks"])
+    else:
+        lines.append("- (none detected)")
+    lines.append("")
+    lines.append("## API Smoke Checks")
+    if tp["api_smoke_checks"]:
+        lines.extend(f"- {c}" for c in tp["api_smoke_checks"])
+    else:
+        lines.append("- (none detected)")
+    lines.append("")
+    lines.append("## DB Read-Only Checks")
+    lines.extend(f"- {c}" for c in tp["db_read_only_checks"])
+    lines.append("")
+    lines.append("## Checks Requiring Human Setup")
+    if tp["human_setup_required"]:
+        lines.extend(f"- {c}" for c in tp["human_setup_required"])
+    else:
+        lines.append("- (none)")
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def run_backend_inventory(
+    existing_app_path, output_dir, backend_root: str | None = None, frontend_root: str | None = None,
+) -> dict:
+    """Orchestrator: generate_backend_inventory + write all 7 backend inventory
+    artifacts into output_dir. Read-only — never modifies app code, never commits,
+    pushes, or opens a PR."""
+    inv = generate_backend_inventory(existing_app_path, backend_root=backend_root, frontend_root=frontend_root)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generate_backend_inventory_report(inv, output_dir / "backend_inventory.md")
+    generate_backend_route_map_report(inv, output_dir / "backend_route_map.md")
+    generate_frontend_api_client_map_report(inv, output_dir / "frontend_api_client_map.md")
+    generate_backend_data_flow_report(inv, output_dir / "backend_data_flow.md")
+    generate_backend_env_requirements_report(inv, output_dir / "backend_env_requirements.md")
+    generate_backend_test_plan_report(inv, output_dir / "backend_test_plan.md")
+    (output_dir / "backend_inventory_state.json").write_text(json.dumps(inv, indent=2), encoding="utf-8")
+    return inv
+
+
+def run_existing_app_backend_inventory(
+    run_id: str, existing_app_path, backend_root: str | None = None, frontend_root: str | None = None,
+) -> dict:
+    """Writes the 7 backend inventory artifacts into the run folder and records
+    backend_inventory_mode/backend_frameworks/backend_route_count/
+    frontend_api_call_count/env_var_count/backend_inventory_artifacts/
+    backend_inventory_summary on run_state.json. Read-only."""
+    rdir = run_dir(run_id)
+    inv = run_backend_inventory(existing_app_path, rdir, backend_root=backend_root, frontend_root=frontend_root)
+    summary = (
+        f"{len(inv['frameworks'])} framework(s) detected — {inv['route_count']} route(s), "
+        f"{inv['frontend_api_call_count']} frontend API call(s), {inv['env_var_count']} env var(s)"
+    )
+    _update_state(run_id, {
+        "backend_inventory_mode": True,
+        "backend_frameworks": inv["frameworks"],
+        "backend_route_count": inv["route_count"],
+        "frontend_api_call_count": inv["frontend_api_call_count"],
+        "env_var_count": inv["env_var_count"],
+        "backend_roots": inv["backend_roots"],
+        "frontend_roots": inv["frontend_roots"],
+        "backend_inventory_warnings": inv["warnings"],
+        "backend_inventory_artifacts": BACKEND_INVENTORY_ARTIFACTS,
+        "backend_inventory_summary": summary,
+    })
+    return inv
 
 
 def _detect_frontend_framework(deps: dict) -> str | None:
@@ -7300,6 +8101,9 @@ def pipeline_existing_app_upgrade(
     bugfix_mode: bool = False,
     bug_report_text: str | None = None,
     bug_title: str | None = None,
+    backend_inventory: bool = False,
+    backend_root: str | None = None,
+    frontend_root: str | None = None,
 ) -> str:
     """
     Existing App Upgrade mode entry point. Additive, not generative-from-scratch:
@@ -7389,6 +8193,23 @@ def pipeline_existing_app_upgrade(
         print("  Planning only — no code changes, commits, pushes, or PRs were created by bugfix mode.")
         print(f"\n{'='*60}")
         print("  Bugfix planning complete")
+        print(f"  Run folder : {rdir}")
+        print(f"{'='*60}\n")
+        return run_id
+
+    if backend_inventory:
+        print("▶ Backend Inventory  Writing backend/API discovery artifacts (read-only)...")
+        t0 = time.time()
+        inv = run_existing_app_backend_inventory(
+            run_id, existing_app_path, backend_root=backend_root, frontend_root=frontend_root,
+        )
+        record_step_time(run_id, "backend_inventory", t0)
+        _update_state(run_id, {"status": "backend_inventory_done", "current_step": "done"})
+        print(f"  {inv['route_count']} route(s), {inv['frontend_api_call_count']} frontend API call(s), "
+              f"{inv['env_var_count']} env var(s) detected.")
+        print("  Inventory only — no code changes, commits, pushes, or PRs were created.")
+        print(f"\n{'='*60}")
+        print("  Backend inventory complete")
         print(f"  Run folder : {rdir}")
         print(f"{'='*60}\n")
         return run_id
@@ -10233,6 +11054,20 @@ if __name__ == "__main__":
                          help="Path to a markdown/text bug report for --bugfix-mode.")
     parser.add_argument("--bug-title", default=None, metavar="TITLE",
                          help="Optional bug title override for --bugfix-mode.")
+    parser.add_argument("--backend-inventory", action="store_true",
+                         help="Generate read-only backend/API discovery artifacts for "
+                              "--existing-app: detected framework(s), a backend route map, "
+                              "a frontend API client map, a backend data flow map, env/config "
+                              "variable NAMES (never values), and a suggested test plan. "
+                              "Inspection only: never modifies app code, never commits, pushes, "
+                              "or opens a PR.")
+    parser.add_argument("--backend-root", default=None, metavar="PATH",
+                         help="Subdirectory (relative to --existing-app) to scope the backend "
+                              "route scan to, e.g. backend. Defaults to scanning the whole repo.")
+    parser.add_argument("--frontend-root", default=None, metavar="PATH",
+                         help="Subdirectory (relative to --existing-app) to scope the frontend "
+                              "API-client scan to, e.g. frontend. Defaults to scanning the "
+                              "whole repo.")
 
     # ── Multi-Sprint Continuation mode ───────────────────────────────────────
     parser.add_argument("--continue-run", default=None, metavar="PATH",
@@ -10435,6 +11270,35 @@ if __name__ == "__main__":
             and not args.upgrade_mode and not args.continue_run
             and not args.resume and not args.jira and not args.input
         )
+        standalone_backend_inventory = (
+            args.backend_inventory
+            and not args.bugfix_mode
+            and not args.upgrade_mode and not args.continue_run
+            and not args.resume and not args.jira and not args.input
+        )
+        if standalone_backend_inventory:
+            if not args.existing_app:
+                print("--backend-inventory requires --existing-app PATH.")
+                sys.exit(1)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path("backend_inventory_runs") / f"backend_inventory_{ts}"
+            inv = run_backend_inventory(
+                args.existing_app, output_dir,
+                backend_root=args.backend_root, frontend_root=args.frontend_root,
+            )
+            print(f"\n{'='*60}")
+            print("  Backend & API Inventory (read-only)")
+            print(f"  Repo                    : {inv['repo_path']}")
+            print(f"  Frameworks              : {', '.join(f['framework'] for f in inv['frameworks'])}")
+            print(f"  Routes detected         : {inv['route_count']}")
+            print(f"  Frontend API calls      : {inv['frontend_api_call_count']}")
+            print(f"  Env/config var names    : {inv['env_var_count']}")
+            if inv["warnings"]:
+                print(f"  Warning(s)              : {'; '.join(inv['warnings'])}")
+            print("  Inventory only — no code changes, commits, pushes, or PRs were created.")
+            print(f"  Reports                 : {output_dir}")
+            print(f"{'='*60}\n")
+            sys.exit(0)
         if standalone_bugfix:
             if not args.existing_app or not args.bug_report:
                 print("--bugfix-mode requires --existing-app PATH and --bug-report PATH.")
@@ -10623,12 +11487,16 @@ if __name__ == "__main__":
                 print("--bugfix-mode is separate from feature sprint mode. Run it with --existing-app, "
                       "--bug-report, and --feature-plan-only/without feature sprint build flags.")
                 sys.exit(1)
-            if not args.existing_app or (not args.feature_request and not args.bugfix_mode):
-                print("--upgrade-mode requires both --existing-app PATH and --feature-request PATH.")
+            if not args.existing_app or (
+                not args.feature_request and not args.bugfix_mode and not args.backend_inventory
+            ):
+                print("--upgrade-mode requires --existing-app PATH and one of --feature-request, "
+                      "--bug-report (with --bugfix-mode), or --backend-inventory.")
                 sys.exit(1)
             feature_request_text = (
-                Path(args.feature_request).read_text(encoding="utf-8").strip()
-                if args.feature_request else Path(args.bug_report).read_text(encoding="utf-8").strip()
+                Path(args.feature_request).read_text(encoding="utf-8").strip() if args.feature_request
+                else Path(args.bug_report).read_text(encoding="utf-8").strip() if args.bug_report
+                else f"Backend Inventory — {args.existing_app}"
             )
             upgrade_run_id = pipeline_existing_app_upgrade(
                 args.existing_app,
@@ -10654,6 +11522,9 @@ if __name__ == "__main__":
                 bugfix_mode=args.bugfix_mode,
                 bug_report_text=feature_request_text,
                 bug_title=args.bug_title,
+                backend_inventory=args.backend_inventory,
+                backend_root=args.backend_root,
+                frontend_root=args.frontend_root,
             )
             if args.local_git_delivery and not args.feature_plan_only:
                 upgrade_state = load_state(upgrade_run_id)

@@ -1230,6 +1230,13 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "minimal_fix_plan.md", label: "Minimal Fix Plan" },
   { file: "bugfix_boundary.md", label: "Bugfix Boundary" },
   { file: "bugfix_completion_report.md", label: "Bugfix Completion Report" },
+  { file: "backend_inventory.md", label: "Backend Inventory" },
+  { file: "backend_inventory_state.json", label: "Backend Inventory State JSON" },
+  { file: "backend_route_map.md", label: "Backend Route Map" },
+  { file: "frontend_api_client_map.md", label: "Frontend API Client Map" },
+  { file: "backend_data_flow.md", label: "Backend Data Flow" },
+  { file: "backend_env_requirements.md", label: "Backend Env Requirements" },
+  { file: "backend_test_plan.md", label: "Backend Test Plan" },
   { file: "existing_app_inventory.md", label: "Existing App Inventory" },
   { file: "baseline_health_check.md", label: "Baseline Health Check" },
   { file: "baseline_behavior_checklist.md", label: "Baseline Behavior Checklist" },
@@ -1487,6 +1494,75 @@ function BugfixPlanCard({ run, selectedArtifact, onSelectArtifact }: {
       {artifacts.length > 0 && (
         <div className="delivery-artifacts">
           <div className="delivery-artifacts-label">Bugfix artifacts</div>
+          <div className="delivery-artifact-tabs">
+            {artifacts.map(a => (
+              <button
+                key={a.file}
+                className={`artifact-tab ${selectedArtifact === a.file ? "active" : ""}`}
+                onClick={() => onSelectArtifact(a.file)}
+              >
+                {a.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Backend & API Inventory — read-only static analysis (detected framework(s), route
+// map, frontend API client map, data flow, env var names, test plan). Never rewrites
+// backend code, never makes app changes, never commits/pushes/opens a PR.
+function BackendInventoryCard({ run, selectedArtifact, onSelectArtifact }: {
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
+  if (!run?.backend_inventory_mode) return null;
+  const frameworks = run.backend_frameworks ?? [];
+  const artifacts = [
+    { file: "backend_inventory.md", label: "Backend Inventory" },
+    { file: "backend_route_map.md", label: "Backend Route Map" },
+    { file: "frontend_api_client_map.md", label: "Frontend API Client Map" },
+    { file: "backend_data_flow.md", label: "Backend Data Flow" },
+    { file: "backend_env_requirements.md", label: "Backend Env Requirements" },
+    { file: "backend_test_plan.md", label: "Backend Test Plan" },
+  ].filter(a => (run.artifacts ?? []).includes(a.file));
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Backend &amp; API Inventory</div>
+          <div className="delivery-card-sub">
+            {run.backend_inventory_summary ?? "Read-only backend/API discovery artifacts."}
+          </div>
+        </div>
+      </div>
+      <div className="delivery-warning-panel">
+        Inventory only — no code changes, commits, pushes, or PRs were created.
+      </div>
+      <div className="delivery-repo-line">
+        Detected frameworks: <code>{frameworks.length ? frameworks.map(f => `${f.framework} (${f.confidence})`).join(", ") : "unknown"}</code>
+      </div>
+      <div className="delivery-repo-line">
+        Backend routes: <code>{run.backend_route_count ?? 0}</code>
+        {" "}· Frontend API calls: <code>{run.frontend_api_call_count ?? 0}</code>
+        {" "}· Env vars: <code>{run.env_var_count ?? 0}</code>
+      </div>
+      <div className="delivery-repo-line">
+        Likely backend root(s): <code>{(run.backend_roots ?? []).join(", ") || "(none detected)"}</code>
+        {" "}· Likely frontend root(s): <code>{(run.frontend_roots ?? []).join(", ") || "(none detected)"}</code>
+      </div>
+      {(run.backend_inventory_warnings?.length ?? 0) > 0 && (
+        <div className="delivery-warning-panel">
+          <strong>Warning(s).</strong>
+          <ul>{run.backend_inventory_warnings!.map(w => <li key={w}>{w}</li>)}</ul>
+        </div>
+      )}
+      {artifacts.length > 0 && (
+        <div className="delivery-artifacts">
+          <div className="delivery-artifacts-label">Backend inventory artifacts</div>
           <div className="delivery-artifact-tabs">
             {artifacts.map(a => (
               <button
@@ -2230,6 +2306,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             <ChangeBoundaryBanner run={run} />
             <SmokeMutationBanner run={run} />
             <BugfixPlanCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            <BackendInventoryCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <GitSyncCard runId={runId} run={run} />
             <PrPlanCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />

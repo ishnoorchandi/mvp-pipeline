@@ -103,6 +103,18 @@ export interface RunDetail {
     reason: string;
     confidence: string;
   }>;
+  // Backend Inventory + Backend Route Map — read-only static analysis. Never
+  // rewrites backend code, never makes app changes, never commits/pushes/opens a PR.
+  backend_inventory_mode?: boolean;
+  backend_frameworks?: Array<{ framework: string; confidence: "low" | "medium" | "high"; evidence: string[] }>;
+  backend_route_count?: number;
+  frontend_api_call_count?: number;
+  env_var_count?: number;
+  backend_roots?: string[];
+  frontend_roots?: string[];
+  backend_inventory_warnings?: string[];
+  backend_inventory_artifacts?: string[];
+  backend_inventory_summary?: string;
 }
 
 export interface Artifact {
