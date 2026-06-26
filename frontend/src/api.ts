@@ -53,6 +53,13 @@ export interface RunDetail {
   smoke_mutation_status?: "PASS" | "WARN" | "FAIL" | null;
   smoke_mutation_file_count?: number;
   smoke_mutation_blocked_delivery?: boolean;
+  // Git Sync & Pull Safety — set by pipeline_existing_app_upgrade's read-only fetch +
+  // status check against the target repo's base branch (see delivery.run_git_sync_check).
+  // Never runs git pull/push/reset/stash. Full detail lives in git_sync_state.json.
+  git_sync_status?: "up_to_date" | "behind" | "ahead" | "diverged" | "unknown" | null;
+  git_sync_blocked?: boolean;
+  git_sync_summary?: string;
+  git_sync_artifacts?: string[];
 }
 
 export interface Artifact {
@@ -269,4 +276,43 @@ export async function pushDeliverySandbox(runId: string, branchName: string, com
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+// ── Git Sync & Pull Safety ──────────────────────────────────────────────────
+// Mirrors delivery.analyze_git_sync's return shape (see delivery.py). Read-only:
+// the pipeline only ever runs `git fetch origin` + status/rev-list checks here,
+// never pull/push/reset/stash. Stored as git_sync_state.json in the run folder.
+
+export interface GitSyncState {
+  repo_path: string;
+  current_branch: string | null;
+  fetch_url: string | null;
+  push_url: string | null;
+  base_branch: string;
+  repo_type: "company-protected" | "personal-sandbox" | "unknown";
+  is_company_repo: boolean;
+  is_dirty: boolean | null;
+  dirty_file_count: number;
+  denied_paths_dirty: boolean;
+  denied_dirty_paths: string[];
+  origin_base_exists: boolean;
+  sync_status: "up_to_date" | "behind" | "ahead" | "diverged" | "unknown";
+  commits_ahead: number;
+  commits_behind: number;
+  fast_forward_safe: boolean;
+  pull_blocked: boolean;
+  block_reasons: string[];
+  fetch_attempted: boolean;
+  fetch_succeeded: boolean | null;
+  build_should_proceed: "yes" | "no" | "warn";
+  recommended_command: string | null;
+}
+
+export async function getGitSyncState(runId: string): Promise<GitSyncState | null> {
+  try {
+    const a = await getArtifact(runId, "git_sync_state.json");
+    return JSON.parse(a.content) as GitSyncState;
+  } catch {
+    return null;
+  }
 }

@@ -3,8 +3,9 @@ import type { ReactElement } from "react";
 import {
   getRuns, getRun, getArtifact, createUpgradeRun, createContinuationRun,
   getDeliveryInfo, getDeliveryPrecheck, createDeliveryCommit, pushDeliverySandbox,
+  getGitSyncState,
 } from "./api";
-import type { RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck } from "./api";
+import type { RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState } from "./api";
 import "./App.css";
 
 // ── Pipeline definitions ───────────────────────────────────────────────────────
@@ -1202,6 +1203,8 @@ interface FeatureSprintPlan {
 }
 
 const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
+  { file: "git_sync_report.md", label: "Git Sync Report" },
+  { file: "git_sync_state.json", label: "Git Sync State JSON" },
   { file: "existing_app_inventory.md", label: "Existing App Inventory" },
   { file: "baseline_health_check.md", label: "Baseline Health Check" },
   { file: "baseline_behavior_checklist.md", label: "Baseline Behavior Checklist" },
@@ -1402,6 +1405,72 @@ function SmokeMutationBanner({ run }: { run: RunDetail | null }) {
           : `Smoke checks changed ${fileCount} tracked file(s) after the build finished — not a Claude `
             + `build change. See smoke_mutation_report.md.`}
         {status === "FAIL" && " This is outside the selected feature boundary and blocks Local Delivery."}
+      </div>
+    </div>
+  );
+}
+
+// Git Sync & Pull Safety — read-only foundation for collaborative existing app repos
+// (e.g. OneHR/OneATS) where other developers are constantly pushing. Pulls full detail
+// from git_sync_state.json (written by delivery.run_git_sync_check); falls back to the
+// summary fields on run_state.json if the artifact hasn't loaded yet. Never offers a
+// pull/update action here — this is fetch + status only, never push/reset/stash/pull.
+function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
+  const [state, setState] = useState<GitSyncState | null>(null);
+  const hasArtifact = (run?.artifacts ?? []).includes("git_sync_state.json");
+
+  useEffect(() => {
+    if (!hasArtifact) { setState(null); return; }
+    getGitSyncState(runId).then(setState).catch(() => setState(null));
+  }, [runId, hasArtifact]);
+
+  if (!run?.git_sync_status && !state) return null;
+
+  const status = state?.sync_status ?? run?.git_sync_status ?? "unknown";
+  const blocked = state?.pull_blocked ?? !!run?.git_sync_blocked;
+  const buildProceed = state?.build_should_proceed
+    ?? (run?.git_sync_blocked ? "no" : (status === "behind" || status === "diverged") ? "warn" : "yes");
+  const badgeClass = blocked ? "fail" : (status === "behind" || status === "diverged") ? "warn" : "ok";
+
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Git Sync &amp; Pull Safety</div>
+          <div className="delivery-card-sub">
+            {run?.git_sync_summary ?? "Read-only fetch + status check against the target repo's base branch."}
+          </div>
+        </div>
+        <span className={`delivery-badge delivery-badge-${badgeClass}`}>{status.replace("_", " ")}</span>
+      </div>
+
+      <div className="delivery-repo-line">
+        Current branch: <code>{state?.current_branch ?? "(unknown)"}</code>
+        {" "}· Base branch: <code>{state?.base_branch ?? "main"}</code>
+      </div>
+      <div className="delivery-repo-line">
+        Ahead: <code>{state?.commits_ahead ?? 0}</code> · Behind: <code>{state?.commits_behind ?? 0}</code>
+        {" "}· Safe to pull (fast-forward): <code>{String(state?.fast_forward_safe ?? false)}</code>
+        {" "}· Build should proceed: <code>{buildProceed}</code>
+      </div>
+
+      {state?.is_company_repo && (
+        <div className="delivery-warning-panel">
+          Company repo detected. Fetch/status checks are allowed, but pull/update must be explicitly
+          approved. The pipeline will not discard, reset, stash, or push changes automatically.
+        </div>
+      )}
+
+      {blocked && (state?.block_reasons?.length ?? 0) > 0 && (
+        <div className="delivery-warning-panel delivery-warning-panel-severe">
+          <strong>Pull blocked.</strong>
+          <ul>{state!.block_reasons.map(r => <li key={r}>{r}</li>)}</ul>
+        </div>
+      )}
+
+      <div className="delivery-command-preview">
+        <div className="delivery-command-preview-label">Recommended command (run manually if you choose)</div>
+        <pre>{state?.recommended_command ?? "No fast-forward pull is recommended right now."}</pre>
       </div>
     </div>
   );
@@ -1740,6 +1809,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             {plan && <FeatureSprintRoadmap plan={plan} onBuild={planReady ? buildFromPlan : undefined} launching={launching} />}
             <ChangeBoundaryBanner run={run} />
             <SmokeMutationBanner run={run} />
+            <GitSyncCard runId={runId} run={run} />
             <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />
           </div>
         </div>

@@ -261,6 +261,36 @@ def record_step_time(run_id: str, step_key: str, t0: float):
     _update_state(run_id, {"step_timings": timings})
 
 
+# ── Git Sync / Pull Safety ─────────────────────────────────────────────────────
+# Read-only foundation for building on top of collaborative existing app repos
+# (e.g. OneHR/OneATS) where other developers are constantly pushing. Delegates the
+# actual git inspection to delivery.run_git_sync_check, which only ever runs
+# `git fetch origin` + status/rev-list reads — never pull, push, reset, or stash.
+
+def run_existing_app_git_sync_check(run_id: str, existing_app_path, base_branch: str = "main") -> dict | None:
+    """Writes git_sync_report.md + git_sync_state.json into the run folder and
+    records git_sync_status/git_sync_blocked/git_sync_summary/git_sync_artifacts on
+    run_state.json. Returns None (and writes nothing) if existing_app_path is not a
+    git repo."""
+    existing_app_path = Path(existing_app_path)
+    if not (existing_app_path / ".git").exists():
+        return None
+    sync_state = delivery_mod.run_git_sync_check(
+        existing_app_path, base_branch=base_branch, output_dir=run_dir(run_id),
+    )
+    summary = (
+        f"{sync_state['sync_status']} (ahead {sync_state['commits_ahead']}, "
+        f"behind {sync_state['commits_behind']})"
+    )
+    _update_state(run_id, {
+        "git_sync_status": sync_state["sync_status"],
+        "git_sync_blocked": sync_state["pull_blocked"],
+        "git_sync_summary": summary,
+        "git_sync_artifacts": ["git_sync_report.md", "git_sync_state.json"],
+    })
+    return sync_state
+
+
 # ── LLM helpers ───────────────────────────────────────────────────────────────
 
 def gpt(messages: list[dict]) -> str:
@@ -6652,6 +6682,7 @@ def pipeline_existing_app_upgrade(
     selected_feature_sprint: int = 1,
     feature_plan_only: bool = False,
     use_deepseek: bool = True,
+    git_sync_base_branch: str = "main",
 ) -> str:
     """
     Existing App Upgrade mode entry point. Additive, not generative-from-scratch:
@@ -6677,6 +6708,23 @@ def pipeline_existing_app_upgrade(
     print(f"  DeepSeek      : {'enabled' if use_deepseek and DEEPSEEK_API_KEY else 'disabled (no key)'}")
     print(f"  Plan only     : {feature_plan_only}")
     print(f"{'='*60}\n")
+
+    print("▶ Step 0  Git sync / pull-safety check (read-only — fetch + status only)...")
+    t0 = time.time()
+    git_sync_state = run_existing_app_git_sync_check(run_id, existing_app_path, base_branch=git_sync_base_branch)
+    record_step_time(run_id, "git_sync_check", t0)
+    if git_sync_state is None:
+        print("  Not a git repository — skipping git sync check.")
+    else:
+        print(f"  Sync status: {git_sync_state['sync_status']} "
+              f"(ahead {git_sync_state['commits_ahead']}, behind {git_sync_state['commits_behind']})")
+        if git_sync_state["sync_status"] in ("behind", "diverged"):
+            print(f"  ⚠️  WARN: target repo is {git_sync_state['sync_status']} relative to "
+                  f"origin/{git_sync_state['base_branch']}. See git_sync_report.md. The build will "
+                  "proceed, but consider pulling the latest changes first.")
+        if git_sync_state["is_dirty"]:
+            print(f"  ⛔ Target repo has {git_sync_state['dirty_file_count']} uncommitted change(s) — "
+                  "the build will be blocked before Step 12 unless this is resolved.")
 
     print("▶ Step 1  Scanning existing app...")
     t0 = time.time()
@@ -6771,6 +6819,19 @@ def pipeline_existing_app_upgrade(
         for f in sorted(rdir.iterdir()):
             if f.is_file():
                 print(f"        {f.name}")
+        print(f"{'='*60}\n")
+        return run_id
+
+    if git_sync_state and git_sync_state.get("is_dirty"):
+        _update_state(run_id, {"status": "blocked_dirty_target_repo", "current_step": "blocked"})
+        log_event(run_id, "build_blocked_dirty_target_repo",
+                  f"{git_sync_state['dirty_file_count']} dirty file(s) in target repo before build")
+        print(f"\n{'='*60}")
+        print("  ⛔ BLOCKED — target repo has uncommitted local changes")
+        print(f"  {git_sync_state['dirty_file_count']} dirty file(s) detected in {existing_app_path}.")
+        print("  Existing App Upgrade will not build on top of a dirty working tree.")
+        print("  Commit or stash your own changes first, then re-run.")
+        print(f"  See {rdir / 'git_sync_report.md'}")
         print(f"{'='*60}\n")
         return run_id
 
@@ -9494,6 +9555,22 @@ if __name__ == "__main__":
     parser.add_argument("--allow-sandbox-remote", action="append", default=[], metavar="OWNER/REPO",
                          help="Additional sandbox remote(s) allowed for --sandbox-push, e.g. "
                               "ishnoorchandi/github-delivery-demo. Repeatable.")
+
+    # ── Git Sync / Pull Safety ───────────────────────────────────────────────
+    parser.add_argument("--git-sync-check", action="store_true",
+                         help="Run the read-only Git sync / pull-safety analysis against "
+                              "--existing-app or --delivery-repo and write git_sync_report.md / "
+                              "git_sync_state.json. Only runs `git fetch origin` + status/rev-list "
+                              "checks — never pulls, pushes, resets, or stashes.")
+    parser.add_argument("--base-branch", default="main", metavar="BRANCH",
+                         help="Base branch to compare against for git sync checks, and for the "
+                              "automatic Git Sync check that runs before every --upgrade-mode "
+                              "build (default: main).")
+    parser.add_argument("--pull-plan-only", action="store_true",
+                         help="Git sync check writes reports only and never modifies the target "
+                              "repo. This is always the current behavior — automatic pull is not "
+                              "implemented yet — the flag is accepted so callers can be explicit "
+                              "about that, and so a future pull implementation defaults to off.")
     args = parser.parse_args()
 
     run_id_arg = args.run_id  # may be None
@@ -9551,7 +9628,33 @@ if __name__ == "__main__":
             and not args.continue_run and not args.upgrade_mode
             and not args.resume and not args.jira and not args.input
         )
-        if standalone_delivery:
+        standalone_git_sync = (
+            args.git_sync_check
+            and not args.local_git_delivery
+            and not args.continue_run and not args.upgrade_mode
+            and not args.resume and not args.jira and not args.input
+        )
+        if standalone_git_sync:
+            repo_path = args.delivery_repo or args.existing_app
+            if not repo_path:
+                print("--git-sync-check requires --existing-app PATH or --delivery-repo PATH.")
+                sys.exit(1)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path("git_sync_runs") / f"git_sync_{ts}"
+            sync_state = delivery_mod.run_git_sync_check(
+                repo_path, base_branch=args.base_branch, output_dir=output_dir,
+            )
+            print(f"\n{'='*60}")
+            print("  Git Sync / Pull Safety Check")
+            print(f"  Repo         : {sync_state['repo_path']}")
+            print(f"  Branch       : {sync_state['current_branch']} (base: {sync_state['base_branch']})")
+            print(f"  Sync status  : {sync_state['sync_status']}")
+            print(f"  Ahead/behind : {sync_state['commits_ahead']}/{sync_state['commits_behind']}")
+            print(f"  Pull blocked : {sync_state['pull_blocked']}")
+            print(f"  Reports      : {output_dir}")
+            print(f"{'='*60}\n")
+            sys.exit(1 if sync_state["pull_blocked"] else 0)
+        elif standalone_delivery:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = Path("delivery_runs") / f"delivery_{ts}"
             state = _run_delivery_step(output_dir)
@@ -9584,6 +9687,7 @@ if __name__ == "__main__":
                 selected_feature_sprint=args.selected_feature_sprint,
                 feature_plan_only=args.feature_plan_only,
                 use_deepseek=not args.no_deepseek,
+                git_sync_base_branch=args.base_branch,
             )
             if args.local_git_delivery and not args.feature_plan_only:
                 upgrade_state = load_state(upgrade_run_id)

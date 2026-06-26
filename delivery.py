@@ -93,6 +93,50 @@ def get_git_status(repo_path) -> dict:
     return {"branch": branch, "clean": len(lines) == 0, "porcelain": lines}
 
 
+def fetch_origin(repo_path) -> dict:
+    """`git fetch origin` only — updates remote-tracking refs (origin/*), never touches
+    the working tree, the index, or any local branch. Safe to run against any repo,
+    including company-protected ones."""
+    result = run_git_command(repo_path, ["fetch", "origin"], check=False)
+    return {
+        "success": result.returncode == 0,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+
+
+def get_ahead_behind_counts(repo_path, base_branch: str = "main") -> dict:
+    """Commits HEAD is ahead/behind origin/<base_branch>, via `git rev-list --left-right
+    --count HEAD...origin/<base_branch>`. Read-only. If origin/<base_branch> does not
+    exist (e.g. never fetched, or base branch name is wrong), origin_base_exists is False
+    and ahead/behind are both 0 — callers must check origin_base_exists before trusting
+    the counts."""
+    ref = f"origin/{base_branch}"
+    verify = run_git_command(repo_path, ["rev-parse", "--verify", "--quiet", ref], check=False)
+    if verify.returncode != 0:
+        return {"origin_base_exists": False, "ahead": 0, "behind": 0}
+    result = run_git_command(repo_path, ["rev-list", "--left-right", "--count", f"HEAD...{ref}"], check=False)
+    if result.returncode != 0:
+        return {"origin_base_exists": True, "ahead": 0, "behind": 0}
+    parts = result.stdout.strip().split()
+    ahead = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+    behind = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return {"origin_base_exists": True, "ahead": ahead, "behind": behind}
+
+
+def classify_sync_status(ahead: int, behind: int, origin_base_exists: bool) -> str:
+    """up_to_date | behind | ahead | diverged | unknown."""
+    if not origin_base_exists:
+        return "unknown"
+    if ahead == 0 and behind == 0:
+        return "up_to_date"
+    if ahead == 0 and behind > 0:
+        return "behind"
+    if ahead > 0 and behind == 0:
+        return "ahead"
+    return "diverged"
+
+
 # ── Classification helpers ────────────────────────────────────────────────────
 
 def is_company_repo_path(repo_path) -> bool:
@@ -183,6 +227,208 @@ def detect_repo_type(repo_path, remote_info: dict) -> str:
     if remote_info.get("fetch_url"):
         return "personal-sandbox"
     return "unknown"
+
+
+# ── Git Sync / Pull Safety ─────────────────────────────────────────────────────
+# Read-only foundation for working with collaborative existing app repos (e.g.
+# OneHR/OneATS) where other developers are constantly pushing. This is NOT a blind
+# `git pull` — it only ever runs `git fetch origin`, `git status --short`,
+# `git rev-parse`, and `git rev-list --left-right --count`. It never runs `git
+# pull`, `push`, `reset`, `stash`, or anything else that mutates the working tree,
+# the index, or local branch history.
+
+def analyze_git_sync(
+    repo_path,
+    base_branch: str = "main",
+    allow_branch_mismatch: bool = False,
+    skip_fetch: bool = False,
+) -> dict:
+    """
+    Inspect repo_path against origin/<base_branch> and report whether a fast-forward
+    pull would be safe. Never raises for "unsafe" conditions — those are reported in
+    block_reasons, not exceptions.
+
+    Pull is blocked if: repo_path is not a git repo, the working tree is dirty,
+    denied paths are dirty, origin/<base_branch> cannot be found, the local branch
+    is ahead of or has diverged from origin/<base_branch>, the fetch itself fails,
+    or the current branch isn't base_branch and allow_branch_mismatch wasn't set.
+    """
+    repo_path = Path(repo_path).resolve()
+
+    repo_exists = repo_path.exists() and (repo_path / ".git").exists()
+    if not repo_exists:
+        return {
+            "repo_path": str(repo_path), "current_branch": None, "fetch_url": None,
+            "push_url": None, "base_branch": base_branch, "repo_type": "unknown",
+            "is_company_repo": False, "is_dirty": None, "dirty_file_count": 0,
+            "denied_paths_dirty": False, "denied_dirty_paths": [],
+            "origin_base_exists": False, "sync_status": "unknown",
+            "commits_ahead": 0, "commits_behind": 0, "fast_forward_safe": False,
+            "pull_blocked": True, "block_reasons": ["repo path is not a git repository"],
+            "fetch_attempted": False, "fetch_succeeded": None,
+            "build_should_proceed": "no", "recommended_command": None,
+        }
+
+    block_reasons: list[str] = []
+    fetch_attempted = not skip_fetch
+    fetch_succeeded: bool | None = None
+    if fetch_attempted:
+        fetch_result = fetch_origin(repo_path)
+        fetch_succeeded = fetch_result["success"]
+        if not fetch_succeeded:
+            block_reasons.append(f"git fetch origin failed: {fetch_result['stderr'] or '(unknown error)'}")
+
+    remote_info = get_git_remote_info(repo_path)
+    status = get_git_status(repo_path)
+    repo_type = detect_repo_type(repo_path, remote_info)
+    is_company = repo_type == "company-protected"
+
+    dirty_paths = [line[3:].strip() for line in status["porcelain"]]
+    denied_dirty = scan_denied_paths(dirty_paths)
+    is_dirty = not status["clean"]
+
+    ab = get_ahead_behind_counts(repo_path, base_branch)
+    sync_status = classify_sync_status(ab["ahead"], ab["behind"], ab["origin_base_exists"])
+
+    if not ab["origin_base_exists"]:
+        block_reasons.append(f"origin/{base_branch} was not found (fetch first, or check --base-branch)")
+    if is_dirty:
+        block_reasons.append(f"working tree is dirty ({len(dirty_paths)} changed file(s))")
+    if denied_dirty:
+        block_reasons.append(f"denied paths are dirty: {denied_dirty}")
+    if sync_status == "ahead":
+        block_reasons.append(
+            f"local branch is {ab['ahead']} commit(s) ahead of origin/{base_branch} — "
+            "pulling could conflict with unpushed local work"
+        )
+    if sync_status == "diverged":
+        block_reasons.append(
+            f"local branch has diverged from origin/{base_branch} "
+            f"({ab['ahead']} ahead, {ab['behind']} behind)"
+        )
+    if status["branch"] and status["branch"] != base_branch and not allow_branch_mismatch:
+        block_reasons.append(
+            f"current branch '{status['branch']}' is not the base branch '{base_branch}'"
+        )
+
+    fast_forward_safe = (
+        ab["origin_base_exists"] and not is_dirty and not denied_dirty
+        and sync_status == "behind"
+        and (status["branch"] == base_branch or allow_branch_mismatch)
+    )
+    pull_blocked = len(block_reasons) > 0
+
+    if is_dirty or denied_dirty:
+        build_should_proceed = "no"
+    elif sync_status in ("behind", "diverged") or pull_blocked:
+        build_should_proceed = "warn"
+    else:
+        build_should_proceed = "yes"
+
+    recommended_command = (
+        f"git fetch origin && git pull --ff-only origin {base_branch}"
+        if fast_forward_safe and not pull_blocked else None
+    )
+
+    return {
+        "repo_path": str(repo_path),
+        "current_branch": status["branch"] or None,
+        "fetch_url": remote_info.get("fetch_url") or None,
+        "push_url": remote_info.get("push_url") or None,
+        "base_branch": base_branch,
+        "repo_type": repo_type,
+        "is_company_repo": is_company,
+        "is_dirty": is_dirty,
+        "dirty_file_count": len(dirty_paths),
+        "denied_paths_dirty": bool(denied_dirty),
+        "denied_dirty_paths": denied_dirty,
+        "origin_base_exists": ab["origin_base_exists"],
+        "sync_status": sync_status,
+        "commits_ahead": ab["ahead"],
+        "commits_behind": ab["behind"],
+        "fast_forward_safe": fast_forward_safe,
+        "pull_blocked": pull_blocked,
+        "block_reasons": block_reasons,
+        "fetch_attempted": fetch_attempted,
+        "fetch_succeeded": fetch_succeeded,
+        "build_should_proceed": build_should_proceed,
+        "recommended_command": recommended_command,
+    }
+
+
+def generate_git_sync_report(sync_state: dict, output_path) -> str:
+    """Writes git_sync_report.md — a plain-English explanation of sync state, never a
+    command runner. Only ever shows the fast-forward command as a suggestion the user
+    can choose to run manually."""
+    lines = ["# Git Sync Report", ""]
+    lines.append(f"**Repo path:** `{sync_state['repo_path']}`")
+    lines.append(f"**Current branch:** `{sync_state.get('current_branch') or '(unknown)'}`")
+    lines.append(f"**Base branch:** `{sync_state['base_branch']}`")
+    lines.append(f"**Fetch URL:** `{sync_state.get('fetch_url') or '(none)'}`")
+    lines.append(f"**Push URL:** `{sync_state.get('push_url') or '(none)'}`")
+    lines.append(f"**Repo type:** `{sync_state.get('repo_type', 'unknown')}`")
+    lines.append("")
+    lines.append(f"## Sync Status: `{sync_state['sync_status']}`")
+    lines.append(f"- Commits ahead of `origin/{sync_state['base_branch']}`: {sync_state['commits_ahead']}")
+    lines.append(f"- Commits behind `origin/{sync_state['base_branch']}`: {sync_state['commits_behind']}")
+    lines.append(f"- `origin/{sync_state['base_branch']}` exists: {sync_state['origin_base_exists']}")
+    lines.append(f"- `git fetch origin` attempted: {sync_state['fetch_attempted']} "
+                 f"(succeeded: {sync_state['fetch_succeeded']})")
+    lines.append("")
+    lines.append("## Working Tree")
+    lines.append(f"- Dirty: {sync_state['is_dirty']} ({sync_state['dirty_file_count']} changed file(s))")
+    lines.append(f"- Denied paths dirty: {sync_state['denied_paths_dirty']}")
+    if sync_state.get("denied_dirty_paths"):
+        lines.extend(f"  - `{p}`" for p in sync_state["denied_dirty_paths"])
+    lines.append("")
+    if sync_state.get("is_company_repo"):
+        lines.append(
+            "**Company repo detected.** Fetch/status checks are allowed, but pull/update must be "
+            "explicitly approved. The pipeline will not discard, reset, stash, or push changes "
+            "automatically."
+        )
+        lines.append("")
+    lines.append(f"## Safe to pull (fast-forward): {sync_state['fast_forward_safe']}")
+    lines.append(f"## Pull blocked: {sync_state['pull_blocked']}")
+    lines.append(f"## Build should proceed: {sync_state['build_should_proceed']}")
+    if sync_state.get("block_reasons"):
+        lines.append("")
+        lines.append("**Block reason(s):**")
+        lines.extend(f"- {r}" for r in sync_state["block_reasons"])
+    lines.append("")
+    lines.append("## Recommended Command")
+    if sync_state.get("recommended_command"):
+        lines.append("Safe to run manually if you choose — this is never run automatically:")
+        lines.append("```bash")
+        lines.append(sync_state["recommended_command"])
+        lines.append("```")
+    else:
+        lines.append("No fast-forward pull is recommended right now — see block reason(s) above.")
+
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def run_git_sync_check(
+    repo_path,
+    base_branch: str = "main",
+    output_dir=None,
+    allow_branch_mismatch: bool = False,
+    skip_fetch: bool = False,
+) -> dict:
+    """Orchestrator: analyze sync state and, if output_dir is given, write
+    git_sync_report.md + git_sync_state.json into it. Never runs git pull, push,
+    reset, or stash — analysis and reporting only."""
+    sync_state = analyze_git_sync(
+        repo_path, base_branch, allow_branch_mismatch=allow_branch_mismatch, skip_fetch=skip_fetch,
+    )
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        generate_git_sync_report(sync_state, output_dir / "git_sync_report.md")
+        (output_dir / "git_sync_state.json").write_text(json.dumps(sync_state, indent=2), encoding="utf-8")
+    return sync_state
 
 
 # ── Precondition checks ───────────────────────────────────────────────────────
