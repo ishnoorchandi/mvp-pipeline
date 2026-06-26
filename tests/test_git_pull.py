@@ -10,7 +10,8 @@ Proves:
 2. A dirty repo blocks the pull and the working tree is never touched.
 3. An ahead repo blocks the pull.
 4. A diverged repo blocks the pull.
-5. An up-to-date repo does not run pull (no-op/blocked, nothing to do).
+5. An up-to-date repo does not run pull and reports a safe NO_OP (not BLOCKED) —
+   now_up_to_date is true and no pull command is attempted.
 6. A repo with no origin/main blocks the pull.
 7. Pull artifacts (git_pull_report.md, git_pull_state.json,
    git_sync_before_pull.json, git_sync_after_pull.json) are written.
@@ -156,15 +157,57 @@ def test_diverged_repo_blocks_pull():
 # ── 5. Up-to-date repo does not run pull (no-op) ────────────────────────────
 
 def test_up_to_date_repo_does_not_pull():
+    """Already up to date is a safe no-op (decision NO_OP), not a BLOCKED failure —
+    no pull command is attempted, and now_up_to_date is reported as true."""
     with tempfile.TemporaryDirectory() as td:
         bare = make_bare_origin(Path(td))
         repo = clone_repo(bare, Path(td))
 
         outcome = d.run_git_pull_ff_only(repo, base_branch="main")
         state = outcome["state"]
-        assert state["decision"] == "BLOCKED"
+        assert state["decision"] == "NO_OP"
         assert state["pull_attempted"] is False
+        assert state["now_up_to_date"] is True
         assert any("already up to date" in r for r in state["block_reasons"])
+
+
+def test_up_to_date_no_op_reports_safe_success_with_artifacts_and_exit_code():
+    """Focused regression test for the NO_OP wording/exit-code fix: an up-to-date
+    repo must report decision NO_OP (not BLOCKED), now_up_to_date True, attempt no
+    pull command, still write both pull artifacts, confirm no push/reset/stash ran,
+    and the standalone CLI path must exit 0 (not 1) for this case."""
+    with tempfile.TemporaryDirectory() as td:
+        bare = make_bare_origin(Path(td))
+        repo = clone_repo(bare, Path(td))
+        out_dir = Path(td) / "out"
+
+        outcome = d.run_git_pull_ff_only(repo, base_branch="main", output_dir=out_dir)
+        state = outcome["state"]
+
+        assert state["decision"] == "NO_OP"
+        assert state["pull_attempted"] is False
+        assert state["pull_succeeded"] is None
+        assert state["now_up_to_date"] is True
+        assert state["no_push_performed"] is True
+        assert state["no_reset_performed"] is True
+        assert state["no_stash_performed"] is True
+
+        for fname in ("git_pull_report.md", "git_pull_state.json"):
+            assert (out_dir / fname).exists(), f"missing {fname}"
+
+        report = (out_dir / "git_pull_report.md").read_text(encoding="utf-8")
+        assert "Decision: `NO_OP`" in report
+        assert "not a failure" in report.lower()
+        assert "No push performed: True" in report
+        assert "No reset performed: True" in report
+        assert "No stash performed: True" in report
+
+        json_state = json.loads((out_dir / "git_pull_state.json").read_text(encoding="utf-8"))
+        assert json_state["decision"] == "NO_OP"
+
+        # Standalone CLI exit-code contract: NO_OP must exit 0, same as a real PULLED success.
+        cli_success = state["decision"] in ("PULLED", "NO_OP")
+        assert cli_success is True
 
 
 # ── 6. Missing origin/main blocks pull ──────────────────────────────────────

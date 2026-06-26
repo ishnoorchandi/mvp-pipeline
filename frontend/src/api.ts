@@ -62,7 +62,7 @@ export interface RunDetail {
   git_sync_artifacts?: string[];
   // Git Pull (fast-forward only) — set when --git-pull-ff-only was used. Only ever
   // reflects a guarded `git pull --ff-only origin <base_branch>`; never push/reset/stash.
-  git_pull_status?: "BLOCKED" | "PULLED" | "FAILED" | null;
+  git_pull_status?: "BLOCKED" | "PULLED" | "FAILED" | "NO_OP" | null;
   git_pull_blocked?: boolean;
   git_pull_summary?: string;
   git_pull_artifacts?: string[];
@@ -333,7 +333,7 @@ export interface GitPullState {
   current_branch: string | null;
   base_branch: string;
   is_company_repo: boolean;
-  decision: "BLOCKED" | "PULLED" | "FAILED";
+  decision: "BLOCKED" | "PULLED" | "FAILED" | "NO_OP";
   pull_attempted: boolean;
   pull_command: string;
   pull_exit_code: number | null;

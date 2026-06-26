@@ -1437,14 +1437,20 @@ function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
 
   if (!run?.git_sync_status && !state) return null;
 
-  // Pull action: not requested / blocked / succeeded / failed.
+  // Pull action: not requested / blocked / succeeded / failed / no update needed.
+  // NO_OP (already up to date) is a safe success state, not a failure — it must never
+  // render with the "blocked"/fail styling.
   const pullDecision = pull?.decision ?? run?.git_pull_status ?? null;
-  const pullAction: "not requested" | "blocked" | "succeeded" | "failed" =
+  const pullAction: "not requested" | "blocked" | "succeeded" | "failed" | "no update needed" =
     pullDecision === "PULLED" ? "succeeded"
+    : pullDecision === "NO_OP" ? "no update needed"
     : pullDecision === "FAILED" ? "failed"
     : pullDecision === "BLOCKED" ? "blocked"
     : "not requested";
-  const pullBadgeClass = pullAction === "succeeded" ? "ok" : pullAction === "blocked" || pullAction === "failed" ? "fail" : "idle";
+  const pullBadgeClass =
+    pullAction === "succeeded" || pullAction === "no update needed" ? "ok"
+    : pullAction === "blocked" || pullAction === "failed" ? "fail"
+    : "idle";
 
   const status = state?.sync_status ?? run?.git_sync_status ?? "unknown";
   const blocked = state?.pull_blocked ?? !!run?.git_sync_blocked;
@@ -1490,7 +1496,9 @@ function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
 
       <div className="delivery-command-preview">
         <div className="delivery-command-preview-label">
-          {pullAction === "not requested" ? "Recommended command (run manually if you choose)" : "Pull command run"}
+          {pullAction === "not requested" ? "Recommended command (run manually if you choose)"
+            : pullAction === "no update needed" ? "Pull command (not run — nothing to pull)"
+            : "Pull command run"}
         </div>
         <pre>{pull?.pull_command ?? state?.recommended_command ?? "No fast-forward pull is recommended right now."}</pre>
       </div>
@@ -1505,6 +1513,16 @@ function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
           No pull was requested for this run. Pass <code>--git-pull-ff-only</code> to run the guarded
           fast-forward pull shown above.
         </div>
+      ) : pullAction === "no update needed" ? (
+        <>
+          <div className="delivery-repo-line">
+            Local repo now up to date: <code>yes</code> — the repo was already up to date with{" "}
+            <code>origin/{pull?.base_branch ?? "main"}</code>, so no pull command was run.
+          </div>
+          <div className="delivery-repo-line">
+            No push/reset/stash performed: <code>true</code>
+          </div>
+        </>
       ) : (
         <>
           <div className="delivery-repo-line">

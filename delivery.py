@@ -471,7 +471,17 @@ def generate_git_pull_report(pull_state: dict, before: dict, after: dict | None,
     lines.append(f"- Safe to fast-forward: {before['fast_forward_safe']}")
     lines.append("")
     lines.append(f"## Decision: `{pull_state['decision']}`")
-    if not pull_state["pull_attempted"]:
+    if pull_state["decision"] == "NO_OP":
+        lines.append(
+            "Pull was **not attempted** — the repository is already up to date with "
+            f"`origin/{pull_state['base_branch']}`. This is a safe no-op, not a failure."
+        )
+        reasons = pull_state.get("block_reasons") or []
+        if reasons:
+            lines.append("")
+            lines.append("**Reason(s):**")
+            lines.extend(f"- {r}" for r in reasons)
+    elif not pull_state["pull_attempted"]:
         lines.append("Pull was **not attempted** — the preflight check did not confirm it was safe.")
         reasons = pull_state.get("block_reasons") or []
         if reasons:
@@ -519,38 +529,51 @@ def run_git_pull_ff_only(
     """
     Guarded fast-forward pull orchestrator:
       1. analyze_git_sync (fetch + status) — "before" state
-      2. only if before.fast_forward_safe: run `git pull --ff-only origin <base_branch>`
-      3. analyze_git_sync again (no re-fetch needed) — "after" state
-      4. write git_sync_before_pull.json / git_sync_after_pull.json / git_pull_report.md /
+      2. if before is already up to date (sync_status == "up_to_date" and no other
+         block reasons — i.e. clean, no denied dirty paths): decision = "NO_OP".
+         Nothing is run; this is a safe no-op, not a failure.
+      3. else, only if before.fast_forward_safe: run
+         `git pull --ff-only origin <base_branch>`
+      4. analyze_git_sync again (no re-fetch needed) — "after" state
+      5. write git_sync_before_pull.json / git_sync_after_pull.json / git_pull_report.md /
          git_pull_state.json into output_dir, if given
 
     Never runs git pull/merge/reset/stash/checkout/clean other than the single
     `git pull --ff-only origin <base_branch>` command, and only when before-pull
     analysis confirms fast_forward_safe is True.
 
+    decision is one of: "NO_OP" (already up to date, nothing to do — success),
+    "PULLED" (fast-forward pull succeeded), "FAILED" (pull was attempted but git
+    reported a non-zero exit code), or "BLOCKED" (an actual safety gate failed:
+    dirty, denied dirty paths, ahead, diverged, missing origin/<base_branch>,
+    fetch failure, or branch mismatch).
+
     Returns {"state": pull_state, "before": before, "after": after_or_None}.
     """
     repo_path = Path(repo_path).resolve()
     before = analyze_git_sync(repo_path, base_branch, allow_branch_mismatch=allow_branch_mismatch)
 
-    block_reasons = list(before["block_reasons"])
-    if before["sync_status"] == "up_to_date" and not block_reasons:
-        block_reasons.append(f"repo is already up to date with origin/{base_branch} — nothing to pull")
+    already_up_to_date = before["sync_status"] == "up_to_date" and not before["block_reasons"]
 
-    safe_to_pull = before["fast_forward_safe"] and not block_reasons
     pull_attempted = False
     pull_result = None
     after = None
+    block_reasons: list[str] = []
 
-    if safe_to_pull:
+    if already_up_to_date:
+        decision = "NO_OP"
+        after = before
+        block_reasons = [f"repo is already up to date with origin/{base_branch} — nothing to pull"]
+    elif before["fast_forward_safe"] and not before["block_reasons"]:
         pull_attempted = True
         pull_result = perform_ff_only_pull(repo_path, base_branch)
         after = analyze_git_sync(repo_path, base_branch, allow_branch_mismatch=allow_branch_mismatch, skip_fetch=True)
         decision = "PULLED" if pull_result["success"] else "FAILED"
     else:
         decision = "BLOCKED"
+        block_reasons = list(before["block_reasons"])
 
-    now_up_to_date = bool(after and after["sync_status"] == "up_to_date")
+    now_up_to_date = True if decision == "NO_OP" else bool(after and after["sync_status"] == "up_to_date")
     new_dirty_changes_detected = bool(after and after["is_dirty"] and not before["is_dirty"])
 
     state = {

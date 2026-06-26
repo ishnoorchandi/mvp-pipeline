@@ -6793,8 +6793,11 @@ def pipeline_existing_app_upgrade(
             print(f"  See {rdir / 'git_pull_report.md'}")
             print(f"{'='*60}\n")
             return run_id
-        print(f"  ✓  Pulled — now up to date: {pull_state['now_up_to_date']}. "
-              "No push, reset, or stash performed.")
+        if pull_state["decision"] == "NO_OP":
+            print("  ✓  Already up to date — no pull needed. No push, reset, or stash performed.")
+        else:
+            print(f"  ✓  Pulled — now up to date: {pull_state['now_up_to_date']}. "
+                  "No push, reset, or stash performed.")
     else:
         print(f"  Sync status: {git_sync_state['sync_status']} "
               f"(ahead {git_sync_state['commits_ahead']}, behind {git_sync_state['commits_behind']})")
@@ -9762,10 +9765,7 @@ if __name__ == "__main__":
             print("  No push, reset, or stash performed — pull-only local update.")
             print(f"  Reports         : {output_dir}")
             print(f"{'='*60}\n")
-            already_up_to_date_noop = (
-                pull_state["decision"] == "BLOCKED" and sync_state["sync_status"] == "up_to_date"
-            )
-            sys.exit(0 if pull_state["decision"] == "PULLED" or already_up_to_date_noop else 1)
+            sys.exit(0 if pull_state["decision"] in ("PULLED", "NO_OP") else 1)
         elif standalone_delivery:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = Path("delivery_runs") / f"delivery_{ts}"
