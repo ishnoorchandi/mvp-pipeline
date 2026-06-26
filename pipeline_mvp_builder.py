@@ -291,6 +291,52 @@ def run_existing_app_git_sync_check(run_id: str, existing_app_path, base_branch:
     return sync_state
 
 
+def run_existing_app_git_pull_ff_only(run_id: str, existing_app_path, base_branch: str = "main") -> dict | None:
+    """Guarded fast-forward pull (delivery.run_git_pull_ff_only) against the target
+    repo. Writes git_sync_before_pull.json / git_sync_after_pull.json /
+    git_pull_report.md / git_pull_state.json, plus the standard git_sync_report.md /
+    git_sync_state.json (from the after-pull state, or before-pull state if the pull
+    was blocked/failed), into the run folder. Records git_sync_*/git_pull_* fields on
+    run_state.json. Returns {"pull_state": ..., "sync_state": ...}, or None if
+    existing_app_path is not a git repo. Only ever runs the single
+    `git pull --ff-only origin <base_branch>` command, and only when it's confirmed
+    safe — never push/merge/reset/stash/checkout/clean."""
+    existing_app_path = Path(existing_app_path)
+    if not (existing_app_path / ".git").exists():
+        return None
+    rdir = run_dir(run_id)
+    outcome = delivery_mod.run_git_pull_ff_only(
+        existing_app_path, base_branch=base_branch, output_dir=rdir,
+    )
+    pull_state = outcome["state"]
+    sync_state = outcome["after"] or outcome["before"]
+
+    delivery_mod.generate_git_sync_report(sync_state, rdir / "git_sync_report.md")
+    (rdir / "git_sync_state.json").write_text(json.dumps(sync_state, indent=2), encoding="utf-8")
+
+    sync_summary = (
+        f"{sync_state['sync_status']} (ahead {sync_state['commits_ahead']}, "
+        f"behind {sync_state['commits_behind']})"
+    )
+    pull_summary = pull_state["decision"] + (
+        f" — {pull_state['pull_command']}" if pull_state["pull_attempted"] else ""
+    )
+    _update_state(run_id, {
+        "git_sync_status": sync_state["sync_status"],
+        "git_sync_blocked": sync_state["pull_blocked"],
+        "git_sync_summary": sync_summary,
+        "git_sync_artifacts": ["git_sync_report.md", "git_sync_state.json"],
+        "git_pull_status": pull_state["decision"],
+        "git_pull_blocked": pull_state["decision"] in ("BLOCKED", "FAILED"),
+        "git_pull_summary": pull_summary,
+        "git_pull_artifacts": [
+            "git_pull_report.md", "git_pull_state.json",
+            "git_sync_before_pull.json", "git_sync_after_pull.json",
+        ],
+    })
+    return {"pull_state": pull_state, "sync_state": sync_state}
+
+
 # ── LLM helpers ───────────────────────────────────────────────────────────────
 
 def gpt(messages: list[dict]) -> str:
@@ -6683,6 +6729,7 @@ def pipeline_existing_app_upgrade(
     feature_plan_only: bool = False,
     use_deepseek: bool = True,
     git_sync_base_branch: str = "main",
+    git_pull_ff_only: bool = False,
 ) -> str:
     """
     Existing App Upgrade mode entry point. Additive, not generative-from-scratch:
@@ -6709,12 +6756,45 @@ def pipeline_existing_app_upgrade(
     print(f"  Plan only     : {feature_plan_only}")
     print(f"{'='*60}\n")
 
-    print("▶ Step 0  Git sync / pull-safety check (read-only — fetch + status only)...")
+    if git_pull_ff_only:
+        print("▶ Step 0  Git sync / pull-safety check + guarded fast-forward pull...")
+    else:
+        print("▶ Step 0  Git sync / pull-safety check (read-only — fetch + status only)...")
     t0 = time.time()
-    git_sync_state = run_existing_app_git_sync_check(run_id, existing_app_path, base_branch=git_sync_base_branch)
+    git_sync_state = None
+    pull_state = None
+    if git_pull_ff_only:
+        pull_result = run_existing_app_git_pull_ff_only(run_id, existing_app_path, base_branch=git_sync_base_branch)
+        if pull_result is not None:
+            pull_state = pull_result["pull_state"]
+            git_sync_state = pull_result["sync_state"]
+    else:
+        git_sync_state = run_existing_app_git_sync_check(run_id, existing_app_path, base_branch=git_sync_base_branch)
     record_step_time(run_id, "git_sync_check", t0)
+
     if git_sync_state is None:
         print("  Not a git repository — skipping git sync check.")
+    elif git_pull_ff_only:
+        print(f"  Pull decision: {pull_state['decision']} "
+              f"(sync status now: {git_sync_state['sync_status']})")
+        if pull_state["decision"] in ("BLOCKED", "FAILED"):
+            _update_state(run_id, {"status": "blocked_git_pull", "current_step": "blocked"})
+            log_event(run_id, "build_blocked_git_pull",
+                      f"decision={pull_state['decision']}; "
+                      f"reasons={'; '.join(pull_state.get('block_reasons') or [])}")
+            print(f"\n{'='*60}")
+            print("  ⛔ BLOCKED — guarded fast-forward pull did not complete")
+            print(f"  Decision     : {pull_state['decision']}")
+            if pull_state["pull_attempted"]:
+                print(f"  Exit code    : {pull_state['pull_exit_code']}")
+            else:
+                print(f"  Reason(s)    : {'; '.join(pull_state.get('block_reasons') or []) or '(see git_pull_report.md)'}")
+            print("  No push, reset, stash, or discard was performed.")
+            print(f"  See {rdir / 'git_pull_report.md'}")
+            print(f"{'='*60}\n")
+            return run_id
+        print(f"  ✓  Pulled — now up to date: {pull_state['now_up_to_date']}. "
+              "No push, reset, or stash performed.")
     else:
         print(f"  Sync status: {git_sync_state['sync_status']} "
               f"(ahead {git_sync_state['commits_ahead']}, behind {git_sync_state['commits_behind']})")
@@ -9568,9 +9648,16 @@ if __name__ == "__main__":
                               "build (default: main).")
     parser.add_argument("--pull-plan-only", action="store_true",
                          help="Git sync check writes reports only and never modifies the target "
-                              "repo. This is always the current behavior — automatic pull is not "
-                              "implemented yet — the flag is accepted so callers can be explicit "
-                              "about that, and so a future pull implementation defaults to off.")
+                              "repo. Default behavior unless --git-pull-ff-only is also passed.")
+    parser.add_argument("--git-pull-ff-only", action="store_true",
+                         help="After the git sync check confirms it is safe (clean, behind "
+                              "origin/<base-branch>, fast-forward-safe), run exactly "
+                              "`git pull --ff-only origin <base-branch>` and write before/after "
+                              "reports (git_pull_report.md, git_pull_state.json, "
+                              "git_sync_before_pull.json, git_sync_after_pull.json). Never pushes, "
+                              "merges, resets, stashes, checks out, or cleans. In --upgrade-mode "
+                              "this runs before scanning/building; if the pull is blocked or fails, "
+                              "the build does not proceed.")
     args = parser.parse_args()
 
     run_id_arg = args.run_id  # may be None
@@ -9629,7 +9716,7 @@ if __name__ == "__main__":
             and not args.resume and not args.jira and not args.input
         )
         standalone_git_sync = (
-            args.git_sync_check
+            (args.git_sync_check or args.git_pull_ff_only)
             and not args.local_git_delivery
             and not args.continue_run and not args.upgrade_mode
             and not args.resume and not args.jira and not args.input
@@ -9637,7 +9724,8 @@ if __name__ == "__main__":
         if standalone_git_sync:
             repo_path = args.delivery_repo or args.existing_app
             if not repo_path:
-                print("--git-sync-check requires --existing-app PATH or --delivery-repo PATH.")
+                print("--git-sync-check/--git-pull-ff-only requires --existing-app PATH or "
+                      "--delivery-repo PATH.")
                 sys.exit(1)
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = Path("git_sync_runs") / f"git_sync_{ts}"
@@ -9653,7 +9741,31 @@ if __name__ == "__main__":
             print(f"  Pull blocked : {sync_state['pull_blocked']}")
             print(f"  Reports      : {output_dir}")
             print(f"{'='*60}\n")
-            sys.exit(1 if sync_state["pull_blocked"] else 0)
+
+            if not args.git_pull_ff_only:
+                sys.exit(1 if sync_state["pull_blocked"] else 0)
+
+            pull_outcome = delivery_mod.run_git_pull_ff_only(
+                repo_path, base_branch=args.base_branch, output_dir=output_dir,
+            )
+            pull_state = pull_outcome["state"]
+            print(f"{'='*60}")
+            print("  Git Pull (fast-forward only)")
+            print(f"  Decision        : {pull_state['decision']}")
+            print(f"  Command         : {pull_state['pull_command']}")
+            print(f"  Attempted       : {pull_state['pull_attempted']}")
+            if pull_state["pull_attempted"]:
+                print(f"  Exit code       : {pull_state['pull_exit_code']}")
+            else:
+                print(f"  Reason(s)       : {'; '.join(pull_state['block_reasons']) or '(none)'}")
+            print(f"  Now up to date  : {pull_state['now_up_to_date']}")
+            print("  No push, reset, or stash performed — pull-only local update.")
+            print(f"  Reports         : {output_dir}")
+            print(f"{'='*60}\n")
+            already_up_to_date_noop = (
+                pull_state["decision"] == "BLOCKED" and sync_state["sync_status"] == "up_to_date"
+            )
+            sys.exit(0 if pull_state["decision"] == "PULLED" or already_up_to_date_noop else 1)
         elif standalone_delivery:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = Path("delivery_runs") / f"delivery_{ts}"
@@ -9688,6 +9800,7 @@ if __name__ == "__main__":
                 feature_plan_only=args.feature_plan_only,
                 use_deepseek=not args.no_deepseek,
                 git_sync_base_branch=args.base_branch,
+                git_pull_ff_only=args.git_pull_ff_only,
             )
             if args.local_git_delivery and not args.feature_plan_only:
                 upgrade_state = load_state(upgrade_run_id)

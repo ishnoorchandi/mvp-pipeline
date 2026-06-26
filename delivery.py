@@ -431,6 +431,161 @@ def run_git_sync_check(
     return sync_state
 
 
+# ── Guarded fast-forward pull ───────────────────────────────────────────────────
+# The ONLY mutating git command this module ever runs. It is only ever invoked
+# after analyze_git_sync has confirmed fast_forward_safe — never on its own. The
+# single allowed command is `git pull --ff-only origin <base_branch>`. This never
+# pushes, merges, resets, stashes, checks out, or cleans anything.
+
+def perform_ff_only_pull(repo_path, base_branch: str = "main") -> dict:
+    """Runs exactly `git pull --ff-only origin <base_branch>` — no other git pull
+    form is ever used. Callers must have already verified fast_forward_safe."""
+    command = f"git pull --ff-only origin {base_branch}"
+    result = run_git_command(repo_path, ["pull", "--ff-only", "origin", base_branch], check=False)
+    return {
+        "command": command,
+        "success": result.returncode == 0,
+        "returncode": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+
+
+def generate_git_pull_report(pull_state: dict, before: dict, after: dict | None, output_path) -> str:
+    """Writes git_pull_report.md — plain English summary of the guarded fast-forward
+    pull attempt, including an explicit confirmation that no push/reset/stash ran."""
+    lines = ["# Git Pull Report (fast-forward only)", ""]
+    lines.append(f"**Repo path:** `{pull_state['repo_path']}`")
+    lines.append(f"**Branch:** `{pull_state.get('current_branch') or '(unknown)'}`")
+    lines.append(f"**Base branch:** `{pull_state['base_branch']}`")
+    if pull_state.get("is_company_repo"):
+        lines.append(
+            "**Company repo detected.** This is a pull-only local update — fast-forward only, "
+            "never a push, PR, reset, stash, or discard."
+        )
+    lines.append("")
+    lines.append("## Before Pull")
+    lines.append(f"- Sync status: `{before['sync_status']}`")
+    lines.append(f"- Ahead/behind origin/{before['base_branch']}: {before['commits_ahead']}/{before['commits_behind']}")
+    lines.append(f"- Working tree dirty: {before['is_dirty']}")
+    lines.append(f"- Safe to fast-forward: {before['fast_forward_safe']}")
+    lines.append("")
+    lines.append(f"## Decision: `{pull_state['decision']}`")
+    if not pull_state["pull_attempted"]:
+        lines.append("Pull was **not attempted** — the preflight check did not confirm it was safe.")
+        reasons = pull_state.get("block_reasons") or []
+        if reasons:
+            lines.append("")
+            lines.append("**Block reason(s):**")
+            lines.extend(f"- {r}" for r in reasons)
+    else:
+        lines.append(f"**Command run:** `{pull_state['pull_command']}`")
+        lines.append(f"**Exit code:** {pull_state['pull_exit_code']}")
+        lines.append(f"**Pull succeeded:** {pull_state['pull_succeeded']}")
+        if pull_state.get("pull_stdout"):
+            lines.append("")
+            lines.append("```")
+            lines.append(pull_state["pull_stdout"])
+            if pull_state.get("pull_stderr"):
+                lines.append(pull_state["pull_stderr"])
+            lines.append("```")
+    lines.append("")
+    if after is not None:
+        lines.append("## After Pull")
+        lines.append(f"- Sync status: `{after['sync_status']}`")
+        lines.append(f"- Ahead/behind origin/{after['base_branch']}: {after['commits_ahead']}/{after['commits_behind']}")
+        lines.append(f"- Working tree dirty: {after['is_dirty']}")
+        lines.append("")
+    lines.append(f"**Local repo now up to date:** {pull_state['now_up_to_date']}")
+    lines.append(f"**New local dirty changes created by the pull:** {pull_state['new_dirty_changes_detected']}")
+    lines.append("")
+    lines.append("## Safety Confirmation")
+    lines.append(f"- No push performed: {pull_state['no_push_performed']}")
+    lines.append(f"- No reset performed: {pull_state['no_reset_performed']}")
+    lines.append(f"- No stash performed: {pull_state['no_stash_performed']}")
+    lines.append("- No merge, checkout, or clean was run — only `git pull --ff-only` was ever invoked.")
+
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def run_git_pull_ff_only(
+    repo_path,
+    base_branch: str = "main",
+    output_dir=None,
+    allow_branch_mismatch: bool = False,
+) -> dict:
+    """
+    Guarded fast-forward pull orchestrator:
+      1. analyze_git_sync (fetch + status) — "before" state
+      2. only if before.fast_forward_safe: run `git pull --ff-only origin <base_branch>`
+      3. analyze_git_sync again (no re-fetch needed) — "after" state
+      4. write git_sync_before_pull.json / git_sync_after_pull.json / git_pull_report.md /
+         git_pull_state.json into output_dir, if given
+
+    Never runs git pull/merge/reset/stash/checkout/clean other than the single
+    `git pull --ff-only origin <base_branch>` command, and only when before-pull
+    analysis confirms fast_forward_safe is True.
+
+    Returns {"state": pull_state, "before": before, "after": after_or_None}.
+    """
+    repo_path = Path(repo_path).resolve()
+    before = analyze_git_sync(repo_path, base_branch, allow_branch_mismatch=allow_branch_mismatch)
+
+    block_reasons = list(before["block_reasons"])
+    if before["sync_status"] == "up_to_date" and not block_reasons:
+        block_reasons.append(f"repo is already up to date with origin/{base_branch} — nothing to pull")
+
+    safe_to_pull = before["fast_forward_safe"] and not block_reasons
+    pull_attempted = False
+    pull_result = None
+    after = None
+
+    if safe_to_pull:
+        pull_attempted = True
+        pull_result = perform_ff_only_pull(repo_path, base_branch)
+        after = analyze_git_sync(repo_path, base_branch, allow_branch_mismatch=allow_branch_mismatch, skip_fetch=True)
+        decision = "PULLED" if pull_result["success"] else "FAILED"
+    else:
+        decision = "BLOCKED"
+
+    now_up_to_date = bool(after and after["sync_status"] == "up_to_date")
+    new_dirty_changes_detected = bool(after and after["is_dirty"] and not before["is_dirty"])
+
+    state = {
+        "repo_path": str(repo_path),
+        "current_branch": before["current_branch"],
+        "base_branch": base_branch,
+        "is_company_repo": before["is_company_repo"],
+        "decision": decision,
+        "pull_attempted": pull_attempted,
+        "pull_command": pull_result["command"] if pull_result else f"git pull --ff-only origin {base_branch}",
+        "pull_exit_code": pull_result["returncode"] if pull_result else None,
+        "pull_succeeded": pull_result["success"] if pull_result else None,
+        "pull_stdout": pull_result["stdout"] if pull_result else "",
+        "pull_stderr": pull_result["stderr"] if pull_result else "",
+        "block_reasons": block_reasons,
+        "now_up_to_date": now_up_to_date,
+        "new_dirty_changes_detected": new_dirty_changes_detected,
+        "no_push_performed": True,
+        "no_reset_performed": True,
+        "no_stash_performed": True,
+        "timestamp": time.time(),
+    }
+
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "git_sync_before_pull.json").write_text(json.dumps(before, indent=2), encoding="utf-8")
+        if after is not None:
+            (output_dir / "git_sync_after_pull.json").write_text(json.dumps(after, indent=2), encoding="utf-8")
+        generate_git_pull_report(state, before, after, output_dir / "git_pull_report.md")
+        (output_dir / "git_pull_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    return {"state": state, "before": before, "after": after}
+
+
 # ── Precondition checks ───────────────────────────────────────────────────────
 
 def assert_clean_delivery_preconditions(

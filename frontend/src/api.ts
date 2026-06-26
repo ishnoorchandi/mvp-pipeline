@@ -60,6 +60,12 @@ export interface RunDetail {
   git_sync_blocked?: boolean;
   git_sync_summary?: string;
   git_sync_artifacts?: string[];
+  // Git Pull (fast-forward only) — set when --git-pull-ff-only was used. Only ever
+  // reflects a guarded `git pull --ff-only origin <base_branch>`; never push/reset/stash.
+  git_pull_status?: "BLOCKED" | "PULLED" | "FAILED" | null;
+  git_pull_blocked?: boolean;
+  git_pull_summary?: string;
+  git_pull_artifacts?: string[];
 }
 
 export interface Artifact {
@@ -312,6 +318,41 @@ export async function getGitSyncState(runId: string): Promise<GitSyncState | nul
   try {
     const a = await getArtifact(runId, "git_sync_state.json");
     return JSON.parse(a.content) as GitSyncState;
+  } catch {
+    return null;
+  }
+}
+
+// ── Git Pull (fast-forward only) ────────────────────────────────────────────
+// Mirrors delivery.run_git_pull_ff_only's "state" dict. The pipeline only ever runs
+// `git pull --ff-only origin <base_branch>`, and only after confirming it's safe —
+// never push/merge/reset/stash/checkout/clean. Stored as git_pull_state.json.
+
+export interface GitPullState {
+  repo_path: string;
+  current_branch: string | null;
+  base_branch: string;
+  is_company_repo: boolean;
+  decision: "BLOCKED" | "PULLED" | "FAILED";
+  pull_attempted: boolean;
+  pull_command: string;
+  pull_exit_code: number | null;
+  pull_succeeded: boolean | null;
+  pull_stdout: string;
+  pull_stderr: string;
+  block_reasons: string[];
+  now_up_to_date: boolean;
+  new_dirty_changes_detected: boolean;
+  no_push_performed: boolean;
+  no_reset_performed: boolean;
+  no_stash_performed: boolean;
+  timestamp: number;
+}
+
+export async function getGitPullState(runId: string): Promise<GitPullState | null> {
+  try {
+    const a = await getArtifact(runId, "git_pull_state.json");
+    return JSON.parse(a.content) as GitPullState;
   } catch {
     return null;
   }

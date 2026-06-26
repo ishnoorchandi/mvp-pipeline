@@ -3,9 +3,9 @@ import type { ReactElement } from "react";
 import {
   getRuns, getRun, getArtifact, createUpgradeRun, createContinuationRun,
   getDeliveryInfo, getDeliveryPrecheck, createDeliveryCommit, pushDeliverySandbox,
-  getGitSyncState,
+  getGitSyncState, getGitPullState,
 } from "./api";
-import type { RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState } from "./api";
+import type { RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState } from "./api";
 import "./App.css";
 
 // ── Pipeline definitions ───────────────────────────────────────────────────────
@@ -1205,6 +1205,10 @@ interface FeatureSprintPlan {
 const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "git_sync_report.md", label: "Git Sync Report" },
   { file: "git_sync_state.json", label: "Git Sync State JSON" },
+  { file: "git_pull_report.md", label: "Git Pull Report" },
+  { file: "git_pull_state.json", label: "Git Pull State JSON" },
+  { file: "git_sync_before_pull.json", label: "Git Sync — Before Pull" },
+  { file: "git_sync_after_pull.json", label: "Git Sync — After Pull" },
   { file: "existing_app_inventory.md", label: "Existing App Inventory" },
   { file: "baseline_health_check.md", label: "Baseline Health Check" },
   { file: "baseline_behavior_checklist.md", label: "Baseline Behavior Checklist" },
@@ -1417,14 +1421,30 @@ function SmokeMutationBanner({ run }: { run: RunDetail | null }) {
 // pull/update action here — this is fetch + status only, never push/reset/stash/pull.
 function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
   const [state, setState] = useState<GitSyncState | null>(null);
+  const [pull, setPull] = useState<GitPullState | null>(null);
   const hasArtifact = (run?.artifacts ?? []).includes("git_sync_state.json");
+  const hasPullArtifact = (run?.artifacts ?? []).includes("git_pull_state.json");
 
   useEffect(() => {
     if (!hasArtifact) { setState(null); return; }
     getGitSyncState(runId).then(setState).catch(() => setState(null));
   }, [runId, hasArtifact]);
 
+  useEffect(() => {
+    if (!hasPullArtifact) { setPull(null); return; }
+    getGitPullState(runId).then(setPull).catch(() => setPull(null));
+  }, [runId, hasPullArtifact]);
+
   if (!run?.git_sync_status && !state) return null;
+
+  // Pull action: not requested / blocked / succeeded / failed.
+  const pullDecision = pull?.decision ?? run?.git_pull_status ?? null;
+  const pullAction: "not requested" | "blocked" | "succeeded" | "failed" =
+    pullDecision === "PULLED" ? "succeeded"
+    : pullDecision === "FAILED" ? "failed"
+    : pullDecision === "BLOCKED" ? "blocked"
+    : "not requested";
+  const pullBadgeClass = pullAction === "succeeded" ? "ok" : pullAction === "blocked" || pullAction === "failed" ? "fail" : "idle";
 
   const status = state?.sync_status ?? run?.git_sync_status ?? "unknown";
   const blocked = state?.pull_blocked ?? !!run?.git_sync_blocked;
@@ -1469,9 +1489,50 @@ function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
       )}
 
       <div className="delivery-command-preview">
-        <div className="delivery-command-preview-label">Recommended command (run manually if you choose)</div>
-        <pre>{state?.recommended_command ?? "No fast-forward pull is recommended right now."}</pre>
+        <div className="delivery-command-preview-label">
+          {pullAction === "not requested" ? "Recommended command (run manually if you choose)" : "Pull command run"}
+        </div>
+        <pre>{pull?.pull_command ?? state?.recommended_command ?? "No fast-forward pull is recommended right now."}</pre>
       </div>
+
+      <div className="delivery-card-header">
+        <div className="delivery-card-title" style={{ fontSize: "0.95em" }}>Pull action</div>
+        <span className={`delivery-badge delivery-badge-${pullBadgeClass}`}>{pullAction}</span>
+      </div>
+
+      {pullAction === "not requested" ? (
+        <div className="delivery-repo-line">
+          No pull was requested for this run. Pass <code>--git-pull-ff-only</code> to run the guarded
+          fast-forward pull shown above.
+        </div>
+      ) : (
+        <>
+          <div className="delivery-repo-line">
+            Before status: <code>{pull?.now_up_to_date === false ? "not up to date" : "(see git_sync_before_pull.json)"}</code>
+            {" "}· After status: <code>{pull ? (pull.now_up_to_date ? "up to date" : "not up to date") : "(unknown)"}</code>
+          </div>
+          <div className="delivery-repo-line">
+            Local repo now up to date: <code>{String(pull?.now_up_to_date ?? false)}</code>
+          </div>
+          {pullAction === "blocked" && (pull?.block_reasons?.length ?? 0) > 0 && (
+            <div className="delivery-warning-panel delivery-warning-panel-severe">
+              <strong>Pull blocked.</strong>
+              <ul>{pull!.block_reasons.map(r => <li key={r}>{r}</li>)}</ul>
+            </div>
+          )}
+          {pullAction === "failed" && (
+            <div className="delivery-warning-panel delivery-warning-panel-severe">
+              <strong>Pull failed.</strong> Exit code {pull?.pull_exit_code}. See git_pull_report.md.
+            </div>
+          )}
+          <div className="delivery-repo-line">
+            No push/reset/stash performed: <code>{String(
+              (pull?.no_push_performed ?? true) && (pull?.no_reset_performed ?? true) && (pull?.no_stash_performed ?? true)
+            )}</code>
+            {pull?.is_company_repo && " — pull-only local update, never published or merged."}
+          </div>
+        </>
+      )}
     </div>
   );
 }
