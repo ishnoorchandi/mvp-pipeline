@@ -1449,6 +1449,410 @@ function SmokeMutationBanner({ run }: { run: RunDetail | null }) {
   );
 }
 
+// What Happened? — plain-English executive summary for non-technical demo viewers.
+// Built purely from run_state.json fields already used by the other cards; mentions
+// only steps that actually ran and never performs an action itself.
+const WHAT_HAPPENED_QUICK_LINKS: { file: string; label: string }[] = [
+  { file: "git_sync_report.md", label: "Git Sync Report" },
+  { file: "minimal_fix_plan.md", label: "Bugfix Plan" },
+  { file: "backend_route_map.md", label: "Backend Route Map" },
+  { file: "pr_remote_delivery_report.md", label: "PR Remote Delivery Report" },
+];
+
+function buildWhatHappenedSummary(run: RunDetail | null): { bullets: string[]; gitOrPrRan: boolean } {
+  const bullets: string[] = [];
+  let gitOrPrRan = false;
+
+  const syncStatus = run?.git_sync_status;
+  if (syncStatus) {
+    gitOrPrRan = true;
+    if (run?.git_sync_blocked) {
+      bullets.push("Repo sync completed: pull was blocked to avoid an unsafe update.");
+    } else if (syncStatus === "up_to_date") {
+      bullets.push("Repo sync completed: up to date with the base branch.");
+    } else if (syncStatus === "behind" || syncStatus === "diverged") {
+      bullets.push(`Repo sync completed: local repo is ${syncStatus} relative to the base branch.`);
+    } else if (syncStatus === "ahead") {
+      bullets.push("Repo sync completed: local repo is ahead of the base branch.");
+    }
+  }
+
+  const pullDecision = run?.git_pull_status;
+  if (pullDecision) {
+    gitOrPrRan = true;
+    if (pullDecision === "PULLED") {
+      bullets.push("Safe pull completed: fast-forwarded the repo without push, reset, or stash.");
+    } else if (pullDecision === "NO_OP") {
+      bullets.push("Safe pull completed: repo was already up to date, so no pull was needed.");
+    } else if (pullDecision === "BLOCKED") {
+      bullets.push("Safe pull blocked to avoid an unsafe update.");
+    } else if (pullDecision === "FAILED") {
+      bullets.push("Safe pull was attempted but failed.");
+    }
+  }
+
+  if (run?.bugfix_mode) {
+    bullets.push(run.bugfix_summary
+      ?? `Bugfix planning completed: identified ${run.suspected_files_count ?? 0} suspected file(s) and a minimal fix plan, without changing code.`);
+  }
+
+  if (run?.backend_inventory_mode) {
+    bullets.push(run.backend_inventory_summary
+      ?? `Backend inventory completed: mapped ${run.backend_route_count ?? 0} backend route(s) and ${run.frontend_api_call_count ?? 0} frontend API call(s).`);
+  }
+
+  if (run?.backend_boundary_status || run?.backend_smoke_status) {
+    bullets.push("Backend safety completed: generated backend boundaries and smoke-check guidance before allowing backend edits.");
+  }
+
+  if (run?.pr_plan_status) {
+    gitOrPrRan = true;
+    bullets.push(run.pr_plan_summary
+      ?? "PR delivery plan created: confirmed that direct push to main is blocked.");
+  }
+
+  if (run?.pr_branch_decision) {
+    gitOrPrRan = true;
+    const decision = run.pr_branch_decision;
+    if (decision === "COMMITTED_LOCAL") {
+      bullets.push(`Branch prep completed: prepared a feature branch and created a local commit${run.pr_commit_hash ? ` (${run.pr_commit_hash})` : ""} using only allowed files.`);
+    } else if (decision === "BRANCH_READY" || decision === "NO_CHANGES") {
+      bullets.push("Branch prep completed: feature branch is ready; no local commit was needed.");
+    } else if (decision === "BLOCKED") {
+      bullets.push("Branch prep blocked before any commit was made.");
+    } else if (decision === "FAILED") {
+      bullets.push("Branch prep was attempted but failed.");
+    }
+  }
+
+  if (run?.pr_remote_decision) {
+    gitOrPrRan = true;
+    const decision = run.pr_remote_decision;
+    if (decision === "PR_CREATED") {
+      bullets.push("Remote PR delivery completed: pushed only the feature branch and opened a pull request.");
+    } else if (decision === "PUSHED_BRANCH") {
+      bullets.push("Remote PR delivery completed: pushed only the feature branch.");
+    } else if (decision === "MANUAL_PR_REQUIRED") {
+      bullets.push("Remote PR delivery completed: branch was pushed, but the pull request must be opened manually.");
+    } else if (decision === "BLOCKED") {
+      bullets.push("Remote PR delivery blocked before any push was made.");
+    } else if (decision === "FAILED") {
+      bullets.push("Remote PR delivery was attempted but failed.");
+    }
+  }
+
+  return { bullets, gitOrPrRan };
+}
+
+function WhatHappenedCard({ run, selectedArtifact, onSelectArtifact }: {
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
+  const { bullets, gitOrPrRan } = buildWhatHappenedSummary(run);
+  const quickLinks = WHAT_HAPPENED_QUICK_LINKS.filter(l => (run?.artifacts ?? []).includes(l.file));
+  const prUrl = run?.pr_remote_pr_url;
+
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">What Happened?</div>
+          <div className="delivery-card-sub">Plain-English summary of this run.</div>
+        </div>
+      </div>
+      {bullets.length > 0 ? (
+        <>
+          <ul className="what-happened-list">
+            {bullets.map((b, i) => <li key={i}>{b}</li>)}
+          </ul>
+          {prUrl && (
+            <div className="timeline-step-links">
+              <a className="timeline-pr-link" href={prUrl} target="_blank" rel="noreferrer">Open Pull Request</a>
+            </div>
+          )}
+          {gitOrPrRan && (
+            <div className="delivery-warning-panel timeline-safety-note">
+              Safety: the guarded flow does not push main, force push, reset, stash, clean, or discard changes.
+            </div>
+          )}
+          {quickLinks.length > 0 && (
+            <div className="delivery-artifacts">
+              <div className="delivery-artifacts-label">Quick links</div>
+              <div className="delivery-artifact-tabs">
+                {quickLinks.map(l => (
+                  <button
+                    key={l.file}
+                    className={`artifact-tab ${selectedArtifact === l.file ? "active" : ""}`}
+                    onClick={() => onSelectArtifact(l.file)}
+                  >
+                    {l.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="delivery-repo-line">This run has not completed enough workflow steps to summarize yet.</div>
+      )}
+    </div>
+  );
+}
+
+// Demo Workflow Timeline — top-level, read-only summary that retells the guarded
+// Git/PR safety story (repo sync -> safe pull -> planning layers -> PR delivery)
+// as a single ordered list, derived entirely from existing run_state.json fields.
+// Never performs an action itself; artifact links reuse the same right-side viewer
+// as every other card (selectedArtifact/onSelectArtifact), so no new viewer exists.
+type TimelineStatus = "PASS" | "WARN" | "BLOCKED" | "FAILED" | "NOT RUN" | "PLAN ONLY";
+
+function timelineBadgeClass(status: TimelineStatus): string {
+  switch (status) {
+    case "PASS": return "ok";
+    case "WARN": return "warn";
+    case "BLOCKED": return "fail";
+    case "FAILED": return "fail";
+    case "PLAN ONLY": return "plan";
+    default: return "idle";
+  }
+}
+
+interface TimelineStep {
+  key: string;
+  title: string;
+  status: TimelineStatus;
+  explanation: string;
+  artifact?: string;
+  prUrl?: string | null;
+}
+
+function buildDemoTimeline(run: RunDetail | null): TimelineStep[] {
+  const artifacts = run?.artifacts ?? [];
+  const firstArtifact = (list?: string[]) => (list ?? []).find(f => artifacts.includes(f));
+
+  const repoSync: TimelineStep = (() => {
+    const status = run?.git_sync_status;
+    if (run?.git_sync_blocked) {
+      return { key: "repo_sync", title: "Repo Sync", status: "BLOCKED",
+        explanation: run?.git_sync_summary ?? "Repo sync is blocked — review the Git Sync details before continuing.",
+        artifact: firstArtifact(run?.git_sync_artifacts) };
+    }
+    if (status === "up_to_date" || status === "ahead") {
+      return { key: "repo_sync", title: "Repo Sync", status: "PASS",
+        explanation: run?.git_sync_summary ?? "Repo is up to date with origin/main.",
+        artifact: firstArtifact(run?.git_sync_artifacts) };
+    }
+    if (status === "behind" || status === "diverged") {
+      return { key: "repo_sync", title: "Repo Sync", status: "WARN",
+        explanation: run?.git_sync_summary ?? "Local repo is behind the base branch — review before building.",
+        artifact: firstArtifact(run?.git_sync_artifacts) };
+    }
+    return { key: "repo_sync", title: "Repo Sync", status: "NOT RUN",
+      explanation: "Repo sync has not been run for this build yet.", artifact: firstArtifact(run?.git_sync_artifacts) };
+  })();
+
+  const safePull: TimelineStep = (() => {
+    const decision = run?.git_pull_status;
+    if (decision === "PULLED" || decision === "NO_OP") {
+      return { key: "safe_pull", title: "Safe Pull", status: "PASS",
+        explanation: run?.git_pull_summary ?? (decision === "NO_OP"
+          ? "Repo was already up to date — no pull was needed."
+          : "Fast-forward-only pull completed safely."),
+        artifact: firstArtifact(run?.git_pull_artifacts) };
+    }
+    if (decision === "BLOCKED") {
+      return { key: "safe_pull", title: "Safe Pull", status: "BLOCKED",
+        explanation: run?.git_pull_summary ?? "Pull was blocked to avoid an unsafe update.",
+        artifact: firstArtifact(run?.git_pull_artifacts) };
+    }
+    if (decision === "FAILED") {
+      return { key: "safe_pull", title: "Safe Pull", status: "FAILED",
+        explanation: run?.git_pull_summary ?? "The guarded fast-forward pull failed.",
+        artifact: firstArtifact(run?.git_pull_artifacts) };
+    }
+    return { key: "safe_pull", title: "Safe Pull", status: "NOT RUN",
+      explanation: "No pull was requested for this run.", artifact: firstArtifact(run?.git_pull_artifacts) };
+  })();
+
+  const bugfixPlan: TimelineStep = (() => {
+    if (!run?.bugfix_mode) {
+      return { key: "bugfix_plan", title: "Bugfix Plan", status: "NOT RUN",
+        explanation: "Bugfix mode was not used for this run." };
+    }
+    if (run.bugfix_boundary_status === "blocked" || run.bugfix_build_readiness === "blocked") {
+      return { key: "bugfix_plan", title: "Bugfix Plan", status: "BLOCKED",
+        explanation: run.bugfix_summary ?? "Bugfix plan is blocked — review the boundary report.",
+        artifact: firstArtifact(run.bugfix_artifacts) };
+    }
+    return { key: "bugfix_plan", title: "Bugfix Plan", status: "PLAN ONLY",
+      explanation: run.bugfix_summary ?? `Planning-only bugfix artifacts generated (${run.suspected_files_count ?? 0} suspected file(s)).`,
+      artifact: firstArtifact(run.bugfix_artifacts) };
+  })();
+
+  const backendInventory: TimelineStep = (() => {
+    if (!run?.backend_inventory_mode) {
+      return { key: "backend_inventory", title: "Backend/API Inventory", status: "NOT RUN",
+        explanation: "Backend & API inventory was not run for this build." };
+    }
+    return { key: "backend_inventory", title: "Backend/API Inventory", status: "PLAN ONLY",
+      explanation: run.backend_inventory_summary
+        ?? `Read-only inventory found ${run.backend_route_count ?? 0} backend route(s) and ${run.frontend_api_call_count ?? 0} frontend API call(s).`,
+      artifact: firstArtifact(run.backend_inventory_artifacts) };
+  })();
+
+  const backendSafety: TimelineStep = (() => {
+    const boundary = run?.backend_boundary_status;
+    const smoke = run?.backend_smoke_status;
+    const safetyArtifact = firstArtifact(run?.backend_boundary_artifacts) ?? firstArtifact(run?.backend_smoke_artifacts);
+    if (!boundary && !smoke) {
+      return { key: "backend_safety", title: "Backend Safety", status: "NOT RUN",
+        explanation: "Backend safety checks were not run for this build." };
+    }
+    if (smoke === "fail" || boundary === "blocked") {
+      return { key: "backend_safety", title: "Backend Safety", status: "FAILED",
+        explanation: run?.backend_boundary_summary ?? run?.backend_smoke_summary ?? "Backend boundary or smoke checks failed.",
+        artifact: safetyArtifact };
+    }
+    if (run?.backend_safe_to_edit === true && run?.backend_safe_to_run_checks === true) {
+      return { key: "backend_safety", title: "Backend Safety", status: "PASS",
+        explanation: run?.backend_boundary_summary ?? run?.backend_smoke_summary ?? "Backend is safe to edit and safe to run checks.",
+        artifact: safetyArtifact };
+    }
+    return { key: "backend_safety", title: "Backend Safety", status: "PLAN ONLY",
+      explanation: run?.backend_boundary_summary ?? run?.backend_smoke_summary ?? "Backend boundary + smoke-check plan generated.",
+      artifact: safetyArtifact };
+  })();
+
+  const prPlan: TimelineStep = (() => {
+    const readiness = run?.pr_plan_status;
+    if (!readiness) {
+      return { key: "pr_plan", title: "PR Plan", status: "NOT RUN",
+        explanation: "No PR delivery plan was generated for this run." };
+    }
+    if (readiness === "blocked") {
+      return { key: "pr_plan", title: "PR Plan", status: "BLOCKED",
+        explanation: run?.pr_plan_summary ?? "PR plan is blocked — see blocker details.",
+        artifact: firstArtifact(run?.pr_plan_artifacts) };
+    }
+    if (readiness === "warning") {
+      return { key: "pr_plan", title: "PR Plan", status: "WARN",
+        explanation: run?.pr_plan_summary ?? "PR plan has warnings to review.",
+        artifact: firstArtifact(run?.pr_plan_artifacts) };
+    }
+    return { key: "pr_plan", title: "PR Plan", status: "PLAN ONLY",
+      explanation: run?.pr_plan_summary ?? "Read-only PR readiness plan — sync now, branch/commit/push/PR later.",
+      artifact: firstArtifact(run?.pr_plan_artifacts) };
+  })();
+
+  const branchPrep: TimelineStep = (() => {
+    const decision = run?.pr_branch_decision;
+    if (!decision) {
+      return { key: "branch_prep", title: "Branch Prep", status: "NOT RUN",
+        explanation: "PR branch preparation was not run for this build." };
+    }
+    if (decision === "COMMITTED_LOCAL") {
+      return { key: "branch_prep", title: "Branch Prep", status: "PASS",
+        explanation: run?.pr_branch_summary ?? "Feature branch created and changes committed locally.",
+        artifact: firstArtifact(run?.pr_branch_artifacts) };
+    }
+    if (decision === "BRANCH_READY" || decision === "NO_CHANGES") {
+      return { key: "branch_prep", title: "Branch Prep", status: "PLAN ONLY",
+        explanation: run?.pr_branch_summary ?? "Feature branch is ready; no local commit was needed yet.",
+        artifact: firstArtifact(run?.pr_branch_artifacts) };
+    }
+    if (decision === "BLOCKED") {
+      return { key: "branch_prep", title: "Branch Prep", status: "BLOCKED",
+        explanation: run?.pr_branch_summary ?? "Branch preparation is blocked.",
+        artifact: firstArtifact(run?.pr_branch_artifacts) };
+    }
+    return { key: "branch_prep", title: "Branch Prep", status: "FAILED",
+      explanation: run?.pr_branch_summary ?? "Branch preparation failed.",
+      artifact: firstArtifact(run?.pr_branch_artifacts) };
+  })();
+
+  const remotePr: TimelineStep = (() => {
+    const decision = run?.pr_remote_decision;
+    if (!decision) {
+      return { key: "remote_pr", title: "Remote PR Delivery", status: "NOT RUN",
+        explanation: "Remote PR delivery was not run for this build." };
+    }
+    if (decision === "PR_CREATED" || decision === "PUSHED_BRANCH" || decision === "NO_OP") {
+      return { key: "remote_pr", title: "Remote PR Delivery", status: "PASS",
+        explanation: run?.pr_remote_summary ?? (
+          decision === "PR_CREATED" ? "Pull request opened against the feature branch."
+          : decision === "PUSHED_BRANCH" ? "Feature branch pushed to the remote."
+          : "Nothing to push — remote was already up to date."),
+        artifact: firstArtifact(run?.pr_remote_artifacts), prUrl: run?.pr_remote_pr_url };
+    }
+    if (decision === "MANUAL_PR_REQUIRED") {
+      return { key: "remote_pr", title: "Remote PR Delivery", status: "WARN",
+        explanation: run?.pr_remote_summary ?? "Branch was pushed but the PR must be opened manually.",
+        artifact: firstArtifact(run?.pr_remote_artifacts), prUrl: run?.pr_remote_pr_url };
+    }
+    if (decision === "BLOCKED") {
+      return { key: "remote_pr", title: "Remote PR Delivery", status: "BLOCKED",
+        explanation: run?.pr_remote_summary ?? "Remote PR delivery is blocked.",
+        artifact: firstArtifact(run?.pr_remote_artifacts) };
+    }
+    return { key: "remote_pr", title: "Remote PR Delivery", status: "FAILED",
+      explanation: run?.pr_remote_summary ?? "Remote PR delivery failed.",
+      artifact: firstArtifact(run?.pr_remote_artifacts) };
+  })();
+
+  return [repoSync, safePull, bugfixPlan, backendInventory, backendSafety, prPlan, branchPrep, remotePr];
+}
+
+function DemoWorkflowTimelineCard({ run, selectedArtifact, onSelectArtifact }: {
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
+  const steps = buildDemoTimeline(run);
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Demo Workflow Timeline</div>
+          <div className="delivery-card-sub">
+            Follow the safe development path from repo sync to pull request.
+          </div>
+        </div>
+      </div>
+      <ol className="timeline-list">
+        {steps.map(step => (
+          <li key={step.key} className="timeline-step">
+            <div className="timeline-step-header">
+              <span className={`delivery-badge delivery-badge-${timelineBadgeClass(step.status)}`}>{step.status}</span>
+              <span className="timeline-step-title">{step.title}</span>
+            </div>
+            <div className="timeline-step-explanation">{step.explanation}</div>
+            {(step.artifact || step.prUrl) && (
+              <div className="timeline-step-links">
+                {step.artifact && (
+                  <button
+                    className={`artifact-tab ${selectedArtifact === step.artifact ? "active" : ""}`}
+                    onClick={() => onSelectArtifact(step.artifact!)}
+                  >
+                    {artifactDisplayName(step.artifact)}
+                  </button>
+                )}
+                {step.prUrl && (
+                  <a className="timeline-pr-link" href={step.prUrl} target="_blank" rel="noreferrer">Open PR</a>
+                )}
+              </div>
+            )}
+          </li>
+        ))}
+      </ol>
+      <div className="delivery-warning-panel timeline-safety-note">
+        Safety guarantees shown here are based on recorded run artifacts. The pipeline does not push main,
+        force push, reset, stash, clean, or discard changes in the guarded Git/PR flow.
+      </div>
+    </div>
+  );
+}
+
 function BugfixPlanCard({ run, selectedArtifact, onSelectArtifact }: {
   run: RunDetail | null;
   selectedArtifact?: string | null;
@@ -2394,6 +2798,8 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             </div>
             {planReady && <div className="sprint-mode-banner">Review the plan, then build exactly one selected feature sprint.</div>}
             {plan && <FeatureSprintRoadmap plan={plan} onBuild={planReady ? buildFromPlan : undefined} launching={launching} />}
+            <WhatHappenedCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            <DemoWorkflowTimelineCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <ChangeBoundaryBanner run={run} />
             <SmokeMutationBanner run={run} />
             <BugfixPlanCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />

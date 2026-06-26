@@ -909,6 +909,28 @@ button { cursor: pointer; border: none; outline: none; background: none; font-fa
 .delivery-badge-ok   { color: #166534; background: #dcfce7; }
 .delivery-badge-warn { color: #92400e; background: #fef3c7; }
 .delivery-badge-fail { color: #991b1b; background: #fee2e2; }
+.delivery-badge-plan { color: #1e3a8a; background: #dbeafe; }
+
+.timeline-list { list-style: none; margin: 14px 0 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.timeline-step {
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg3); padding: 10px 12px;
+}
+.timeline-step-header { display: flex; align-items: center; gap: 8px; }
+.timeline-step-title { font-size: 13px; font-weight: 700; color: var(--text); }
+.timeline-step-explanation { font-size: 12px; color: var(--text2); margin-top: 5px; line-height: 1.45; }
+.timeline-step-links { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.timeline-pr-link {
+  font-size: 11.5px; font-weight: 700; color: var(--text); background: var(--bg2);
+  border: 1px solid var(--border); border-radius: 99px; padding: 4px 10px; text-decoration: none;
+}
+.timeline-pr-link:hover { border-color: var(--border2); }
+.timeline-safety-note { margin-top: 14px; }
+
+.what-happened-list {
+  margin: 12px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px;
+  font-size: 13px; line-height: 1.5; color: var(--text);
+}
+.what-happened-list li { padding-left: 2px; }
 
 .delivery-repo-line {
   font-size: 12px; color: var(--text2); margin-top: 12px; padding: 8px 10px;
