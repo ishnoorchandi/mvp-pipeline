@@ -187,6 +187,64 @@ PLAN_ONLY_NOT_RUN_STEPS = [
 ]
 
 
+# ── Build gate — single source of truth for "can Claude Code build run?" ───────
+# Every path that could reach Step 12 (Claude Code build) must consult this
+# instead of re-deriving plan-only/company-repo logic locally. A run is either
+# plan-only (never reaches Claude), blocked (company-protected repo on a
+# protected branch, or company repo without an explicit override), or build
+# (Claude Code is allowed to run). plan-only always wins over company-repo
+# checks, since a plan-only run cannot reach Step 12 either way.
+def resolve_build_gate(
+    *,
+    workflow_mode: str = "existing_app_upgrade",
+    plan_only_requested: bool = False,
+    plan_only_reason: str = "plan-only mode requested",
+    is_company_repo: bool = False,
+    current_branch: str | None = None,
+    allow_company_build: bool = False,
+) -> dict:
+    """Returns a structured build-gate decision. The caller must check
+    `claude_build_allowed` immediately before invoking Claude Code — do not
+    rely on earlier returns alone."""
+    if plan_only_requested:
+        return {
+            "workflow_mode": workflow_mode,
+            "execution_mode": "plan_only",
+            "plan_only": True,
+            "build_allowed": False,
+            "claude_build_allowed": False,
+            "company_repo_build_allowed": False,
+            "reason": plan_only_reason,
+        }
+
+    protected_branch = (current_branch or "") in delivery_mod.PROTECTED_BRANCHES
+    if is_company_repo and (not allow_company_build or protected_branch):
+        reason = (
+            "company-protected repo on protected branch"
+            if protected_branch else
+            "company-protected repo build requires --allow-company-build"
+        )
+        return {
+            "workflow_mode": workflow_mode,
+            "execution_mode": "build_blocked",
+            "plan_only": False,
+            "build_allowed": False,
+            "claude_build_allowed": False,
+            "company_repo_build_allowed": False,
+            "reason": reason,
+        }
+
+    return {
+        "workflow_mode": workflow_mode,
+        "execution_mode": "build",
+        "plan_only": False,
+        "build_allowed": True,
+        "claude_build_allowed": True,
+        "company_repo_build_allowed": True,
+        "reason": "build allowed",
+    }
+
+
 def _set_step(run_id: str, key: str, status: str, **extra):
     """Update one entry in run_state["steps"][key]. status must be one of STEP_STATUSES."""
     assert status in STEP_STATUSES, f"unknown step status: {status}"
@@ -8745,6 +8803,8 @@ def pipeline_existing_app_upgrade(
     run_id: str | None = None,
     selected_feature_sprint: int = 1,
     feature_plan_only: bool = False,
+    plan_only_reason: str = "plan-only mode requested",
+    allow_company_build: bool = False,
     use_deepseek: bool = True,
     git_sync_base_branch: str = "main",
     git_pull_ff_only: bool = False,
@@ -8797,6 +8857,16 @@ def pipeline_existing_app_upgrade(
     print(f"  DeepSeek      : {'enabled' if use_deepseek and DEEPSEEK_API_KEY else 'disabled (no key)'}")
     print(f"  Plan only     : {feature_plan_only}")
     print(f"{'='*60}\n")
+
+    # Provisional gate for printing/early-return purposes — recomputed with the
+    # real company-repo/branch facts right before Step 12, once git_sync_state
+    # is known. plan-only always short-circuits here regardless of repo facts.
+    build_gate = resolve_build_gate(
+        workflow_mode="existing_app_upgrade",
+        plan_only_requested=feature_plan_only,
+        plan_only_reason=plan_only_reason,
+        allow_company_build=allow_company_build,
+    )
 
     if git_pull_ff_only:
         print("▶ Step 0  Git sync / pull-safety check + guarded fast-forward pull...")
@@ -9052,7 +9122,15 @@ def pipeline_existing_app_upgrade(
               f"'{state['feature_branch']}' (see pr_remote_delivery_report.md)")
 
     if feature_plan_only:
-        _update_state(run_id, {"status": "feature_plan_only_done", "current_step": "done"})
+        _update_state(run_id, {
+            "status": "feature_plan_only_done", "current_step": "done",
+            "execution_mode": build_gate["execution_mode"],
+            "plan_only": build_gate["plan_only"],
+            "build_allowed": build_gate["build_allowed"],
+            "claude_build_allowed": build_gate["claude_build_allowed"],
+            "build_gate_reason": build_gate["reason"],
+            "company_repo_build_allowed": build_gate["company_repo_build_allowed"],
+        })
         log_event(run_id, "feature_plan_only_done")
         _maybe_write_pr_delivery_plan()
         print(f"\n{'='*60}")
@@ -9097,6 +9175,50 @@ def pipeline_existing_app_upgrade(
     boundary = generate_selected_feature_change_boundary(
         selected_sprint, plan_json, additive_architecture, build_prompt_text, rdir,
     )
+
+    # Recompute the gate with real company-repo/branch facts (git_sync_state is only
+    # known once Step 0 has run). plan-only already returned above, so this can only
+    # newly block on company-repo protection.
+    build_gate = resolve_build_gate(
+        workflow_mode="existing_app_upgrade",
+        plan_only_requested=feature_plan_only,
+        plan_only_reason=plan_only_reason,
+        is_company_repo=bool(git_sync_state and git_sync_state.get("is_company_repo")),
+        current_branch=(git_sync_state or {}).get("current_branch"),
+        allow_company_build=allow_company_build,
+    )
+
+    # ── Hard Step 12 guard ────────────────────────────────────────────────────
+    # This must be the last check before any Claude Code invocation. Do not
+    # rely on the earlier plan-only/dirty-repo returns alone — if the gate says
+    # no, Claude Code cannot run, full stop.
+    if not build_gate["claude_build_allowed"]:
+        _update_state(run_id, {
+            "status": "build_blocked", "current_step": "blocked",
+            "execution_mode": build_gate["execution_mode"],
+            "plan_only": build_gate["plan_only"],
+            "build_allowed": build_gate["build_allowed"],
+            "claude_build_allowed": build_gate["claude_build_allowed"],
+            "build_gate_reason": build_gate["reason"],
+            "company_repo_build_allowed": build_gate["company_repo_build_allowed"],
+        })
+        log_event(run_id, "build_blocked_company_repo_protection", build_gate["reason"])
+        print(f"\n{'='*60}")
+        print("  ⛔ Claude Code build blocked: company-protected repo on protected branch. "
+              "Use plan-only, a sandbox workspace, or a prepared feature branch.")
+        print(f"  Reason     : {build_gate['reason']}")
+        print(f"  Run folder : {rdir}")
+        print(f"{'='*60}\n")
+        return run_id
+
+    _update_state(run_id, {
+        "execution_mode": build_gate["execution_mode"],
+        "plan_only": build_gate["plan_only"],
+        "build_allowed": build_gate["build_allowed"],
+        "claude_build_allowed": build_gate["claude_build_allowed"],
+        "build_gate_reason": build_gate["reason"],
+        "company_repo_build_allowed": build_gate["company_repo_build_allowed"],
+    })
 
     print(f"\n▶ Step 12  Claude Code — building Sprint {selected_feature_sprint} in place...")
     t0 = time.time()
@@ -11756,7 +11878,15 @@ if __name__ == "__main__":
                          help="(Existing App Upgrade mode) Generate all planning artifacts "
                               "(inventory, health check, summary, requirements, gap analysis, "
                               "additive architecture, feature sprint plan) then stop before sprint "
-                              "selection. Skips Claude Code and DeepSeek entirely.")
+                              "selection. Skips Claude Code and DeepSeek entirely. Equivalent to "
+                              "--plan-only / --sprint-plan-only for Existing App Upgrade mode — "
+                              "all three force plan-only and never reach Claude Code build.")
+    parser.add_argument("--allow-company-build", action="store_true",
+                         help="(Existing App Upgrade mode) Required to let Claude Code build "
+                              "(Step 12) run against a company-protected repo. Even with this "
+                              "flag, building directly on a protected branch (main/master/develop/"
+                              "production) is always blocked — use a sandbox workspace or a "
+                              "prepared feature branch instead.")
     parser.add_argument("--bugfix-mode", action="store_true",
                          help="Generate bugfix planning artifacts for --existing-app from a bug report. "
                               "Planning only: no code changes, commits, pushes, or PRs.")
@@ -12305,12 +12435,28 @@ if __name__ == "__main__":
                 else Path(args.bug_report).read_text(encoding="utf-8").strip() if args.bug_report
                 else f"Backend Safety — {args.existing_app}"
             )
+            # --plan-only, --sprint-plan-only, and --feature-plan-only are all
+            # equivalent aliases for plan-only in Existing App Upgrade mode — any
+            # one of them must force plan-only and skip Claude Code build entirely.
+            effective_feature_plan_only = bool(
+                args.plan_only or args.sprint_plan_only or args.feature_plan_only
+            )
+            if args.plan_only:
+                plan_only_reason = "plan-only mode requested"
+            elif args.sprint_plan_only:
+                plan_only_reason = "sprint-plan-only mode requested"
+            elif args.feature_plan_only:
+                plan_only_reason = "feature-plan-only mode requested"
+            else:
+                plan_only_reason = "plan-only mode requested"
             upgrade_run_id = pipeline_existing_app_upgrade(
                 args.existing_app,
                 feature_request_text,
                 run_id=run_id_arg,
                 selected_feature_sprint=args.selected_feature_sprint,
-                feature_plan_only=args.feature_plan_only,
+                feature_plan_only=effective_feature_plan_only,
+                plan_only_reason=plan_only_reason,
+                allow_company_build=args.allow_company_build,
                 use_deepseek=not args.no_deepseek,
                 git_sync_base_branch=args.base_branch,
                 git_pull_ff_only=args.git_pull_ff_only,
@@ -12339,7 +12485,7 @@ if __name__ == "__main__":
                 backend_test_command=args.backend_test_command,
                 backend_start_command=args.backend_start_command,
             )
-            if args.local_git_delivery and not args.feature_plan_only:
+            if args.local_git_delivery and not effective_feature_plan_only:
                 upgrade_state = load_state(upgrade_run_id)
                 if upgrade_state.get("local_delivery_blocked_by_boundary"):
                     print(f"\n{'='*60}")
@@ -12389,3 +12535,14 @@ if __name__ == "__main__":
     except ContinuationError as e:
         print(f"\n  ❌  {e}\n")
         sys.exit(1)
+    except KeyboardInterrupt:
+        if run_id_arg:
+            try:
+                state = load_state(run_id_arg)
+                if state and state.get("status") not in ("done", "failed", "interrupted", "cancelled"):
+                    _update_state(run_id_arg, {"status": "interrupted", "current_step": "interrupted"})
+            except Exception:
+                pass
+        print("\n  ⏹  Interrupted by user — run marked 'interrupted' where possible. "
+              "No commit or push was performed by this exit.")
+        sys.exit(130)

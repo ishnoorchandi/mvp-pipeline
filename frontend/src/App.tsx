@@ -91,6 +91,7 @@ const STEP_MAP: Record<string, string> = {
 const TERMINAL = new Set([
   "done", "approved", "max_iterations_reached",
   "blocked_consistency_violation", "plan_only_done", "sprint_plan_only_done",
+  "interrupted", "cancelled", "build_blocked", "failed",
 ]);
 
 // Clean display names for sprint-mode artifacts (requirement: artifact sidebar should
@@ -757,6 +758,15 @@ function NowBanner({ run, elapsed, sprintModeActive, selectedSprintNum }: {
     } else if (run.status === "sprint_plan_only_done") {
       title = "Sprint Planning Complete";
       sub = "Claude Code, DeepSeek, and Governance were not run.";
+    } else if (run.status === "interrupted" || run.status === "cancelled") {
+      title = "Run interrupted before completion";
+      sub = "This run did not finish. Do not assume any build, commit, or push completed — check the artifacts and pipeline log.";
+    } else if (run.status === "build_blocked") {
+      title = "Claude Code build blocked";
+      sub = run.build_gate_reason || "The build gate blocked Claude Code before Step 12. No code was changed.";
+    } else if (run.status === "failed") {
+      title = "Run failed";
+      sub = "The pipeline exited with an error before completion — see pipeline.log.";
     } else if (sprintModeActive) {
       title = "Sprint Build Complete";
       sub = `Sprint ${selectedSprintNum} was built. Future sprints are planned but not built.`;
@@ -1189,6 +1199,7 @@ interface FeatureSprintEntry {
   must_not_modify?: string[];
   overlap_warnings?: string[];
   overlap_matched_files?: string[];
+  independently_demoable?: boolean;
 }
 
 // A sprint in either of these statuses must never expose a normal, active "Build" button —
@@ -1268,8 +1279,11 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "feature_completion_report.md", label: "Feature Completion Report" },
 ];
 
-function FeatureSprintRoadmap({ plan, onBuild, launching }: {
+function FeatureSprintRoadmap({ plan, onBuild, launching, hasPlanArtifact, selectedArtifact, onSelectArtifact }: {
   plan: FeatureSprintPlan; onBuild?: (n: number) => void; launching?: number | null;
+  hasPlanArtifact?: boolean;
+  selectedArtifact?: string | null;
+  onSelectArtifact?: (artifact: string) => void;
 }) {
   const selected = plan.selected_feature_sprint;
   const sprints = [...(plan.sprints ?? [])].sort((a, b) => a.sprint_number - b.sprint_number);
@@ -1282,6 +1296,9 @@ function FeatureSprintRoadmap({ plan, onBuild, launching }: {
       {sprints.map(s => {
         const status = s.status ?? "ready";
         const hasOverlap = OVERLAP_BLOCKING_STATUSES.has(status) || (s.overlap_warnings?.length ?? 0) > 0;
+        const needsDecomposition = !hasOverlap && s.independently_demoable === false;
+        const matchedFiles = (s.overlap_matched_files ?? []).slice(0, 3);
+        const matchedFilesMore = (s.overlap_matched_files?.length ?? 0) - matchedFiles.length;
         return (
           <div
             key={s.sprint_number}
@@ -1291,6 +1308,7 @@ function FeatureSprintRoadmap({ plan, onBuild, launching }: {
               Sprint {s.sprint_number} — {s.title}
               {s.sprint_number === selected && <span className="upgrade-sprint-pill">SELECTED</span>}
               {hasOverlap && <span className="upgrade-sprint-pill upgrade-sprint-pill-warning">OVERLAP</span>}
+              {needsDecomposition && <span className="upgrade-sprint-pill upgrade-sprint-pill-neutral">NEEDS DECOMPOSITION</span>}
             </div>
             <div className="upgrade-sprint-goal">{s.goal}</div>
             <div className="upgrade-sprint-meta">
@@ -1298,13 +1316,18 @@ function FeatureSprintRoadmap({ plan, onBuild, launching }: {
             </div>
             {hasOverlap && (
               <div className="upgrade-sprint-overlap-warning">
-                ⚠️ This feature appears partially/already implemented. Extend matched existing files
-                instead of creating duplicate files.
-                {(s.overlap_matched_files?.length ?? 0) > 0 && (
+                Overlap detected — extend existing files instead of duplicating.
+                {matchedFiles.length > 0 && (
                   <ul>
-                    {s.overlap_matched_files!.map(f => <li key={f}>{f}</li>)}
+                    {matchedFiles.map(f => <li key={f}><code>{f}</code></li>)}
+                    {matchedFilesMore > 0 && <li>+{matchedFilesMore} more file(s) — see full plan</li>}
                   </ul>
                 )}
+              </div>
+            )}
+            {needsDecomposition && (
+              <div className="upgrade-sprint-decomposition-note">
+                This area is too broad for one build step and should be refined before building.
               </div>
             )}
             {onBuild && (
@@ -1312,11 +1335,23 @@ function FeatureSprintRoadmap({ plan, onBuild, launching }: {
                 <button className="submit-btn submit-btn-disabled" disabled title="This sprint needs roadmap revision before it can be safely built.">
                   Needs roadmap revision before build
                 </button>
+              ) : needsDecomposition ? (
+                <button className="submit-btn submit-btn-disabled" disabled title="This sprint should be broken down into smaller sprints before it can be built.">
+                  Needs decomposition before build
+                </button>
               ) : (
                 <button className="submit-btn" onClick={() => onBuild(s.sprint_number)} disabled={launching !== null}>
                   {launching === s.sprint_number ? "Starting…" : `Build Feature Sprint ${s.sprint_number}`}
                 </button>
               )
+            )}
+            {hasPlanArtifact && onSelectArtifact && (
+              <button
+                className={`upgrade-sprint-view-plan ${selectedArtifact === "feature_sprint_plan.md" ? "active" : ""}`}
+                onClick={() => onSelectArtifact("feature_sprint_plan.md")}
+              >
+                View full plan
+              </button>
             )}
           </div>
         );
@@ -1449,6 +1484,88 @@ function SmokeMutationBanner({ run }: { run: RunDetail | null }) {
   );
 }
 
+// Shared "is this run mainly a planning/scan demo, or a full build?" check — drives
+// which workflow rows, summary lines, and status wording several cards below show.
+// A run counts as planning-focused once it has a sprint roadmap but no Claude Code
+// build output yet (or was explicitly created in feature-plan-only mode).
+function isPlanningFocusedRun(run: RunDetail | null): boolean {
+  if (!run) return false;
+  const artifacts = run.artifacts ?? [];
+  if ((run.status ?? "").includes("feature_plan_only")) return true;
+  if (artifacts.includes("feature_sprint_plan.md") && !artifacts.includes("claude_build_output.txt")) return true;
+  return false;
+}
+
+// Planning Progress — live, professional progress card for the scan → requirements →
+// overlap → gap matrix → architecture → roadmap → scope story. Purely derived from
+// artifact presence; never infers anything backend-side.
+const PLANNING_PROGRESS_STEPS: { key: string; label: string; files: string[] }[] = [
+  { key: "requirements", label: "Reading requirements", files: ["feature_request.md", "new_feature_requirements.md"] },
+  { key: "scan", label: "Scanning existing app", files: ["existing_app_inventory.md"] },
+  { key: "overlap", label: "Checking existing feature overlap", files: ["existing_feature_overlap_check.md"] },
+  { key: "gap_matrix", label: "Building gap matrix", files: ["feature_gap_matrix.md"] },
+  { key: "architecture", label: "Writing additive architecture", files: ["additive_architecture.md"] },
+  { key: "roadmap", label: "Generating sprint roadmap", files: ["feature_sprint_plan.md"] },
+  { key: "scope", label: "Preparing selected sprint scope", files: ["selected_feature_sprint_scope.md"] },
+];
+
+const PLANNING_QUICK_LINKS: { file: string; label: string }[] = [
+  { file: "existing_app_inventory.md", label: "Existing App Inventory" },
+  { file: "existing_feature_overlap_check.md", label: "Overlap Check" },
+  { file: "feature_gap_matrix.md", label: "Gap Matrix" },
+  { file: "additive_architecture.md", label: "Additive Architecture" },
+  { file: "feature_sprint_plan.md", label: "Sprint Plan" },
+  { file: "selected_feature_sprint_scope.md", label: "Selected Sprint Scope" },
+];
+
+function PlanningProgressCard({ run, selectedArtifact, onSelectArtifact }: {
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
+  const artifacts = run?.artifacts ?? [];
+  const quickLinks = PLANNING_QUICK_LINKS.filter(l => artifacts.includes(l.file));
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Planning Progress</div>
+          <div className="delivery-card-sub">
+            Scanning the app and turning requirements into an additive sprint roadmap.
+          </div>
+        </div>
+      </div>
+      <ul className="planning-progress-list">
+        {PLANNING_PROGRESS_STEPS.map(step => {
+          const complete = step.files.some(f => artifacts.includes(f));
+          return (
+            <li key={step.key} className={`planning-progress-item ${complete ? "complete" : "pending"}`}>
+              <span className="planning-progress-icon">{complete ? "✓" : "○"}</span>
+              <span className="planning-progress-label">{step.label}</span>
+            </li>
+          );
+        })}
+      </ul>
+      {quickLinks.length > 0 && (
+        <div className="delivery-artifacts">
+          <div className="delivery-artifacts-label">Quick links</div>
+          <div className="delivery-artifact-tabs">
+            {quickLinks.map(l => (
+              <button
+                key={l.file}
+                className={`artifact-tab ${selectedArtifact === l.file ? "active" : ""}`}
+                onClick={() => onSelectArtifact(l.file)}
+              >
+                {l.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // What Happened? — plain-English executive summary for non-technical demo viewers.
 // Built purely from run_state.json fields already used by the other cards; mentions
 // only steps that actually ran and never performs an action itself.
@@ -1459,7 +1576,35 @@ const WHAT_HAPPENED_QUICK_LINKS: { file: string; label: string }[] = [
   { file: "pr_remote_delivery_report.md", label: "PR Remote Delivery Report" },
 ];
 
+// Planning-focused runs get their own summary so the first (and often only) line
+// is never something like "pull was blocked" — the main outcome here is the sprint
+// roadmap, not a Git operation.
+function buildPlanningWhatHappenedSummary(run: RunDetail | null): { bullets: string[]; gitOrPrRan: boolean } {
+  const artifacts = run?.artifacts ?? [];
+  const bullets: string[] = [];
+
+  if (artifacts.includes("existing_app_inventory.md")) {
+    bullets.push("The pipeline scanned the existing app structure.");
+  }
+  if (artifacts.includes("feature_sprint_plan.md")) {
+    bullets.push("The pipeline analyzed the requirements and generated an additive sprint roadmap.");
+  }
+  if (artifacts.includes("existing_feature_overlap_check.md")) {
+    bullets.push("The pipeline checked for overlap so existing functionality is extended instead of duplicated.");
+  }
+  if (!artifacts.includes("claude_build_output.txt")) {
+    bullets.push("No Claude Code build was run for this planning demo.");
+  }
+  if (!run?.pr_remote_decision) {
+    bullets.push("No company repository push was attempted.");
+  }
+
+  return { bullets, gitOrPrRan: false };
+}
+
 function buildWhatHappenedSummary(run: RunDetail | null): { bullets: string[]; gitOrPrRan: boolean } {
+  if (isPlanningFocusedRun(run)) return buildPlanningWhatHappenedSummary(run);
+
   const bullets: string[] = [];
   let gitOrPrRan = false;
 
@@ -1595,6 +1740,107 @@ function WhatHappenedCard({ run, selectedArtifact, onSelectArtifact }: {
         </>
       ) : (
         <div className="delivery-repo-line">This run has not completed enough workflow steps to summarize yet.</div>
+      )}
+    </div>
+  );
+}
+
+// Review & Commit — simplified, demo-friendly restatement of the Delivery & Git
+// Safety card below. Purely presentational: the "Commit to Repository" button is
+// always disabled and never calls any API — it exists only to narrate the real
+// guarded workflow (feature branch + allowed-file commit, then a push/PR only after
+// explicit approval), which still happens exclusively in the detailed DeliveryCard
+// further down the page.
+const REVIEW_COMMIT_HANDOFF_TARGET_PATH = "/Users/ishnoorchandi/github-delivery-test";
+const REVIEW_COMMIT_QUICK_LINKS: { file: string; label: string }[] = [
+  { file: "feature_completion_report.md", label: "Feature Completion Report" },
+  { file: "changed_files_report.md", label: "Changed Files Report" },
+  { file: "selected_feature_change_boundary.md", label: "Change Boundary" },
+  { file: "smoke_mutation_report.md", label: "Smoke Mutation Report" },
+];
+
+function useRegressionStatus(runId: string, run: RunDetail | null): string | null {
+  const [status, setStatus] = useState<string | null>(null);
+  const hasArtifact = (run?.artifacts ?? []).includes("regression_check.md");
+  useEffect(() => {
+    if (!hasArtifact) { setStatus(null); return; }
+    getArtifact(runId, "regression_check.md")
+      .then(a => {
+        const m = a.content.match(/\*\*Status:\*\*\s*(\w+)/);
+        setStatus(m ? m[1] : null);
+      })
+      .catch(() => setStatus(null));
+  }, [runId, hasArtifact]);
+  return status;
+}
+
+function ReviewCommitCard({ runId, run, selectedArtifact, onSelectArtifact }: {
+  runId: string;
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
+  const regressionStatus = useRegressionStatus(runId, run);
+  const checksPassed =
+    regressionStatus === "PASS" &&
+    run?.change_boundary_status === "PASS" &&
+    run?.smoke_mutation_status === "PASS";
+  const planOnly = isPlanningFocusedRun(run);
+  const quickLinks = REVIEW_COMMIT_QUICK_LINKS.filter(l => (run?.artifacts ?? []).includes(l.file));
+
+  const statusLine = checksPassed
+    ? "Build checks passed. Ready for review."
+    : planOnly
+    ? "Plan generated. Review the sprint roadmap before building."
+    : "Run artifacts are still being prepared or were not produced for this run.";
+
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Review &amp; Commit</div>
+          <div className="delivery-card-sub">
+            Review the generated plan and prepare a safe repository handoff.
+          </div>
+        </div>
+      </div>
+
+      <div className={`delivery-result-panel ${checksPassed ? "delivery-result-ok" : "delivery-result-neutral"}`}>
+        {statusLine}
+      </div>
+
+      <div className="delivery-action">
+        <button
+          className="submit-btn"
+          disabled
+          title="This target is separate from the protected company repository. The company repo is never pushed unless explicitly approved."
+        >
+          Commit to Repository
+        </button>
+        <div className="delivery-action-help">
+          Handoff target: <code>{REVIEW_COMMIT_HANDOFF_TARGET_PATH}</code>
+        </div>
+        <div className="delivery-action-help">
+          This target is separate from the protected company repository. The company repo is never
+          pushed unless explicitly approved.
+        </div>
+      </div>
+
+      {quickLinks.length > 0 && (
+        <div className="delivery-artifacts">
+          <div className="delivery-artifacts-label">Quick links</div>
+          <div className="delivery-artifact-tabs">
+            {quickLinks.map(l => (
+              <button
+                key={l.file}
+                className={`artifact-tab ${selectedArtifact === l.file ? "active" : ""}`}
+                onClick={() => onSelectArtifact(l.file)}
+              >
+                {l.label}
+              </button>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );
@@ -1803,19 +2049,80 @@ function buildDemoTimeline(run: RunDetail | null): TimelineStep[] {
   return [repoSync, safePull, bugfixPlan, backendInventory, backendSafety, prPlan, branchPrep, remotePr];
 }
 
+// Planning-focused runs get a 6-row workflow (scan → roadmap → handoff) instead of
+// the full Git/PR row set — PR Plan / Branch Prep / Remote PR Delivery never ran for
+// a planning demo, so showing them as NOT RUN just makes the run look incomplete.
+function buildPlanningTimeline(run: RunDetail | null): TimelineStep[] {
+  const artifacts = run?.artifacts ?? [];
+  const firstArtifact = (list?: string[]) => (list ?? []).find(f => artifacts.includes(f));
+
+  const repoStatus: TimelineStep = (() => {
+    const status = run?.git_sync_status;
+    if (run?.git_sync_blocked) {
+      return { key: "repo_status", title: "Repo Status", status: "BLOCKED",
+        explanation: run?.git_sync_summary ?? "Repo sync is blocked — review the Git Sync details before continuing.",
+        artifact: firstArtifact(run?.git_sync_artifacts) };
+    }
+    if (status === "up_to_date" || status === "ahead") {
+      return { key: "repo_status", title: "Repo Status", status: "PASS",
+        explanation: run?.git_sync_summary ?? "Repo is up to date with the base branch.",
+        artifact: firstArtifact(run?.git_sync_artifacts) };
+    }
+    if (status === "behind" || status === "diverged") {
+      return { key: "repo_status", title: "Repo Status", status: "WARN",
+        explanation: run?.git_sync_summary ?? "Local repo is behind the base branch.",
+        artifact: firstArtifact(run?.git_sync_artifacts) };
+    }
+    return { key: "repo_status", title: "Repo Status", status: "NOT RUN",
+      explanation: "Repo status has not been checked for this run yet." };
+  })();
+
+  const appScan: TimelineStep = artifacts.includes("existing_app_inventory.md")
+    ? { key: "app_scan", title: "App Scan", status: "PASS",
+        explanation: "The pipeline scanned the existing app structure.", artifact: "existing_app_inventory.md" }
+    : { key: "app_scan", title: "App Scan", status: "NOT RUN", explanation: "Existing app scan has not been run yet." };
+
+  const overlapCheck: TimelineStep = artifacts.includes("existing_feature_overlap_check.md")
+    ? { key: "overlap_check", title: "Overlap Check", status: "PASS",
+        explanation: "Checked for overlap so existing functionality is extended instead of duplicated.",
+        artifact: "existing_feature_overlap_check.md" }
+    : { key: "overlap_check", title: "Overlap Check", status: "NOT RUN", explanation: "Overlap check has not been run yet." };
+
+  const gapAnalysis: TimelineStep = (() => {
+    const file = firstArtifact(["feature_gap_matrix.md", "change_gap_analysis.md"]);
+    return file
+      ? { key: "gap_analysis", title: "Gap Analysis", status: "PASS",
+          explanation: "Built a gap matrix comparing requirements against the existing app.", artifact: file }
+      : { key: "gap_analysis", title: "Gap Analysis", status: "NOT RUN", explanation: "Gap analysis has not been run yet." };
+  })();
+
+  const sprintRoadmap: TimelineStep = artifacts.includes("feature_sprint_plan.md")
+    ? { key: "sprint_roadmap", title: "Sprint Roadmap", status: "PASS",
+        explanation: "Generated an additive sprint roadmap from the requirements.", artifact: "feature_sprint_plan.md" }
+    : { key: "sprint_roadmap", title: "Sprint Roadmap", status: "NOT RUN", explanation: "Sprint roadmap has not been generated yet." };
+
+  const reviewHandoff: TimelineStep = artifacts.includes("selected_feature_sprint_scope.md")
+    ? { key: "review_handoff", title: "Review Handoff", status: "PLAN ONLY",
+        explanation: "Selected sprint scope is ready for review before building.", artifact: "selected_feature_sprint_scope.md" }
+    : { key: "review_handoff", title: "Review Handoff", status: "NOT RUN", explanation: "No sprint has been selected for handoff yet." };
+
+  return [repoStatus, appScan, overlapCheck, gapAnalysis, sprintRoadmap, reviewHandoff];
+}
+
 function DemoWorkflowTimelineCard({ run, selectedArtifact, onSelectArtifact }: {
   run: RunDetail | null;
   selectedArtifact?: string | null;
   onSelectArtifact: (artifact: string) => void;
 }) {
-  const steps = buildDemoTimeline(run);
+  const planOnly = isPlanningFocusedRun(run);
+  const steps = planOnly ? buildPlanningTimeline(run) : buildDemoTimeline(run);
   return (
     <div className="delivery-card">
       <div className="delivery-card-header">
         <div>
-          <div className="delivery-card-title">Demo Workflow Timeline</div>
+          <div className="delivery-card-title">Safe Development Workflow</div>
           <div className="delivery-card-sub">
-            Follow the safe development path from repo sync to pull request.
+            Follow the guarded path from repo sync to pull request.
           </div>
         </div>
       </div>
@@ -2080,7 +2387,28 @@ function BackendSafetyCard({ runId, run, selectedArtifact, onSelectArtifact }: {
 // from git_sync_state.json (written by delivery.run_git_sync_check); falls back to the
 // summary fields on run_state.json if the artifact hasn't loaded yet. Never offers a
 // pull/update action here — this is fetch + status only, never push/reset/stash/pull.
-function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
+// Collapses a long/dependency-heavy block-reason list into one calm sentence instead
+// of dumping potentially thousands of node_modules paths inline. Full detail always
+// stays available via the Git Sync Report artifact link.
+function summarizeBlockReasons(reasons: string[]): { collapsed: boolean; text?: string; examples: string[] } {
+  const hasNodeModules = reasons.some(r => r.toLowerCase().includes("node_modules"));
+  if (hasNodeModules || reasons.length > 10) {
+    return {
+      collapsed: true,
+      text: "Dependency folder changes detected. The pipeline will not pull, commit, or push while "
+        + "dependency files are dirty. See Git Sync Report for full details.",
+      examples: [],
+    };
+  }
+  return { collapsed: false, examples: reasons.slice(0, 3) };
+}
+
+function RepositoryStatusCard({ runId, run, selectedArtifact, onSelectArtifact }: {
+  runId: string;
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
   const [state, setState] = useState<GitSyncState | null>(null);
   const [pull, setPull] = useState<GitPullState | null>(null);
   const hasArtifact = (run?.artifacts ?? []).includes("git_sync_state.json");
@@ -2098,9 +2426,6 @@ function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
 
   if (!run?.git_sync_status && !state) return null;
 
-  // Pull action: not requested / blocked / succeeded / failed / no update needed.
-  // NO_OP (already up to date) is a safe success state, not a failure — it must never
-  // render with the "blocked"/fail styling.
   const pullDecision = pull?.decision ?? run?.git_pull_status ?? null;
   const pullAction: "not requested" | "blocked" | "succeeded" | "failed" | "no update needed" =
     pullDecision === "PULLED" ? "succeeded"
@@ -2108,22 +2433,44 @@ function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
     : pullDecision === "FAILED" ? "failed"
     : pullDecision === "BLOCKED" ? "blocked"
     : "not requested";
-  const pullBadgeClass =
-    pullAction === "succeeded" || pullAction === "no update needed" ? "ok"
-    : pullAction === "blocked" || pullAction === "failed" ? "fail"
-    : "idle";
 
   const status = state?.sync_status ?? run?.git_sync_status ?? "unknown";
   const blocked = state?.pull_blocked ?? !!run?.git_sync_blocked;
-  const buildProceed = state?.build_should_proceed
-    ?? (run?.git_sync_blocked ? "no" : (status === "behind" || status === "diverged") ? "warn" : "yes");
+  const baseBranch = state?.base_branch ?? pull?.base_branch ?? "main";
   const badgeClass = blocked ? "fail" : (status === "behind" || status === "diverged") ? "warn" : "ok";
+  const isCompanyRepo = !!(state?.is_company_repo || pull?.is_company_repo);
+
+  const remoteStatusText =
+    status === "up_to_date" ? `Up to date with origin/${baseBranch}`
+    : status === "ahead" ? `Ahead of origin/${baseBranch}`
+    : status === "behind" ? `Behind origin/${baseBranch}`
+    : status === "diverged" ? `Diverged from origin/${baseBranch}`
+    : "Not checked yet";
+
+  const blockReasons = blocked ? (state?.block_reasons ?? pull?.block_reasons ?? []) : [];
+  const blockedSummary = summarizeBlockReasons(blockReasons);
+  const pullStatusText =
+    pullAction === "not requested" ? "No pull needed for this planning run"
+    : pullAction === "no update needed" ? "No pull needed — already up to date"
+    : pullAction === "succeeded" ? "Pulled safely (fast-forward only)"
+    : pullAction === "failed" ? "Pull attempted but failed — see Git Sync Report"
+    : blockedSummary.collapsed ? "Pull blocked — local dependency changes detected"
+    : "Pull blocked — see details below";
+
+  const companyRepoText = isCompanyRepo
+    ? "Protected — no automatic push or destructive Git action"
+    : "Not a protected company repository";
+
+  const quickLinks = [
+    { file: "git_sync_report.md", label: "Git Sync Report" },
+    { file: "git_sync_state.json", label: "Git Sync State JSON" },
+  ].filter(l => (run?.artifacts ?? []).includes(l.file));
 
   return (
     <div className="delivery-card">
       <div className="delivery-card-header">
         <div>
-          <div className="delivery-card-title">Git Sync &amp; Pull Safety</div>
+          <div className="delivery-card-title">Repository Status</div>
           <div className="delivery-card-sub">
             {run?.git_sync_summary ?? "Read-only fetch + status check against the target repo's base branch."}
           </div>
@@ -2131,86 +2478,54 @@ function GitSyncCard({ runId, run }: { runId: string; run: RunDetail | null }) {
         <span className={`delivery-badge delivery-badge-${badgeClass}`}>{status.replace("_", " ")}</span>
       </div>
 
-      <div className="delivery-repo-line">
-        Current branch: <code>{state?.current_branch ?? "(unknown)"}</code>
-        {" "}· Base branch: <code>{state?.base_branch ?? "main"}</code>
-      </div>
-      <div className="delivery-repo-line">
-        Ahead: <code>{state?.commits_ahead ?? 0}</code> · Behind: <code>{state?.commits_behind ?? 0}</code>
-        {" "}· Safe to pull (fast-forward): <code>{String(state?.fast_forward_safe ?? false)}</code>
-        {" "}· Build should proceed: <code>{buildProceed}</code>
+      <div className="repo-status-rows">
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Current branch</span>
+          <code>{state?.current_branch ?? "(unknown)"}</code>
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Base branch</span>
+          <code>{baseBranch}</code>
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Remote status</span>
+          <span>{remoteStatusText}</span>
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Pull status</span>
+          <span>{pullStatusText}</span>
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Company repository</span>
+          <span>{companyRepoText}</span>
+        </div>
       </div>
 
-      {state?.is_company_repo && (
+      {blocked && blockedSummary.collapsed && (
+        <div className="delivery-warning-panel">{blockedSummary.text}</div>
+      )}
+      {blocked && !blockedSummary.collapsed && blockedSummary.examples.length > 0 && (
         <div className="delivery-warning-panel">
-          Company repo detected. Fetch/status checks are allowed, but pull/update must be explicitly
-          approved. The pipeline will not discard, reset, stash, or push changes automatically.
-        </div>
-      )}
-
-      {blocked && (state?.block_reasons?.length ?? 0) > 0 && (
-        <div className="delivery-warning-panel delivery-warning-panel-severe">
           <strong>Pull blocked.</strong>
-          <ul>{state!.block_reasons.map(r => <li key={r}>{r}</li>)}</ul>
+          <ul>{blockedSummary.examples.map(r => <li key={r}>{r}</li>)}</ul>
         </div>
       )}
 
-      <div className="delivery-command-preview">
-        <div className="delivery-command-preview-label">
-          {pullAction === "not requested" ? "Recommended command (run manually if you choose)"
-            : pullAction === "no update needed" ? "Pull command (not run — nothing to pull)"
-            : "Pull command run"}
+      {quickLinks.length > 0 && (
+        <div className="delivery-artifacts">
+          <div className="delivery-artifacts-label">Quick links</div>
+          <div className="delivery-artifact-tabs">
+            {quickLinks.map(l => (
+              <button
+                key={l.file}
+                className={`artifact-tab ${selectedArtifact === l.file ? "active" : ""}`}
+                onClick={() => onSelectArtifact(l.file)}
+              >
+                {l.label}
+              </button>
+            ))}
+          </div>
         </div>
-        <pre>{pull?.pull_command ?? state?.recommended_command ?? "No fast-forward pull is recommended right now."}</pre>
-      </div>
-
-      <div className="delivery-card-header">
-        <div className="delivery-card-title" style={{ fontSize: "0.95em" }}>Pull action</div>
-        <span className={`delivery-badge delivery-badge-${pullBadgeClass}`}>{pullAction}</span>
-      </div>
-
-      {pullAction === "not requested" ? (
-        <div className="delivery-repo-line">
-          No pull was requested for this run. Pass <code>--git-pull-ff-only</code> to run the guarded
-          fast-forward pull shown above.
-        </div>
-      ) : pullAction === "no update needed" ? (
-        <>
-          <div className="delivery-repo-line">
-            Local repo now up to date: <code>yes</code> — the repo was already up to date with{" "}
-            <code>origin/{pull?.base_branch ?? "main"}</code>, so no pull command was run.
-          </div>
-          <div className="delivery-repo-line">
-            No push/reset/stash performed: <code>true</code>
-          </div>
-        </>
-      ) : (
-        <>
-          <div className="delivery-repo-line">
-            Before status: <code>{pull?.now_up_to_date === false ? "not up to date" : "(see git_sync_before_pull.json)"}</code>
-            {" "}· After status: <code>{pull ? (pull.now_up_to_date ? "up to date" : "not up to date") : "(unknown)"}</code>
-          </div>
-          <div className="delivery-repo-line">
-            Local repo now up to date: <code>{String(pull?.now_up_to_date ?? false)}</code>
-          </div>
-          {pullAction === "blocked" && (pull?.block_reasons?.length ?? 0) > 0 && (
-            <div className="delivery-warning-panel delivery-warning-panel-severe">
-              <strong>Pull blocked.</strong>
-              <ul>{pull!.block_reasons.map(r => <li key={r}>{r}</li>)}</ul>
-            </div>
-          )}
-          {pullAction === "failed" && (
-            <div className="delivery-warning-panel delivery-warning-panel-severe">
-              <strong>Pull failed.</strong> Exit code {pull?.pull_exit_code}. See git_pull_report.md.
-            </div>
-          )}
-          <div className="delivery-repo-line">
-            No push/reset/stash performed: <code>{String(
-              (pull?.no_push_performed ?? true) && (pull?.no_reset_performed ?? true) && (pull?.no_stash_performed ?? true)
-            )}</code>
-            {pull?.is_company_repo && " — pull-only local update, never published or merged."}
-          </div>
-        </>
       )}
     </div>
   );
@@ -2769,6 +3084,10 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
   const availablePanels = UPGRADE_ARTIFACT_PANELS.filter(p => artifacts.includes(p.file));
   const planReady = run?.status === "feature_plan_only_done";
   const buildFromPlan = async (n: number) => {
+    const confirmed = window.confirm(
+      "This will run Claude Code and may modify the target working tree. Continue?"
+    );
+    if (!confirmed) return;
     setLaunching(n);
     try {
       const created = await createContinuationRun({
@@ -2797,17 +3116,31 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
               </span>
             </div>
             {planReady && <div className="sprint-mode-banner">Review the plan, then build exactly one selected feature sprint.</div>}
-            {plan && <FeatureSprintRoadmap plan={plan} onBuild={planReady ? buildFromPlan : undefined} launching={launching} />}
+            <PlanningProgressCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            {plan && (
+              <FeatureSprintRoadmap
+                plan={plan}
+                onBuild={planReady ? buildFromPlan : undefined}
+                launching={launching}
+                hasPlanArtifact={artifacts.includes("feature_sprint_plan.md")}
+                selectedArtifact={selected}
+                onSelectArtifact={setSelected}
+              />
+            )}
             <WhatHappenedCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <DemoWorkflowTimelineCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            <ReviewCommitCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <ChangeBoundaryBanner run={run} />
             <SmokeMutationBanner run={run} />
             <BugfixPlanCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <BackendInventoryCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <BackendSafetyCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
-            <GitSyncCard runId={runId} run={run} />
+            <RepositoryStatusCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <PrPlanCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
-            <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            <details className="advanced-git-details">
+              <summary>Show advanced Git safety details</summary>
+              <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            </details>
           </div>
         </div>
         <div className="right-panel">
@@ -3366,6 +3699,9 @@ function UpgradePanel({ onCreated, onCancel }: { onCreated: (id: string) => void
   const canSubmit = existingApp.trim().length > 0 && featureRequest.trim().length > 0;
 
   const submit = async () => {
+    if (!planOnly && !window.confirm(
+      "This will run Claude Code and may modify the target working tree. Continue?"
+    )) return;
     setLoading(true); setError(null);
     try {
       const data = await createUpgradeRun({
@@ -3439,6 +3775,9 @@ function ContinuationPanel({ onCreated, onCancel }: { onCreated: (id: string) =>
   const canSubmit = sourceRun.trim().length > 0;
 
   const submit = async () => {
+    if (!planOnly && !window.confirm(
+      "This will run Claude Code and may modify the target working tree. Continue?"
+    )) return;
     setLoading(true); setError(null);
     try {
       const data = await createContinuationRun({
@@ -3588,6 +3927,9 @@ function InputView({ mode, onBack, onCreated }: { mode: EntryMode; onBack: () =>
   const card = ENTRY_CARDS.find(c => c.mode === mode)!;
 
   const submit = async () => {
+    if (runMode === "full" && !window.confirm(
+      "This will run Claude Code and may modify the target working tree. Continue?"
+    )) return;
     setLoading(true); setError(null);
     try {
       const base =

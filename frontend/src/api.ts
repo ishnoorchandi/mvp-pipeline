@@ -60,6 +60,14 @@ export interface RunDetail {
   git_sync_blocked?: boolean;
   git_sync_summary?: string;
   git_sync_artifacts?: string[];
+  // Build gate — single source of truth for whether Claude Code build (Step 12) ran,
+  // was skipped (plan-only), or was blocked (e.g. company-protected repo on a protected
+  // branch). Written by resolve_build_gate() in pipeline_mvp_builder.py.
+  execution_mode?: "plan_only" | "build" | "build_blocked";
+  build_allowed?: boolean;
+  claude_build_allowed?: boolean;
+  build_gate_reason?: string;
+  company_repo_build_allowed?: boolean;
   // Git Pull (fast-forward only) — set when --git-pull-ff-only was used. Only ever
   // reflects a guarded `git pull --ff-only origin <base_branch>`; never push/reset/stash.
   git_pull_status?: "BLOCKED" | "PULLED" | "FAILED" | "NO_OP" | null;

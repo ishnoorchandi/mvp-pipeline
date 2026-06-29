@@ -158,6 +158,7 @@ def run_pipeline_upgrade_async(
     no_deepseek: bool,
     bugfix_mode: bool = False,
     bug_title: str = "",
+    allow_company_build: bool = False,
 ):
     """Existing App Upgrade mode — maps to --existing-app/--feature-request/--upgrade-mode."""
     def _run():
@@ -173,6 +174,8 @@ def run_pipeline_upgrade_async(
             cmd += ["--feature-sprint-plan"]
         if feature_plan_only:
             cmd += ["--feature-plan-only"]
+        if allow_company_build:
+            cmd += ["--allow-company-build"]
         if no_deepseek:
             cmd += ["--no-deepseek"]
         if bugfix_mode:
@@ -313,6 +316,7 @@ def create_upgrade_run(body: dict):
         selected_feature_sprint = 1
     feature_plan_only = bool(body.get("feature_plan_only", True))
     no_deepseek = bool(body.get("no_deepseek", True))
+    allow_company_build = bool(body.get("allow_company_build", False))
 
     run_id = allocate_run_id()
     run_path = RUNS_DIR / run_id
@@ -334,13 +338,17 @@ def create_upgrade_run(body: dict):
         "selected_feature_sprint": selected_feature_sprint,
         "feature_plan_only": feature_plan_only,
         "no_deepseek": no_deepseek,
+        "execution_mode": "plan_only" if feature_plan_only else "build",
+        "plan_only": feature_plan_only,
+        "build_allowed": not feature_plan_only,
+        "claude_build_allowed": not feature_plan_only,
     }
     (run_path / "run_state.json").write_text(json.dumps(state, indent=2))
 
     run_pipeline_upgrade_async(
         run_id, existing_app, str(feature_request_path),
         selected_feature_sprint, feature_plan_only, no_deepseek,
-        bugfix_mode=bugfix_mode, bug_title=bug_title,
+        bugfix_mode=bugfix_mode, bug_title=bug_title, allow_company_build=allow_company_build,
     )
 
     return jsonify({"run_id": run_id, "status": "queued"}), 201
