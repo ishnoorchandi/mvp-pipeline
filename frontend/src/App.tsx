@@ -1298,6 +1298,12 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "sprint_quality_gate.json", label: "Sprint Quality Gate JSON" },
   { file: "build_ready_sprints.md", label: "Build-Ready Sprints" },
   { file: "decomposition_needed_sprints.md", label: "Decomposition-Needed Sprints" },
+  { file: "sandbox_workspace_report.md", label: "Sandbox Workspace Report" },
+  { file: "sandbox_workspace_state.json", label: "Sandbox Workspace State JSON" },
+  { file: "sandbox_changed_files.md", label: "Sandbox Changed Files" },
+  { file: "sandbox_patch.diff", label: "Sandbox Patch Diff" },
+  { file: "sandbox_patch_summary.md", label: "Sandbox Patch Summary" },
+  { file: "apply_patch_instructions.md", label: "Apply Patch Instructions" },
   { file: "selected_feature_sprint_scope.md", label: "Selected Feature Sprint Scope" },
   { file: "selected_feature_sprint_build_prompt.txt", label: "Selected Feature Sprint Build Prompt" },
   { file: "selected_feature_change_boundary.md", label: "Selected Feature Change Boundary" },
@@ -2481,6 +2487,113 @@ function BackendSafetyCard({ runId, run, selectedArtifact, onSelectArtifact }: {
   );
 }
 
+// Build Workspace — compact visibility into WHERE Claude Code actually built
+// (sandbox copy vs. the real repo directly), so a sandbox run never looks
+// indistinguishable from a direct build. Purely derived from run_state.json
+// fields written by resolve_build_gate()/pipeline_existing_app_upgrade — never
+// performs an action itself. Renders gracefully (returns null) for older runs
+// that predate this field, and for runs that haven't reached the build gate yet.
+function BuildWorkspaceCard({ run, selectedArtifact, onSelectArtifact }: {
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
+  if (!run) return null;
+  const mode = run.build_workspace_mode;
+  const blocked = run.execution_mode === "build_blocked";
+  const planOnly = run.execution_mode === "plan_only" || run.plan_only === true;
+
+  if (!mode && !blocked && !planOnly) return null;
+
+  const quickLinks = [
+    { file: "sandbox_workspace_report.md", label: "Sandbox Workspace Report" },
+    { file: "sandbox_workspace_state.json", label: "Sandbox Workspace State JSON" },
+    { file: "sandbox_changed_files.md", label: "Sandbox Changed Files" },
+    { file: "sandbox_patch.diff", label: "Sandbox Patch Diff" },
+    { file: "sandbox_patch_summary.md", label: "Sandbox Patch Summary" },
+    { file: "apply_patch_instructions.md", label: "Apply Patch Instructions" },
+  ].filter(l => (run.artifacts ?? []).includes(l.file));
+
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Build Workspace</div>
+        </div>
+      </div>
+
+      {blocked ? (
+        <div className="delivery-warning-panel delivery-warning-panel-severe">
+          <strong>Build blocked</strong>
+          <div>Reason: {run.build_gate_reason ?? "company-protected repo requires a sandbox workspace or prepared feature branch."}</div>
+        </div>
+      ) : planOnly && mode !== "sandbox" && mode !== "direct" ? (
+        <div className="repo-status-rows">
+          <div className="repo-status-row">
+            <span className="repo-status-row-label">Mode</span>
+            <span>Not used — planning only</span>
+          </div>
+        </div>
+      ) : mode === "sandbox" ? (
+        <div className="repo-status-rows">
+          <div className="repo-status-row">
+            <span className="repo-status-row-label">Mode</span>
+            <span>Sandbox copy</span>
+          </div>
+          <div className="repo-status-row">
+            <span className="repo-status-row-label">Original repo</span>
+            <span>Protected{run.original_repo_modified === false ? " — unchanged" : ""}</span>
+          </div>
+          <div className="repo-status-row">
+            <span className="repo-status-row-label">Active build path</span>
+            <code>{run.active_build_path ?? run.sandbox_workspace}</code>
+          </div>
+          {run.original_repo_modified === true && (
+            <div className="delivery-warning-panel delivery-warning-panel-severe">
+              ⚠️ Original repo working tree changed during this sandbox build — investigate
+              before trusting this run. This was not expected.
+            </div>
+          )}
+          {run.original_repo_modified === false && (
+            <div className="repo-status-row">
+              <span className="repo-status-row-label">Patch</span>
+              <span>Ready for review</span>
+            </div>
+          )}
+        </div>
+      ) : mode === "direct" ? (
+        <div className="repo-status-rows">
+          <div className="repo-status-row">
+            <span className="repo-status-row-label">Mode</span>
+            <span>Direct feature branch</span>
+          </div>
+          <div className="repo-status-row">
+            <span className="repo-status-row-label">Active build path</span>
+            <code>{run.active_build_path ?? run.original_repo_path}</code>
+          </div>
+        </div>
+      ) : null}
+
+      {quickLinks.length > 0 && (
+        <div className="delivery-artifacts">
+          <div className="delivery-artifacts-label">Quick links</div>
+          <div className="delivery-artifact-tabs">
+            {quickLinks.map(l => (
+              <button
+                key={l.file}
+                className={`artifact-tab ${selectedArtifact === l.file ? "active" : ""}`}
+                onClick={() => onSelectArtifact(l.file)}
+              >
+                {l.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Git Sync & Pull Safety — read-only foundation for collaborative existing app repos
 // (e.g. OneHR/OneATS) where other developers are constantly pushing. Pulls full detail
 // from git_sync_state.json (written by delivery.run_git_sync_check); falls back to the
@@ -3306,6 +3419,7 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             <BugfixPlanCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <BackendInventoryCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <BackendSafetyCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            <BuildWorkspaceCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <RepositoryStatusCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <PrPlanCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <details className="advanced-git-details">
@@ -3864,6 +3978,8 @@ function UpgradePanel({ onCreated, onCancel }: { onCreated: (id: string) => void
   const [selectedSprint, setSelectedSprint] = useState(1);
   const [planOnly, setPlanOnly] = useState(true);
   const [noDeepseek, setNoDeepseek] = useState(true);
+  const [useSandbox, setUseSandbox] = useState(true);
+  const [sandboxPath, setSandboxPath] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -3883,6 +3999,8 @@ function UpgradePanel({ onCreated, onCancel }: { onCreated: (id: string) => void
         selected_feature_sprint: selectedSprint,
         feature_plan_only: planOnly,
         no_deepseek: noDeepseek,
+        use_sandbox_workspace: !planOnly && useSandbox,
+        sandbox_workspace: !planOnly && useSandbox ? sandboxPath.trim() || undefined : undefined,
       });
       onCreated(data.run_id);
     } catch (e: unknown) {
@@ -3923,7 +4041,20 @@ function UpgradePanel({ onCreated, onCancel }: { onCreated: (id: string) => void
             <input type="checkbox" checked={noDeepseek} onChange={e => setNoDeepseek(e.target.checked)} disabled={loading} />
             <span>Skip DeepSeek review</span>
           </label>
+          {!planOnly && (
+            <label className="expand-checkbox">
+              <input type="checkbox" checked={useSandbox} onChange={e => setUseSandbox(e.target.checked)} disabled={loading} />
+              <span>Build in sandbox copy <em>— original repo stays untouched</em></span>
+            </label>
+          )}
         </div>
+        {!planOnly && useSandbox && (
+          <label className="expand-field">
+            <span className="expand-field-label">Sandbox path (optional)</span>
+            <input className="expand-input" value={sandboxPath} onChange={e => setSandboxPath(e.target.value)}
+              placeholder="Leave blank for ~/mvp-sandboxes/<repo-name>-<run-id>" disabled={loading} />
+          </label>
+        )}
         {error && <p className="input-error">{error}</p>}
         <button className="submit-btn" onClick={submit} disabled={loading || !canSubmit}>
           {loading ? "Starting…" : planOnly ? "Generate Feature Sprint Plan →" : "Build Feature Sprint →"}

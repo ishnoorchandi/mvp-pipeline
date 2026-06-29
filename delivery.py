@@ -2476,3 +2476,188 @@ def run_pr_remote_delivery(
         (output_dir / "pr_remote_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     return state
+
+
+# ── Sandbox Workspace ────────────────────────────────────────────────────────
+# Lets Claude Code build against a disposable COPY of the target repo instead
+# of the real working tree, so the real repo is never modified by a build the
+# user hasn't reviewed yet. The sandbox gets its own throwaway git repo (used
+# only to produce a diff) — this is never the original repo's .git, is never
+# pushed anywhere, and the original repo is never committed to by this module.
+
+SANDBOX_EXCLUDED_DIR_NAMES = {
+    ".git", "node_modules", "venv", ".venv", "dist", "build", ".next", ".turbo",
+    "coverage", ".pytest_cache", "__pycache__",
+}
+_SANDBOX_EXCLUDED_FILE_RE = re.compile(r"\.log$|(^|/)\.env(\.[\w-]+)?$")
+
+
+def default_sandbox_workspace_path(repo_path, run_id: str, sandbox_root=None) -> Path:
+    """Deterministic sandbox folder: <sandbox_root>/<repo-name>-<run-id>. Defaults
+    sandbox_root to ~/mvp-sandboxes when not given."""
+    repo_path = Path(repo_path).resolve()
+    sandbox_root = Path(sandbox_root) if sandbox_root else Path.home() / "mvp-sandboxes"
+    return sandbox_root / f"{repo_path.name}-{run_id}"
+
+
+def _sandbox_copy_ignore(dir_path: str, names: list[str]) -> set[str]:
+    """shutil.copytree `ignore` callback — excludes .git/node_modules/venv/.venv/
+    dist/build/.next/.turbo/coverage/.pytest_cache/__pycache__, logs, and local
+    .env* files. Source files, package manifests, configs, tests, and docs are
+    always preserved."""
+    ignored = set()
+    for name in names:
+        full = Path(dir_path) / name
+        if name in SANDBOX_EXCLUDED_DIR_NAMES and full.is_dir():
+            ignored.add(name)
+        elif full.is_file() and _SANDBOX_EXCLUDED_FILE_RE.search(name):
+            ignored.add(name)
+    return ignored
+
+
+def create_sandbox_workspace(repo_path, sandbox_path, run_id: str | None = None) -> dict:
+    """Copies repo_path into sandbox_path (excluding the paths above), then
+    initializes a FRESH git repo inside the sandbox only and commits a baseline
+    snapshot — never touches repo_path's own .git, never pushes the sandbox
+    anywhere. The baseline commit is what later lets `git diff` in the sandbox
+    produce a reviewable patch after a build. Returns sandbox_workspace_state."""
+    repo_path = Path(repo_path).resolve()
+    sandbox_path = Path(sandbox_path).resolve()
+    if sandbox_path.exists():
+        shutil.rmtree(sandbox_path)
+    sandbox_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(repo_path, sandbox_path, ignore=_sandbox_copy_ignore)
+
+    run_git_command(sandbox_path, ["init", "-q", "-b", "sandbox-baseline"], check=False)
+    run_git_command(sandbox_path, ["config", "user.email", "sandbox@mvp-pipeline.local"], check=False)
+    run_git_command(sandbox_path, ["config", "user.name", "MVP Pipeline Sandbox"], check=False)
+    run_git_command(sandbox_path, ["add", "-A"], check=False)
+    run_git_command(
+        sandbox_path, ["commit", "-q", "--allow-empty", "-m", "Sandbox baseline snapshot"], check=False,
+    )
+
+    return {
+        "original_repo_path": str(repo_path),
+        "sandbox_path": str(sandbox_path),
+        "run_id": run_id,
+        "excluded": sorted(SANDBOX_EXCLUDED_DIR_NAMES) + [".env*", "*.log"],
+        "status": "ready",
+        "no_push_performed": True,
+        "original_repo_git_untouched": True,
+        "timestamp": time.time(),
+    }
+
+
+def generate_sandbox_workspace_report(state: dict, output_path) -> str:
+    """Writes sandbox_workspace_report.md — short, human-readable. Full state
+    lives in sandbox_workspace_state.json."""
+    lines = ["# Sandbox Workspace", ""]
+    lines.append(f"Original repo: {state['original_repo_path']}")
+    lines.append(f"Sandbox repo: {state['sandbox_path']}")
+    lines.append("Mode: sandbox build")
+    lines.append("")
+    lines.append("## Excluded")
+    lines.extend(f"- {item}" for item in state.get("excluded", []))
+    lines.append("")
+    lines.append(f"Status: {str(state.get('status', 'unknown')).capitalize()}")
+    content = "\n".join(lines) + "\n"
+    Path(output_path).write_text(content, encoding="utf-8")
+    return content
+
+
+def write_sandbox_workspace_artifacts(state: dict, output_dir) -> str:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    md = generate_sandbox_workspace_report(state, output_dir / "sandbox_workspace_report.md")
+    (output_dir / "sandbox_workspace_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return md
+
+
+def generate_sandbox_patch_artifacts(sandbox_path, original_repo_path, output_dir) -> dict:
+    """Runs `git diff` / `git status --short` INSIDE THE SANDBOX (never the
+    original repo) to produce sandbox_patch.diff, sandbox_changed_files.md,
+    sandbox_patch_summary.md, apply_patch_instructions.md. Never pushes the
+    sandbox anywhere; never commits or modifies the original repo. Returns a
+    small summary dict (file count, patch byte size)."""
+    sandbox_path = Path(sandbox_path).resolve()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    diff_result = run_git_command(sandbox_path, ["diff", "--no-color", "HEAD"], check=False)
+    patch_text = diff_result.stdout or ""
+    (output_dir / "sandbox_patch.diff").write_text(patch_text, encoding="utf-8")
+
+    status_result = run_git_command(sandbox_path, ["status", "--short"], check=False)
+    changed_lines = [l for l in status_result.stdout.splitlines() if l.strip()]
+    changed_paths = [l[3:].strip() for l in changed_lines]
+
+    changed_md = ["# Sandbox Changed Files", ""]
+    if changed_lines:
+        changed_md.append(f"{len(changed_lines)} file(s) changed in the sandbox build:")
+        changed_md.append("")
+        changed_md.extend(f"- `{path}` ({line[:2].strip() or 'modified'})"
+                           for line, path in zip(changed_lines, changed_paths))
+    else:
+        changed_md.append("No files changed in the sandbox build.")
+    (output_dir / "sandbox_changed_files.md").write_text("\n".join(changed_md) + "\n", encoding="utf-8")
+
+    summary = {
+        "sandbox_path": str(sandbox_path),
+        "original_repo_path": str(original_repo_path),
+        "changed_file_count": len(changed_paths),
+        "patch_byte_size": len(patch_text.encode("utf-8")),
+    }
+    summary_lines = [
+        "# Sandbox Patch Summary", "",
+        f"Sandbox path: {sandbox_path}",
+        f"Files changed: {summary['changed_file_count']}",
+        f"Patch size: {summary['patch_byte_size']} byte(s)",
+        "",
+        "This patch was generated against the sandbox workspace only. The "
+        "original repo was never modified, never committed to, and never pushed.",
+    ]
+    (output_dir / "sandbox_patch_summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+    instructions = [
+        "# Apply Patch Instructions", "",
+        "Review `sandbox_patch.diff` before applying anything to the real repo. "
+        "Nothing is applied automatically.", "",
+        "```bash",
+        f"cd {original_repo_path}",
+        f"git apply {output_dir / 'sandbox_patch.diff'}",
+        "```", "",
+        "- The pipeline never pushes the sandbox repo anywhere.",
+        "- The pipeline never commits these changes into the original repo automatically.",
+        "- Apply the patch manually, review it with `git diff` again, then commit/test as usual.",
+    ]
+    (output_dir / "apply_patch_instructions.md").write_text("\n".join(instructions) + "\n", encoding="utf-8")
+
+    return summary
+
+
+def capture_repo_status_snapshot(repo_path) -> dict:
+    """Read-only — `git status --short` only. Used to verify a repo's working
+    tree is unchanged before/after a sandbox build. Never pulls, pushes,
+    resets, or stashes."""
+    repo_path = Path(repo_path)
+    if not (repo_path / ".git").exists():
+        return {"is_git_repo": False, "dirty_paths": []}
+    status = get_git_status(repo_path)
+    return {
+        "is_git_repo": True,
+        "dirty_paths": sorted(l[3:].strip() for l in status["porcelain"] if l.strip()),
+    }
+
+
+def check_original_repo_unchanged(before: dict, after: dict) -> dict:
+    """Compares two capture_repo_status_snapshot() results for the ORIGINAL repo
+    (never the sandbox) taken before and after a sandbox build. If the repo
+    wasn't (or isn't) a git repo, the check is not_applicable rather than a
+    false pass/fail."""
+    if not before.get("is_git_repo") or not after.get("is_git_repo"):
+        return {"original_repo_modified": False, "original_repo_change_check": "not_applicable"}
+    modified = before.get("dirty_paths") != after.get("dirty_paths")
+    return {
+        "original_repo_modified": modified,
+        "original_repo_change_check": "failed" if modified else "passed",
+    }

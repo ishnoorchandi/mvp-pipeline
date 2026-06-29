@@ -73,6 +73,16 @@ export interface RunDetail {
   claude_build_allowed?: boolean;
   build_gate_reason?: string;
   company_repo_build_allowed?: boolean;
+  // Sandbox Workspace — when build_workspace_mode is "sandbox", Claude Code built
+  // against a disposable copy at active_build_path/sandbox_workspace instead of
+  // original_repo_path, which is never modified. See delivery.create_sandbox_workspace
+  // and sandbox_workspace_report.md/.json, sandbox_patch.diff.
+  build_workspace_mode?: "none" | "sandbox" | "direct";
+  original_repo_path?: string | null;
+  active_build_path?: string | null;
+  sandbox_workspace?: string | null;
+  original_repo_modified?: boolean;
+  original_repo_change_check?: "passed" | "failed" | "not_applicable";
   // Git Pull (fast-forward only) — set when --git-pull-ff-only was used. Only ever
   // reflects a guarded `git pull --ff-only origin <base_branch>`; never push/reset/stash.
   git_pull_status?: "BLOCKED" | "PULLED" | "FAILED" | "NO_OP" | null;
@@ -206,6 +216,11 @@ export interface UpgradeRunPayload {
   bugfix_mode?: boolean;
   bug_report_text?: string;
   bug_title?: string;
+  // Sandbox Workspace — build in a disposable copy instead of the real repo.
+  // See delivery.create_sandbox_workspace / resolve_build_gate.
+  use_sandbox_workspace?: boolean;
+  sandbox_workspace?: string;
+  allow_company_build?: boolean;
 }
 
 export interface ContinuationRunPayload {

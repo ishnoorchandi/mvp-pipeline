@@ -202,10 +202,29 @@ def resolve_build_gate(
     is_company_repo: bool = False,
     current_branch: str | None = None,
     allow_company_build: bool = False,
+    sandbox_requested: bool = False,
+    sandbox_workspace: str | None = None,
+    original_repo_path: str | None = None,
+    repo_hygiene_severity: str | None = None,
 ) -> dict:
     """Returns a structured build-gate decision. The caller must check
     `claude_build_allowed` immediately before invoking Claude Code — do not
-    rely on earlier returns alone."""
+    rely on earlier returns alone.
+
+    Sandbox workspace policy (company-protected repos):
+      - protected branch + no sandbox  => blocked.
+      - protected branch + sandbox     => build allowed, IN THE SANDBOX ONLY.
+      - non-protected branch + sandbox => build allowed, IN THE SANDBOX ONLY.
+      - non-protected branch + --allow-company-build (no sandbox) => build
+        allowed directly on the branch, but only if repo_hygiene_severity is
+        "clean" when that information is supplied (callers that don't pass it
+        keep the prior allow-by-default behavior).
+      - plan-only always overrides every sandbox/company flag — a plan-only
+        run never builds anywhere, sandboxed or not.
+
+    build_workspace_mode is one of "none" (plan-only / not building),
+    "sandbox" (build happens in sandbox_workspace, original repo untouched),
+    or "direct" (build happens in original_repo_path directly)."""
     if plan_only_requested:
         return {
             "workflow_mode": workflow_mode,
@@ -215,25 +234,69 @@ def resolve_build_gate(
             "claude_build_allowed": False,
             "company_repo_build_allowed": False,
             "reason": plan_only_reason,
+            "build_workspace_mode": "none",
+            "sandbox_requested": sandbox_requested,
+            "sandbox_workspace": sandbox_workspace,
+            "active_build_path": None,
+            "original_repo_path": original_repo_path,
         }
 
     protected_branch = (current_branch or "") in delivery_mod.PROTECTED_BRANCHES
-    if is_company_repo and (not allow_company_build or protected_branch):
-        reason = (
-            "company-protected repo on protected branch"
-            if protected_branch else
-            "company-protected repo build requires --allow-company-build"
-        )
-        return {
-            "workflow_mode": workflow_mode,
-            "execution_mode": "build_blocked",
-            "plan_only": False,
-            "build_allowed": False,
-            "claude_build_allowed": False,
-            "company_repo_build_allowed": False,
-            "reason": reason,
-        }
+    use_sandbox = bool(sandbox_requested and sandbox_workspace)
 
+    if is_company_repo:
+        if protected_branch and not use_sandbox:
+            return {
+                "workflow_mode": workflow_mode,
+                "execution_mode": "build_blocked",
+                "plan_only": False,
+                "build_allowed": False,
+                "claude_build_allowed": False,
+                "company_repo_build_allowed": False,
+                "reason": "company-protected repo on protected branch — requires a sandbox "
+                          "workspace or prepared feature branch",
+                "build_workspace_mode": "none",
+                "sandbox_requested": sandbox_requested,
+                "sandbox_workspace": sandbox_workspace,
+                "active_build_path": None,
+                "original_repo_path": original_repo_path,
+            }
+        if not protected_branch and not use_sandbox and not allow_company_build:
+            return {
+                "workflow_mode": workflow_mode,
+                "execution_mode": "build_blocked",
+                "plan_only": False,
+                "build_allowed": False,
+                "claude_build_allowed": False,
+                "company_repo_build_allowed": False,
+                "reason": "company-protected repo build requires --allow-company-build, a sandbox "
+                          "workspace, or a prepared feature branch",
+                "build_workspace_mode": "none",
+                "sandbox_requested": sandbox_requested,
+                "sandbox_workspace": sandbox_workspace,
+                "active_build_path": None,
+                "original_repo_path": original_repo_path,
+            }
+        if not protected_branch and not use_sandbox and allow_company_build:
+            if repo_hygiene_severity is not None and repo_hygiene_severity != "clean":
+                return {
+                    "workflow_mode": workflow_mode,
+                    "execution_mode": "build_blocked",
+                    "plan_only": False,
+                    "build_allowed": False,
+                    "claude_build_allowed": False,
+                    "company_repo_build_allowed": False,
+                    "reason": "company-protected repo direct branch build requires clean repo "
+                              f"hygiene (current severity: {repo_hygiene_severity})",
+                    "build_workspace_mode": "none",
+                    "sandbox_requested": sandbox_requested,
+                    "sandbox_workspace": sandbox_workspace,
+                    "active_build_path": None,
+                    "original_repo_path": original_repo_path,
+                }
+
+    build_workspace_mode = "sandbox" if use_sandbox else "direct"
+    active_build_path = sandbox_workspace if use_sandbox else original_repo_path
     return {
         "workflow_mode": workflow_mode,
         "execution_mode": "build",
@@ -241,7 +304,12 @@ def resolve_build_gate(
         "build_allowed": True,
         "claude_build_allowed": True,
         "company_repo_build_allowed": True,
-        "reason": "build allowed",
+        "reason": "build allowed" if not use_sandbox else "build allowed in sandbox workspace",
+        "build_workspace_mode": build_workspace_mode,
+        "sandbox_requested": sandbox_requested,
+        "sandbox_workspace": sandbox_workspace,
+        "active_build_path": active_build_path,
+        "original_repo_path": original_repo_path,
     }
 
 
@@ -9218,6 +9286,8 @@ def pipeline_existing_app_upgrade(
     feature_plan_only: bool = False,
     plan_only_reason: str = "plan-only mode requested",
     allow_company_build: bool = False,
+    use_sandbox_workspace: bool = False,
+    sandbox_workspace_path: str | None = None,
     use_deepseek: bool = True,
     git_sync_base_branch: str = "main",
     git_pull_ff_only: bool = False,
@@ -9279,6 +9349,8 @@ def pipeline_existing_app_upgrade(
         plan_only_requested=feature_plan_only,
         plan_only_reason=plan_only_reason,
         allow_company_build=allow_company_build,
+        sandbox_requested=use_sandbox_workspace,
+        original_repo_path=str(existing_app_path),
     )
 
     if git_pull_ff_only:
@@ -9543,6 +9615,10 @@ def pipeline_existing_app_upgrade(
             "claude_build_allowed": build_gate["claude_build_allowed"],
             "build_gate_reason": build_gate["reason"],
             "company_repo_build_allowed": build_gate["company_repo_build_allowed"],
+            "build_workspace_mode": build_gate["build_workspace_mode"],
+            "original_repo_path": build_gate["original_repo_path"],
+            "active_build_path": build_gate["active_build_path"],
+            "sandbox_workspace": build_gate["sandbox_workspace"],
         })
         log_event(run_id, "feature_plan_only_done")
         _maybe_write_pr_delivery_plan()
@@ -9584,24 +9660,19 @@ def pipeline_existing_app_upgrade(
     total = plan_json.get("total_sprints", len(plan_json.get("sprints", [])))
     print(f"Selected Feature Sprint: Sprint {selected_feature_sprint} of {total}")
 
-    print("▶ Step 11  Writing selected feature sprint scope + build prompt...")
-    build_prompt_text = generate_selected_feature_sprint_build_prompt(
-        existing_app_summary, scan, plan_json, selected_sprint, rdir, baseline_checklist,
-    )
-    _update_state(run_id, {})
+    # Sandbox workspace path is computed deterministically up front (even before
+    # the sandbox is actually created) so the build gate can decide
+    # build_workspace_mode/active_build_path with full information. Real
+    # git_sync_state is already known from Step 0, so the gate can be resolved
+    # — and Claude Code blocked, if necessary — before Step 11 does any work
+    # against a path we might not be allowed to build in.
+    sandbox_workspace_resolved = None
+    if use_sandbox_workspace:
+        sandbox_workspace_resolved = str(
+            Path(sandbox_workspace_path).resolve() if sandbox_workspace_path
+            else delivery_mod.default_sandbox_workspace_path(existing_app_path, run_id)
+        )
 
-    must_not_modify = selected_sprint.get("must_not_modify") or []
-    snapshot_protected_files(existing_app_path, must_not_modify, rdir)
-    snapshot_existing_files(existing_app_path, rdir)
-
-    print("▶ Step 11b  Deriving selected feature change boundary...")
-    boundary = generate_selected_feature_change_boundary(
-        selected_sprint, plan_json, additive_architecture, build_prompt_text, rdir,
-    )
-
-    # Recompute the gate with real company-repo/branch facts (git_sync_state is only
-    # known once Step 0 has run). plan-only already returned above, so this can only
-    # newly block on company-repo protection.
     build_gate = resolve_build_gate(
         workflow_mode="existing_app_upgrade",
         plan_only_requested=feature_plan_only,
@@ -9609,10 +9680,15 @@ def pipeline_existing_app_upgrade(
         is_company_repo=bool(git_sync_state and git_sync_state.get("is_company_repo")),
         current_branch=(git_sync_state or {}).get("current_branch"),
         allow_company_build=allow_company_build,
+        sandbox_requested=use_sandbox_workspace,
+        sandbox_workspace=sandbox_workspace_resolved,
+        original_repo_path=str(existing_app_path),
+        repo_hygiene_severity=(git_sync_state or {}).get("repo_hygiene", {}).get("severity"),
     )
 
     # ── Hard Step 12 guard ────────────────────────────────────────────────────
-    # This must be the last check before any Claude Code invocation. Do not
+    # This must run before any Claude Code invocation, and before any
+    # path-dependent build prep (snapshots, the build prompt's target). Do not
     # rely on the earlier plan-only/dirty-repo returns alone — if the gate says
     # no, Claude Code cannot run, full stop.
     if not build_gate["claude_build_allowed"]:
@@ -9624,15 +9700,31 @@ def pipeline_existing_app_upgrade(
             "claude_build_allowed": build_gate["claude_build_allowed"],
             "build_gate_reason": build_gate["reason"],
             "company_repo_build_allowed": build_gate["company_repo_build_allowed"],
+            "build_workspace_mode": build_gate["build_workspace_mode"],
+            "original_repo_path": build_gate["original_repo_path"],
+            "active_build_path": build_gate["active_build_path"],
+            "sandbox_workspace": build_gate["sandbox_workspace"],
         })
         log_event(run_id, "build_blocked_company_repo_protection", build_gate["reason"])
         print(f"\n{'='*60}")
-        print("  ⛔ Claude Code build blocked: company-protected repo on protected branch. "
-              "Use plan-only, a sandbox workspace, or a prepared feature branch.")
+        print("  ⛔ Claude Code build blocked: company-protected repo requires a sandbox "
+              "workspace or prepared feature branch.")
         print(f"  Reason     : {build_gate['reason']}")
         print(f"  Run folder : {rdir}")
         print(f"{'='*60}\n")
         return run_id
+
+    using_sandbox = build_gate["build_workspace_mode"] == "sandbox"
+    active_build_path = Path(build_gate["active_build_path"])
+    original_repo_status_before = None
+
+    if using_sandbox:
+        print(f"\n▶ Sandbox  Copying {existing_app_path} into sandbox workspace "
+              f"{active_build_path} (original repo stays untouched)...")
+        original_repo_status_before = delivery_mod.capture_repo_status_snapshot(existing_app_path)
+        sandbox_state = delivery_mod.create_sandbox_workspace(existing_app_path, active_build_path, run_id)
+        delivery_mod.write_sandbox_workspace_artifacts(sandbox_state, rdir)
+        print(f"  Sandbox ready: {active_build_path}")
 
     _update_state(run_id, {
         "execution_mode": build_gate["execution_mode"],
@@ -9641,33 +9733,54 @@ def pipeline_existing_app_upgrade(
         "claude_build_allowed": build_gate["claude_build_allowed"],
         "build_gate_reason": build_gate["reason"],
         "company_repo_build_allowed": build_gate["company_repo_build_allowed"],
+        "build_workspace_mode": build_gate["build_workspace_mode"],
+        "original_repo_path": build_gate["original_repo_path"],
+        "active_build_path": str(active_build_path),
+        "sandbox_workspace": build_gate["sandbox_workspace"],
+        "original_repo_modified": False,
     })
 
-    print(f"\n▶ Step 12  Claude Code — building Sprint {selected_feature_sprint} in place...")
+    print("▶ Step 11  Writing selected feature sprint scope + build prompt...")
+    build_prompt_text = generate_selected_feature_sprint_build_prompt(
+        existing_app_summary, scan, plan_json, selected_sprint, rdir, baseline_checklist,
+    )
+    _update_state(run_id, {})
+
+    must_not_modify = selected_sprint.get("must_not_modify") or []
+    snapshot_protected_files(active_build_path, must_not_modify, rdir)
+    snapshot_existing_files(active_build_path, rdir)
+
+    print("▶ Step 11b  Deriving selected feature change boundary...")
+    boundary = generate_selected_feature_change_boundary(
+        selected_sprint, plan_json, additive_architecture, build_prompt_text, rdir,
+    )
+
+    print(f"\n▶ Step 12  Claude Code — building Sprint {selected_feature_sprint} "
+          f"{'in the sandbox workspace' if using_sandbox else 'in place'}...")
     t0 = time.time()
     _update_state(run_id, {"current_step": "building", "status": "building"})
-    build_output = build_feature_sprint(run_id, existing_app_path, build_prompt_text)
+    build_output = build_feature_sprint(run_id, active_build_path, build_prompt_text)
     record_step_time(run_id, "built", t0)
     _update_state(run_id, {"status": "built"})
     # Snapshot the tree right after the build, BEFORE smoke checks run, so any file
     # that differs between this snapshot and the post-smoke tree was changed by the
     # smoke-check commands themselves (e.g. `npm install` rewriting package-lock.json),
     # never by Claude.
-    snapshot_post_build_files(existing_app_path, rdir)
+    snapshot_post_build_files(active_build_path, rdir)
 
     print("\n▶ Step 13  Regression + change boundary check...")
     smoke_log = ""
     try:
-        smoke_log = run_smoke_checks(run_id, existing_app_path)
+        smoke_log = run_smoke_checks(run_id, active_build_path)
     except Exception as e:
         smoke_log = f"Smoke checks could not run: {e}"
     save_artifact(run_id, "feature_sprint_smoke_log.txt", smoke_log)
     save_artifact(run_id, "smoke_test_log.txt", smoke_log)
-    smoke_mutation_result, _ = write_smoke_mutation_report(existing_app_path, rdir, boundary, smoke_log)
+    smoke_mutation_result, _ = write_smoke_mutation_report(active_build_path, rdir, boundary, smoke_log)
     if smoke_mutation_result["mutation_detected"]:
         print(f"  ⚠️  Smoke checks mutated {len(smoke_mutation_result['files'])} tracked file(s) "
               "after the build finished (see smoke_mutation_report.md).")
-    changed_files, changed_files_report = write_changed_files_report(existing_app_path, rdir, selected_sprint)
+    changed_files, changed_files_report = write_changed_files_report(active_build_path, rdir, selected_sprint)
     boundary_result = check_selected_feature_boundary(changed_files, boundary)
     if boundary_result["status"] == "FAIL":
         write_boundary_violation_report(boundary_result, boundary, rdir, smoke_mutation_result)
@@ -9675,7 +9788,7 @@ def pipeline_existing_app_upgrade(
               "outside the selected sprint (see boundary_violation_report.md).")
     review_classification: dict | None = None
     regression_status, regression_report = run_regression_check(
-        existing_app_path, rdir, selected_sprint, smoke_log, changed_files, baseline_checklist,
+        active_build_path, rdir, selected_sprint, smoke_log, changed_files, baseline_checklist,
         boundary_result=boundary_result, smoke_mutation_result=smoke_mutation_result,
     )
     print(f"  Regression result: {regression_status}")
@@ -9687,7 +9800,7 @@ def pipeline_existing_app_upgrade(
     # a human must restore the repo before retrying.
     if use_deepseek and DEEPSEEK_API_KEY and boundary_result["status"] == "PASS":
         print("\n▶ Step 14  DeepSeek review (optional)...")
-        deepseek_report = deepseek_attack_review(existing_app_summary, existing_app_path, smoke_log + "\n\n" + regression_report)
+        deepseek_report = deepseek_attack_review(existing_app_summary, active_build_path, smoke_log + "\n\n" + regression_report)
         save_artifact(run_id, "deepseek_attack_report.md", deepseek_report)
         if not is_approved(deepseek_report):
             review_classification = classify_review_findings(deepseek_report, boundary, selected_sprint)
@@ -9701,22 +9814,22 @@ def pipeline_existing_app_upgrade(
                 fix_prompt = generate_existing_app_fix_prompt(
                     existing_app_summary, boundary, review_classification, 1,
                 )
-                apply_fixes(run_id, existing_app_path, fix_prompt, 1)
-                snapshot_post_build_files(existing_app_path, rdir)
-                smoke_log = run_smoke_checks(run_id, existing_app_path)
+                apply_fixes(run_id, active_build_path, fix_prompt, 1)
+                snapshot_post_build_files(active_build_path, rdir)
+                smoke_log = run_smoke_checks(run_id, active_build_path)
                 save_artifact(run_id, "smoke_test_log.txt", smoke_log)
-                smoke_mutation_result, _ = write_smoke_mutation_report(existing_app_path, rdir, boundary, smoke_log)
+                smoke_mutation_result, _ = write_smoke_mutation_report(active_build_path, rdir, boundary, smoke_log)
                 if smoke_mutation_result["mutation_detected"]:
                     print(f"  ⚠️  Smoke checks mutated {len(smoke_mutation_result['files'])} tracked file(s) "
                           "after the fix pass finished (see smoke_mutation_report.md).")
-                changed_files, changed_files_report = write_changed_files_report(existing_app_path, rdir, selected_sprint)
+                changed_files, changed_files_report = write_changed_files_report(active_build_path, rdir, selected_sprint)
                 boundary_result = check_selected_feature_boundary(changed_files, boundary)
                 if boundary_result["status"] == "FAIL":
                     write_boundary_violation_report(boundary_result, boundary, rdir, smoke_mutation_result)
                     print(f"  ⚠️  Change boundary FAIL after fix pass — {len(boundary_result['violations'])} "
                           "violation(s) outside the selected sprint.")
                 regression_status, regression_report = run_regression_check(
-                    existing_app_path, rdir, selected_sprint, smoke_log, changed_files, baseline_checklist,
+                    active_build_path, rdir, selected_sprint, smoke_log, changed_files, baseline_checklist,
                     boundary_result=boundary_result, review_classification=review_classification,
                     smoke_mutation_result=smoke_mutation_result,
                 )
@@ -9738,6 +9851,37 @@ def pipeline_existing_app_upgrade(
         "smoke_mutation_blocked_delivery": smoke_mutation_blocked,
     })
 
+    # ── Sandbox patch + original-repo-unchanged check ────────────────────────
+    # Runs only when the build happened in a sandbox. Produces review artifacts
+    # from the SANDBOX's own throwaway git repo (never pushed anywhere) and
+    # verifies the ORIGINAL repo's working tree is unchanged compared to the
+    # snapshot captured right before the sandbox was created.
+    if using_sandbox:
+        print("\n▶ Sandbox  Generating patch/diff artifacts from the sandbox workspace...")
+        patch_summary = delivery_mod.generate_sandbox_patch_artifacts(
+            active_build_path, existing_app_path, rdir,
+        )
+        print(f"  {patch_summary['changed_file_count']} file(s) changed in the sandbox "
+              f"({patch_summary['patch_byte_size']} byte(s) of patch). See sandbox_patch.diff.")
+        original_repo_status_after = delivery_mod.capture_repo_status_snapshot(existing_app_path)
+        unchanged_check = delivery_mod.check_original_repo_unchanged(
+            original_repo_status_before or {"is_git_repo": False, "dirty_paths": []},
+            original_repo_status_after,
+        )
+        _update_state(run_id, {
+            "original_repo_modified": unchanged_check["original_repo_modified"],
+            "original_repo_change_check": unchanged_check["original_repo_change_check"],
+        })
+        if unchanged_check["original_repo_modified"]:
+            _update_state(run_id, {"status": "sandbox_original_repo_modified_warning"})
+            log_event(run_id, "sandbox_original_repo_modified_warning",
+                      "Original repo working tree changed during a sandbox build — investigate "
+                      "immediately. The pipeline did not make this change intentionally.")
+            print("  ⚠️  WARNING: the original repo's working tree changed during a sandbox build. "
+                  "This was not expected — investigate before trusting this run.")
+        else:
+            print("  ✓  Original repo unchanged — verified against the pre-sandbox snapshot.")
+
     print("\n▶ Step 15  Writing feature completion report...")
     generate_feature_completion_report(
         existing_app_summary, plan_json, selected_sprint, build_output,
@@ -9756,6 +9900,9 @@ def pipeline_existing_app_upgrade(
     print(f"\n{'='*60}")
     print("  Existing App Upgrade — Feature Sprint Complete")
     print(f"  Run folder        : {rdir}")
+    print(f"  Build workspace   : {'Sandbox copy (' + str(active_build_path) + ')' if using_sandbox else 'Direct (original repo)'}")
+    if using_sandbox:
+        print(f"  Original repo     : Unmodified — review sandbox_patch.diff before applying anything.")
     print(f"  Regression        : {regression_status}")
     print(f"  Change boundary   : {boundary_result['status']}")
     print(f"  Smoke mutation    : {smoke_mutation_result.get('status')}")
@@ -12310,6 +12457,18 @@ if __name__ == "__main__":
                               "flag, building directly on a protected branch (main/master/develop/"
                               "production) is always blocked — use a sandbox workspace or a "
                               "prepared feature branch instead.")
+    parser.add_argument("--sandbox-workspace", default=None, metavar="PATH",
+                         help="(Existing App Upgrade mode) Build in a disposable COPY of "
+                              "--existing-app at PATH instead of the real working tree. The "
+                              "original repo is never modified — Claude Code runs against the "
+                              "sandbox copy, and a reviewable sandbox_patch.diff is produced "
+                              "afterwards. Implies --use-sandbox-workspace.")
+    parser.add_argument("--use-sandbox-workspace", action="store_true",
+                         help="(Existing App Upgrade mode) Build in a disposable sandbox copy of "
+                              "--existing-app. Without --sandbox-workspace, a deterministic path "
+                              "is created at ~/mvp-sandboxes/<repo-name>-<run-id>. Required (or a "
+                              "prepared feature branch + --allow-company-build) to build against a "
+                              "company-protected repo on a protected branch.")
     parser.add_argument("--bugfix-mode", action="store_true",
                          help="Generate bugfix planning artifacts for --existing-app from a bug report. "
                               "Planning only: no code changes, commits, pushes, or PRs.")
@@ -12880,6 +13039,8 @@ if __name__ == "__main__":
                 feature_plan_only=effective_feature_plan_only,
                 plan_only_reason=plan_only_reason,
                 allow_company_build=args.allow_company_build,
+                use_sandbox_workspace=bool(args.use_sandbox_workspace or args.sandbox_workspace),
+                sandbox_workspace_path=args.sandbox_workspace,
                 use_deepseek=not args.no_deepseek,
                 git_sync_base_branch=args.base_branch,
                 git_pull_ff_only=args.git_pull_ff_only,

@@ -181,6 +181,8 @@ def run_pipeline_upgrade_async(
     bugfix_mode: bool = False,
     bug_title: str = "",
     allow_company_build: bool = False,
+    use_sandbox_workspace: bool = False,
+    sandbox_workspace: str = "",
 ):
     """Existing App Upgrade mode — maps to --existing-app/--feature-request/--upgrade-mode."""
     def _run():
@@ -198,6 +200,10 @@ def run_pipeline_upgrade_async(
             cmd += ["--feature-plan-only"]
         if allow_company_build:
             cmd += ["--allow-company-build"]
+        if sandbox_workspace:
+            cmd += ["--sandbox-workspace", sandbox_workspace]
+        elif use_sandbox_workspace:
+            cmd += ["--use-sandbox-workspace"]
         if no_deepseek:
             cmd += ["--no-deepseek"]
         if bugfix_mode:
@@ -317,6 +323,36 @@ def create_run():
     return jsonify({"run_id": run_id, "status": "queued"}), 201
 
 
+def check_company_repo_build_guard(
+    existing_app: str, use_sandbox_workspace: bool, sandbox_workspace: str, allow_company_build: bool,
+) -> str | None:
+    """Backend-side synchronous guard mirroring resolve_build_gate's company-repo
+    policy — read-only, never mutates the target repo. Returns an error message
+    if this build request would silently build directly in a company-protected
+    repo on a protected branch (or off-branch without an explicit override/
+    sandbox), else None. The CLI's own resolve_build_gate is still the
+    authoritative, final check — this just avoids queuing a build that the CLI
+    would only block after a background subprocess already started."""
+    repo_path = Path(existing_app)
+    if not existing_app or not (repo_path / ".git").exists():
+        return None
+    remote_info = delivery_mod.get_git_remote_info(repo_path)
+    repo_type = delivery_mod.detect_repo_type(repo_path, remote_info)
+    if repo_type != "company-protected":
+        return None
+    status = delivery_mod.get_git_status(repo_path)
+    current_branch = status.get("branch")
+    protected_branch = current_branch in delivery_mod.PROTECTED_BRANCHES
+    use_sandbox = bool(use_sandbox_workspace or sandbox_workspace)
+    if protected_branch and not use_sandbox:
+        return ("Claude Code build blocked: company-protected repo requires a sandbox "
+                "workspace or prepared feature branch.")
+    if not protected_branch and not use_sandbox and not allow_company_build:
+        return ("company-protected repo build requires --allow-company-build, a sandbox "
+                "workspace, or a prepared feature branch")
+    return None
+
+
 def create_upgrade_run(body: dict):
     """Existing App Upgrade payload → pre-allocated run + --existing-app/--upgrade-mode CLI.
 
@@ -339,6 +375,19 @@ def create_upgrade_run(body: dict):
     feature_plan_only = bool(body.get("feature_plan_only", True))
     no_deepseek = bool(body.get("no_deepseek", True))
     allow_company_build = bool(body.get("allow_company_build", False))
+    use_sandbox_workspace = bool(body.get("use_sandbox_workspace", False))
+    sandbox_workspace = (body.get("sandbox_workspace") or "").strip()
+    if sandbox_workspace:
+        use_sandbox_workspace = True
+
+    # Backend-side build guard — block before even queuing a run, not just in
+    # the frontend. Never silently build directly in a company-protected repo.
+    if not feature_plan_only and not bugfix_mode:
+        guard_error = check_company_repo_build_guard(
+            existing_app, use_sandbox_workspace, sandbox_workspace, allow_company_build,
+        )
+        if guard_error:
+            abort(400, guard_error)
 
     run_id = allocate_run_id()
     run_path = RUNS_DIR / run_id
@@ -364,6 +413,8 @@ def create_upgrade_run(body: dict):
         "plan_only": feature_plan_only,
         "build_allowed": not feature_plan_only,
         "claude_build_allowed": not feature_plan_only,
+        "use_sandbox_workspace": use_sandbox_workspace,
+        "sandbox_workspace": sandbox_workspace or None,
     }
     (run_path / "run_state.json").write_text(json.dumps(state, indent=2))
 
@@ -371,6 +422,7 @@ def create_upgrade_run(body: dict):
         run_id, existing_app, str(feature_request_path),
         selected_feature_sprint, feature_plan_only, no_deepseek,
         bugfix_mode=bugfix_mode, bug_title=bug_title, allow_company_build=allow_company_build,
+        use_sandbox_workspace=use_sandbox_workspace, sandbox_workspace=sandbox_workspace,
     )
 
     return jsonify({"run_id": run_id, "status": "queued"}), 201
