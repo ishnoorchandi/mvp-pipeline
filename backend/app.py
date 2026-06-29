@@ -45,6 +45,28 @@ def load_state(run_id: str) -> dict | None:
         return None
 
 
+def load_feature_sprint_quality(continue_run: str, sprint_number: int) -> dict | None:
+    """Backend-side build guard: reads Sprint Quality Gate metadata for one feature
+    sprint from the source run's feature_sprint_plan.json (written by
+    write_sprint_quality_gate_artifacts). Returns None when unavailable — e.g. an
+    older run without quality metadata — so older runs are never blocked
+    (backward compatible). Never writes anything; read-only."""
+    source = Path(continue_run)
+    if not source.is_absolute():
+        source = BASE_DIR / continue_run
+    plan_path = source / "feature_sprint_plan.json"
+    if not plan_path.exists():
+        return None
+    try:
+        plan = json.loads(plan_path.read_text())
+    except Exception:
+        return None
+    for sprint in plan.get("sprints") or []:
+        if sprint.get("sprint_number") == sprint_number:
+            return sprint.get("quality")
+    return None
+
+
 def list_runs() -> list[dict]:
     if not RUNS_DIR.exists():
         return []
@@ -370,6 +392,14 @@ def create_continuation_run(body: dict):
         continue_sprint = 2
     continue_plan_only = bool(body.get("continue_plan_only", True))
     no_deepseek = bool(body.get("no_deepseek", True))
+
+    # Backend-side build guard — block before even queuing a run, not just in the
+    # frontend. Frontend-only blocking is not enough when the backend already has
+    # this data (sprint["quality"] in the source run's feature_sprint_plan.json).
+    if feature_sprint and not continue_plan_only:
+        quality = load_feature_sprint_quality(continue_run, continue_sprint)
+        if quality and quality.get("build_ready") is False:
+            abort(400, quality.get("disabled_reason") or "Sprint is not build-ready; decomposition or review required.")
 
     run_id = allocate_run_id()
     run_path = RUNS_DIR / run_id

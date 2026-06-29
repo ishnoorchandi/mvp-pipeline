@@ -1188,6 +1188,29 @@ function PipelineSectionOverview({ sections }: { sections: SectionDef[] }) {
 // later (Gap Analysis / Additive Architecture as structured panels, sprint-card
 // "Run next sprint" actions like normal sprint mode) — kept simple here on purpose.
 
+// Sprint Quality Gate — evaluate_sprint_quality()'s per-sprint result, mirrored
+// onto feature_sprint_plan.json's sprints[i].quality by
+// write_sprint_quality_gate_artifacts (see sprint_quality_gate.md/.json).
+// Older runs won't have this field — every consumer must handle it being
+// undefined and fall back to the pre-existing overlap/independently_demoable
+// signals.
+interface SprintQuality {
+  sprint_id: string;
+  sprint_number: number;
+  title: string;
+  build_ready: boolean;
+  requires_decomposition: boolean;
+  quality_score: number;
+  risk_level: "low" | "medium" | "high";
+  reasons: string[];
+  required_refinement: string[];
+  likely_files: string[];
+  matched_existing_files: string[];
+  has_overlap: boolean;
+  disabled_reason: string | null;
+  recommended_next_action: string;
+}
+
 interface FeatureSprintEntry {
   sprint_number: number;
   title: string;
@@ -1200,6 +1223,7 @@ interface FeatureSprintEntry {
   overlap_warnings?: string[];
   overlap_matched_files?: string[];
   independently_demoable?: boolean;
+  quality?: SprintQuality;
 }
 
 // A sprint in either of these statuses must never expose a normal, active "Build" button —
@@ -1215,6 +1239,12 @@ interface FeatureSprintPlan {
   sprints?: FeatureSprintEntry[];
   total_sprints?: number;
   selected_feature_sprint?: number;
+  sprint_quality_summary?: {
+    build_ready_count: number;
+    review_required_count: number;
+    requires_decomposition_count: number;
+    total_sprints: number;
+  };
 }
 
 const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
@@ -1264,6 +1294,10 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "additive_architecture.md", label: "Additive Architecture" },
   { file: "feature_sprint_plan.md", label: "Feature Sprint Plan" },
   { file: "feature_sprint_plan.json", label: "Feature Sprint Plan JSON" },
+  { file: "sprint_quality_gate.md", label: "Sprint Quality Gate" },
+  { file: "sprint_quality_gate.json", label: "Sprint Quality Gate JSON" },
+  { file: "build_ready_sprints.md", label: "Build-Ready Sprints" },
+  { file: "decomposition_needed_sprints.md", label: "Decomposition-Needed Sprints" },
   { file: "selected_feature_sprint_scope.md", label: "Selected Feature Sprint Scope" },
   { file: "selected_feature_sprint_build_prompt.txt", label: "Selected Feature Sprint Build Prompt" },
   { file: "selected_feature_change_boundary.md", label: "Selected Feature Change Boundary" },
@@ -1278,6 +1312,25 @@ const UPGRADE_ARTIFACT_PANELS: { file: string; label: string }[] = [
   { file: "regression_check.md", label: "Regression Check" },
   { file: "feature_completion_report.md", label: "Feature Completion Report" },
 ];
+
+// Sprint Quality Gate status badge — priority order matches the decisions a
+// builder actually needs to make first: decomposition blocks everything, then
+// overlap (extend, don't duplicate), then the quality gate's own build_ready/
+// review_required verdict. Older runs without sprint.quality fall back to the
+// pre-existing overlap_warnings/independently_demoable signals so they still
+// render correctly (backward compatible).
+function sprintStatusBadge(s: FeatureSprintEntry, hasOverlap: boolean, needsDecomposition: boolean): {
+  label: string; cls: string;
+} {
+  if (needsDecomposition) return { label: "Needs decomposition", cls: "decomposition" };
+  if (hasOverlap) return { label: "Overlap detected", cls: "overlap" };
+  if (s.quality) {
+    return s.quality.build_ready
+      ? { label: "Build ready", cls: "ready" }
+      : { label: "Review required", cls: "review" };
+  }
+  return { label: "Build ready", cls: "ready" };
+}
 
 function FeatureSprintRoadmap({ plan, onBuild, launching, hasPlanArtifact, selectedArtifact, onSelectArtifact }: {
   plan: FeatureSprintPlan; onBuild?: (n: number) => void; launching?: number | null;
@@ -1295,10 +1348,22 @@ function FeatureSprintRoadmap({ plan, onBuild, launching, hasPlanArtifact, selec
       </div>
       {sprints.map(s => {
         const status = s.status ?? "ready";
-        const hasOverlap = OVERLAP_BLOCKING_STATUSES.has(status) || (s.overlap_warnings?.length ?? 0) > 0;
-        const needsDecomposition = !hasOverlap && s.independently_demoable === false;
-        const matchedFiles = (s.overlap_matched_files ?? []).slice(0, 3);
-        const matchedFilesMore = (s.overlap_matched_files?.length ?? 0) - matchedFiles.length;
+        const quality = s.quality;
+        const hasOverlap = quality
+          ? quality.has_overlap
+          : OVERLAP_BLOCKING_STATUSES.has(status) || (s.overlap_warnings?.length ?? 0) > 0;
+        const needsDecomposition = quality
+          ? quality.requires_decomposition
+          : !hasOverlap && s.independently_demoable === false;
+        // build_ready: false (whether decomposition or just review_required) must
+        // disable the build action — frontend-only blocking is not enough on its
+        // own, but it must still never offer the button in the first place.
+        const buildBlocked = quality ? !quality.build_ready : (hasOverlap || needsDecomposition);
+        const badge = sprintStatusBadge(s, hasOverlap, needsDecomposition);
+        const matchedFiles = (s.overlap_matched_files ?? quality?.matched_existing_files ?? []).slice(0, 3);
+        const matchedFilesMore = (s.overlap_matched_files?.length ?? quality?.matched_existing_files.length ?? 0) - matchedFiles.length;
+        const likelyFiles = (quality?.likely_files ?? []).slice(0, 3);
+        const reasons = (quality?.reasons ?? []).slice(0, 3);
         return (
           <div
             key={s.sprint_number}
@@ -1307,12 +1372,14 @@ function FeatureSprintRoadmap({ plan, onBuild, launching, hasPlanArtifact, selec
             <div className="upgrade-sprint-title">
               Sprint {s.sprint_number} — {s.title}
               {s.sprint_number === selected && <span className="upgrade-sprint-pill">SELECTED</span>}
-              {hasOverlap && <span className="upgrade-sprint-pill upgrade-sprint-pill-warning">OVERLAP</span>}
-              {needsDecomposition && <span className="upgrade-sprint-pill upgrade-sprint-pill-neutral">NEEDS DECOMPOSITION</span>}
+              <span className={`upgrade-sprint-pill upgrade-sprint-pill-${badge.cls}`}>{badge.label}</span>
             </div>
             <div className="upgrade-sprint-goal">{s.goal}</div>
             <div className="upgrade-sprint-meta">
               Depends on: {(s.depends_on ?? [0]).map(d => `Sprint ${d}`).join(", ")} · Status: {status}
+              {quality && (
+                <> · Quality score: {quality.quality_score} · Risk: {quality.risk_level}</>
+              )}
             </div>
             {hasOverlap && (
               <div className="upgrade-sprint-overlap-warning">
@@ -1330,14 +1397,35 @@ function FeatureSprintRoadmap({ plan, onBuild, launching, hasPlanArtifact, selec
                 This area is too broad for one build step and should be refined before building.
               </div>
             )}
+            {!hasOverlap && !!likelyFiles.length && (
+              <div className="upgrade-sprint-likely-files">
+                <span className="upgrade-sprint-detail-label">Likely files</span>
+                <ul>{likelyFiles.map(f => <li key={f}><code>{f}</code></li>)}</ul>
+              </div>
+            )}
+            {!!reasons.length && (
+              <div className="upgrade-sprint-reasons">
+                <span className="upgrade-sprint-detail-label">Why</span>
+                <ul>{reasons.map(r => <li key={r}>{r}</li>)}</ul>
+              </div>
+            )}
+            {quality?.recommended_next_action && (
+              <div className="upgrade-sprint-next-action">{quality.recommended_next_action}</div>
+            )}
             {onBuild && (
-              hasOverlap ? (
-                <button className="submit-btn submit-btn-disabled" disabled title="This sprint needs roadmap revision before it can be safely built.">
-                  Needs roadmap revision before build
-                </button>
-              ) : needsDecomposition ? (
-                <button className="submit-btn submit-btn-disabled" disabled title="This sprint should be broken down into smaller sprints before it can be built.">
-                  Needs decomposition before build
+              buildBlocked ? (
+                <button
+                  className="submit-btn submit-btn-disabled"
+                  disabled
+                  title={
+                    quality?.disabled_reason
+                      ?? (hasOverlap ? "This sprint needs roadmap revision before it can be safely built."
+                          : "This sprint should be broken down into smaller sprints before it can be built.")
+                  }
+                >
+                  {needsDecomposition ? "Needs decomposition before build."
+                    : hasOverlap ? "Needs roadmap revision before build"
+                    : "Review required before build."}
                 </button>
               ) : (
                 <button className="submit-btn" onClick={() => onBuild(s.sprint_number)} disabled={launching !== null}>

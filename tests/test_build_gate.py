@@ -43,9 +43,19 @@ def make_repo(root: Path, branch: str = "main") -> Path:
 
 
 def rich_sprint_plan_json() -> str:
+    # Enough detail (likely files, specific acceptance criteria, non-goals, smoke
+    # checks, no backend/db/auth keywords) to clear the Sprint Quality Gate and
+    # reach build_ready — these tests are about build-path mechanics (company
+    # branch protection, Claude invocation), not the quality gate itself.
     return json.dumps({"sprints": [{
-        "sprint_number": 1, "title": "Add Saved Filters", "goal": "Save filters",
-        "features": ["save"], "completion_criteria": ["works"],
+        "sprint_number": 1, "title": "Add Saved Filters to Resource Browser",
+        "goal": "Let users save and reload named filters on the resource browser page.",
+        "features": ["save filter", "reload filter"],
+        "completion_criteria": ["A named filter can be saved and reloaded from the resource browser page."],
+        "non_goals": ["No backend or schema changes."],
+        "smoke_checks": ["npm run build"],
+        "likely_files_created": ["frontend/src/components/SavedFilters.tsx"],
+        "likely_files_modified": ["frontend/src/pages/Home.tsx"],
     }]})
 
 

@@ -417,9 +417,15 @@ def test_build_mode_creates_accountability_artifacts():
         p.RUNS_DIR.mkdir()
         p.gpt = lambda *_args, **_kwargs: "# Generated\n"
         p.gpt4o = lambda *_args, **_kwargs: json.dumps({"sprints": [{
-            "sprint_number": 1, "title": "Add Saved Filters", "goal": "Save filters",
-            "features": ["save"], "likely_files_modified": ["frontend/src/pages/Home.tsx"],
-            "must_not_modify": ["backend/app.py"], "completion_criteria": ["works"],
+            "sprint_number": 1, "title": "Add Saved Filters to Resource Browser",
+            "goal": "Let users save and reload named filters on the resource browser page.",
+            "features": ["save filter", "reload filter"],
+            "likely_files_created": ["frontend/src/components/SavedFilters.tsx"],
+            "likely_files_modified": ["frontend/src/pages/Home.tsx"],
+            "must_not_modify": ["backend/app.py"],
+            "completion_criteria": ["A named filter can be saved and reloaded from the resource browser page."],
+            "non_goals": ["No backend or schema changes."],
+            "smoke_checks": ["npm run build"],
             "manual_qa_checklist": ["save and reload"],
         }]})
         def fake_build(*_args, **_kwargs):

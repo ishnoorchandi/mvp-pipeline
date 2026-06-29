@@ -1531,6 +1531,13 @@ class SprintNotFoundError(ValueError):
     """Raised when --selected-sprint refers to a sprint number not present in the plan."""
 
 
+class SprintNotBuildReadyError(ValueError):
+    """Raised when select_feature_sprint resolves a sprint whose quality gate says
+    build_ready is False. The pipeline must never reach Step 12 / Claude Code for a
+    sprint that needs decomposition or review — this is the backend-side guard, not
+    just a frontend-only block."""
+
+
 def _extract_json_object(text: str) -> str:
     """Strip markdown code fences (```json ... ``` or ``` ... ```) if present, else
     fall back to slicing between the first '{' and the last '}'. Deterministic, no GPT call."""
@@ -6611,6 +6618,10 @@ _FEATURE_SPRINT_FIELD_DEFAULTS = {
     "smoke_checks": [],
     "manual_qa_checklist": [],
     "independently_demoable": True,
+    # True only for placeholder sprints appended by _expand_plan_for_undercovered_topics —
+    # a floor for roadmap coverage, never a substitute for real planning. Always a
+    # high-risk blocker in the sprint quality gate.
+    "auto_expanded": False,
 }
 
 
@@ -6961,6 +6972,7 @@ def _expand_plan_for_undercovered_topics(
             "status": "ready",
             "buildable": True,
             "independently_demoable": False,
+            "auto_expanded": True,
         })
         expanded.append(placeholder)
         next_number += 1
@@ -6998,6 +7010,7 @@ def normalize_feature_sprint_plan(
         ))
         entry["buildable"] = True
         entry["independently_demoable"] = bool(entry.get("independently_demoable", True))
+        entry["auto_expanded"] = bool(entry.get("auto_expanded", False))
         if entry.get("status") not in ("ready", "locked"):
             entry["status"] = "ready"
         normalized.append(entry)
@@ -7064,14 +7077,29 @@ def parse_feature_sprint_plan_json(
     )
 
 
-def select_feature_sprint(plan_json: dict, selected_sprint_number: int) -> dict:
-    """Deterministic lookup. Sprint 0 is the baseline and is never selectable for build."""
+def select_feature_sprint(plan_json: dict, selected_sprint_number: int, enforce_quality_gate: bool = True) -> dict:
+    """Deterministic lookup. Sprint 0 is the baseline and is never selectable for build.
+
+    Backend-side build guard: if the resolved sprint carries Sprint Quality Gate
+    metadata (sprint["quality"], written by write_sprint_quality_gate_artifacts)
+    and it says build_ready is False, this raises SprintNotBuildReadyError instead
+    of returning the sprint — frontend-only blocking is not enough when the backend
+    already has this data. Older plans without quality metadata are unaffected
+    (backward compatible). Pass enforce_quality_gate=False for read-only lookups
+    that are not about to trigger a build."""
     if selected_sprint_number == 0:
         raise SprintNotFoundError(
             "Sprint 0 is the existing baseline and is not buildable. Choose a feature sprint >= 1."
         )
     for s in plan_json.get("sprints", []):
         if s.get("sprint_number") == selected_sprint_number:
+            quality = s.get("quality")
+            if enforce_quality_gate and quality and quality.get("build_ready") is False:
+                raise SprintNotBuildReadyError(
+                    f"Feature sprint {selected_sprint_number} ('{s.get('title')}') is not build-ready: "
+                    f"{quality.get('disabled_reason') or 'quality gate blocked this sprint'}. "
+                    f"{quality.get('recommended_next_action') or ''}".strip()
+                )
             return s
     available = [s.get("sprint_number") for s in plan_json.get("sprints", [])]
     raise SprintNotFoundError(
@@ -7432,6 +7460,362 @@ def _apply_overlap_status_to_sprints(sprints: list[dict], violations_detailed: l
         sprint["status"] = overlap_status
 
 
+# ── Sprint Quality Gate ──────────────────────────────────────────────────────
+# Evaluates each generated feature sprint for build-readiness BEFORE it can be
+# selected for Step 12 (Claude Code build). Planning/safety only — never runs
+# Claude Code, never changes build execution behavior beyond blocking sprints
+# that are too vague or too broad to safely build in one step.
+
+_SQ_DB_RE = re.compile(r"\b(database|db schema|schema migration|schema change|migrations?)\b", re.IGNORECASE)
+_SQ_AUTH_RE = re.compile(
+    r"\b(auth(?:entication|orization)?|rbac|role[- ]based access|permissions?|security (?:review|hardening|polic\w*))\b",
+    re.IGNORECASE,
+)
+_SQ_PAYMENT_RE = re.compile(r"\b(payment|billing|invoic\w*|stripe|checkout)\b", re.IGNORECASE)
+_SQ_INFRA_RE = re.compile(
+    r"\b(infrastructure|production deploy\w*|deployment pipeline|kubernetes|docker(?:file)?|terraform|ci/cd|provisioning)\b",
+    re.IGNORECASE,
+)
+_SQ_ADMIN_REWRITE_RE = re.compile(
+    r"\b(admin platform|platform[- ]wide|full platform|entire platform|complete rewrite|rewrite the)\b",
+    re.IGNORECASE,
+)
+_SQ_BACKEND_RE = re.compile(r"\b(backend|\bapi\b|endpoint|server[- ]side route)\b", re.IGNORECASE)
+_SQ_ENDPOINT_PATTERN_RE = re.compile(
+    r"(get|post|put|patch|delete)\s+/\S+|/api/[a-z0-9_\-/{}]+", re.IGNORECASE,
+)
+_SQ_VAGUE_RE = re.compile(r"\b(full|complete|entire|all|platform[- ]wide|everything)\b", re.IGNORECASE)
+_SQ_FRONTEND_RE = re.compile(
+    r"\b(ui|frontend|component|page|dashboard|screen|view|widget|form|modal|button)\b", re.IGNORECASE,
+)
+
+_SQ_DOMAIN_PATTERNS = {
+    "backend": _SQ_BACKEND_RE,
+    "database": _SQ_DB_RE,
+    "auth": _SQ_AUTH_RE,
+    "payment": _SQ_PAYMENT_RE,
+    "infrastructure": _SQ_INFRA_RE,
+}
+
+_SPRINT_TOO_BROAD_NOTE = "Too broad for one build step"
+
+
+def _sprint_quality_text(sprint: dict) -> str:
+    """Combined lowercase text for one sprint — title/goal/result + the list
+    fields that describe actual planned work. Deliberately EXCLUDES non_goals
+    and regression_risks: those fields describe what is explicitly NOT being
+    done (or what could go wrong), so a sprint that says "no changes to backend
+    endpoints" must never be flagged as touching backend just because the word
+    "backend" appears in its non-goals. Deterministic, no GPT call."""
+    parts: list[str] = []
+    for key in ("title", "goal", "user_visible_result"):
+        v = sprint.get(key)
+        if isinstance(v, str):
+            parts.append(v)
+    for key in ("features", "requirements_covered", "completion_criteria",
+                "smoke_checks", "manual_qa_checklist"):
+        parts.extend(str(v) for v in (sprint.get(key) or []) if isinstance(v, str))
+    return " ".join(parts).lower()
+
+
+def evaluate_sprint_quality(sprint: dict, existing_app_files: set[str] | None = None) -> dict:
+    """Evaluates ONE normalized feature sprint dict for build-readiness.
+
+    Planning/safety only — never runs Claude Code, never decides anything about
+    Step 12 other than whether this sprint is allowed to be selected for it.
+
+    existing_app_files (optional): repo-relative paths from the existing app
+    scan (scan["all_files"]) — used to raise confidence when likely files
+    actually exist in the repo already.
+
+    Conservative thresholds: quality_score >= 75 and no high-risk blocker =>
+    build_ready. 50-74 (no blocker) => review_required. < 50, or any high-risk
+    blocker regardless of score, => requires_decomposition.
+    """
+    text = _sprint_quality_text(sprint)
+    title = (sprint.get("title") or "").strip()
+    goal = (sprint.get("goal") or "").strip()
+    likely_files = list(sprint.get("likely_files_created") or []) + list(sprint.get("likely_files_modified") or [])
+    completion_criteria = sprint.get("completion_criteria") or []
+    non_goals = sprint.get("non_goals") or []
+    smoke_checks = sprint.get("smoke_checks") or []
+    overlap_matched_files = sprint.get("overlap_matched_files") or []
+    overlap_warnings = sprint.get("overlap_warnings") or []
+    depends_on = [d for d in (sprint.get("depends_on") or []) if d != 0]
+    auto_expanded = bool(sprint.get("auto_expanded"))
+
+    score = 60
+    reasons: list[str] = []
+    required_refinement: list[str] = []
+    blockers: list[str] = []
+
+    has_files = bool(likely_files)
+    has_acceptance = bool(completion_criteria) and any(len(str(c).strip()) >= 15 for c in completion_criteria)
+    has_non_goals = bool(non_goals)
+    has_smoke = bool(smoke_checks)
+    has_dep_list = bool(depends_on)
+    matched_existing = [f for f in likely_files if existing_app_files and f in existing_app_files]
+
+    domain_hits = {name: bool(pattern.search(text)) for name, pattern in _SQ_DOMAIN_PATTERNS.items()}
+    domain_count = sum(domain_hits.values())
+    is_frontend_bounded = bool(_SQ_FRONTEND_RE.search(text)) and not any(
+        domain_hits[d] for d in ("backend", "database", "auth", "payment", "infrastructure")
+    )
+    has_endpoint_pattern = bool(_SQ_ENDPOINT_PATTERN_RE.search(text))
+    is_vague_title = len(title.split()) <= 2 or len(goal.split()) <= 3
+    has_vague_scope_words = bool(_SQ_VAGUE_RE.search(f"{title} {goal}"))
+    is_admin_rewrite = bool(_SQ_ADMIN_REWRITE_RE.search(text))
+
+    # ── Positive credit ──────────────────────────────────────────────────────
+    if has_files:
+        score += 15
+        reasons.append("Lists likely files")
+    if has_acceptance:
+        score += 10
+        reasons.append("Acceptance criteria are specific")
+    if has_non_goals:
+        score += 8
+        reasons.append("Has clear non-goals")
+    if overlap_matched_files:
+        score += 8
+        reasons.append("Matched existing files for overlap area")
+    if is_frontend_bounded:
+        score += 10
+        reasons.append("Has clear UI scope")
+    if has_smoke:
+        score += 8
+        reasons.append("Has an explicit test/smoke check plan")
+    if has_dep_list:
+        score += 5
+        reasons.append("Has a clear dependency list")
+    if domain_count <= 1 and not has_vague_scope_words:
+        score += 5
+        reasons.append("Scope is limited to one area")
+    if matched_existing:
+        score += 4
+
+    # ── Negative credit ──────────────────────────────────────────────────────
+    if is_vague_title:
+        score -= 15
+        reasons.append("Vague title or goal")
+    if not has_files:
+        score -= 20
+        reasons.append("No likely files listed")
+    if not has_acceptance:
+        score -= 15
+        reasons.append("No specific acceptance criteria")
+    if domain_hits["backend"] and not has_endpoint_pattern:
+        score -= 15
+        reasons.append("Touches backend without an exact endpoint list")
+        required_refinement.append("Split API endpoints into a separate sprint with an exact route list")
+        blockers.append("backend_no_endpoints")
+    if domain_hits["database"]:
+        score -= 25
+        reasons.append("Touches database/schema/migrations")
+        required_refinement.append("Define exact schema/migration changes before build")
+        required_refinement.append("Define backend smoke checks before build")
+        blockers.append("database_schema")
+    if domain_hits["auth"]:
+        score -= 25
+        reasons.append("Touches authentication/authorization/security")
+        required_refinement.append("Define exact authorization rules and affected endpoints/pages")
+        blockers.append("auth_security")
+    if domain_hits["payment"]:
+        score -= 25
+        reasons.append("Touches payment/billing")
+        required_refinement.append("Define exact payment/billing flows and compliance checks")
+        blockers.append("payment_billing")
+    if domain_hits["infrastructure"]:
+        score -= 20
+        reasons.append("Requires new infrastructure/deployment changes")
+        required_refinement.append("Move infrastructure/deployment changes to a dedicated ops sprint")
+        blockers.append("infrastructure")
+    if is_admin_rewrite:
+        score -= 20
+        reasons.append("Describes a broad admin platform rewrite")
+        required_refinement.append("Break the platform-wide rewrite into smaller, independently buildable sprints")
+        blockers.append("admin_rewrite")
+    if domain_count >= 3:
+        score -= 15
+        reasons.append("Includes multiple unrelated domains in one sprint")
+        required_refinement.append("Split unrelated domains into separate sprints")
+    if has_vague_scope_words:
+        score -= 15
+        reasons.append("Uses broad/unscoped language (full, complete, entire, all, platform-wide)")
+        required_refinement.append("Narrow the scope to a specific, demoable slice")
+    if auto_expanded:
+        score -= 20
+        reasons.append("Auto-expanded roadmap placeholder, not yet decomposed")
+        required_refinement.append("Re-plan this bucket into concrete, independently buildable sprints")
+        blockers.append("auto_expanded")
+    if overlap_warnings and not overlap_matched_files:
+        score -= 8
+        reasons.append("Overlap expected but no matched existing files were listed — needs review")
+    if not has_files and not has_acceptance:
+        blockers.append("no_files_no_acceptance")
+        required_refinement.append("List the exact files this sprint will create or modify")
+        required_refinement.append("Define specific, testable acceptance criteria")
+
+    score = max(0, min(100, score))
+
+    has_blocker = bool(blockers)
+    requires_decomposition = has_blocker or score < 50
+    build_ready = score >= 75 and not has_blocker
+
+    if requires_decomposition:
+        risk_level = "high"
+        if _SPRINT_TOO_BROAD_NOTE not in reasons:
+            reasons.append(_SPRINT_TOO_BROAD_NOTE)
+        if _SPRINT_TOO_BROAD_NOTE not in required_refinement:
+            required_refinement.append(_SPRINT_TOO_BROAD_NOTE)
+        recommended_next_action = "Decompose before build."
+        disabled_reason = "Needs decomposition before build"
+    elif not build_ready:
+        risk_level = "medium"
+        recommended_next_action = "Review required before build."
+        disabled_reason = "Review required before build"
+    else:
+        risk_level = "low"
+        recommended_next_action = "Ready for guarded build in sandbox or feature branch."
+        disabled_reason = None
+
+    sprint_number = sprint.get("sprint_number")
+    return {
+        "sprint_id": f"sprint_{sprint_number}",
+        "sprint_number": sprint_number,
+        "title": title or f"Sprint {sprint_number}",
+        "build_ready": build_ready,
+        "requires_decomposition": requires_decomposition,
+        "quality_score": score,
+        "risk_level": risk_level,
+        "reasons": reasons[:6],
+        "required_refinement": required_refinement[:6],
+        "likely_files": likely_files[:3],
+        "matched_existing_files": (overlap_matched_files or matched_existing)[:3],
+        "has_overlap": bool(overlap_warnings or overlap_matched_files),
+        "disabled_reason": disabled_reason,
+        "recommended_next_action": recommended_next_action,
+    }
+
+
+def build_sprint_quality_gate(plan_json: dict, existing_app_files: set[str] | None = None) -> dict:
+    """Evaluates every buildable sprint (sprint_number > 0; Sprint 0 baseline is
+    never selectable for build) in a normalized feature sprint plan. Deterministic,
+    no GPT call. Returns {"sprints": [...], "summary": {...}}."""
+    sprints = [s for s in (plan_json.get("sprints") or []) if (s.get("sprint_number") or 0) > 0]
+    results = [evaluate_sprint_quality(s, existing_app_files) for s in sprints]
+    build_ready_count = sum(1 for r in results if r["build_ready"])
+    decomposition_count = sum(1 for r in results if r["requires_decomposition"])
+    review_count = len(results) - build_ready_count - decomposition_count
+    return {
+        "sprints": results,
+        "summary": {
+            "build_ready_count": build_ready_count,
+            "review_required_count": review_count,
+            "requires_decomposition_count": decomposition_count,
+            "total_sprints": len(results),
+        },
+    }
+
+
+def _sprint_quality_status_label(result: dict) -> str:
+    if result["build_ready"]:
+        return "Build ready"
+    if result["requires_decomposition"]:
+        return "Needs decomposition"
+    return "Review required"
+
+
+def render_sprint_quality_gate_markdown(gate: dict) -> str:
+    summary = gate["summary"]
+    lines = [
+        "# Sprint Quality Gate", "",
+        "## Summary",
+        f"- Build-ready sprints: {summary['build_ready_count']}",
+        f"- Review-required sprints: {summary['review_required_count']}",
+        f"- Needs decomposition: {summary['requires_decomposition_count']}",
+        "",
+    ]
+    for r in gate["sprints"]:
+        lines.append(f"## Sprint {r['sprint_number']} — {r['title']}")
+        lines.append(f"Status: {_sprint_quality_status_label(r)}")
+        lines.append(f"Quality score: {r['quality_score']}")
+        lines.append(f"Risk: {r['risk_level'].capitalize()}")
+        lines.append("")
+        if r["reasons"]:
+            lines.append("Why:")
+            lines.extend(f"- {reason}" for reason in r["reasons"][:3])
+            lines.append("")
+        if r["matched_existing_files"]:
+            lines.append("Matched existing files:")
+            lines.extend(f"- {f}" for f in r["matched_existing_files"][:3])
+            lines.append("")
+        elif r["likely_files"]:
+            lines.append("Likely files:")
+            lines.extend(f"- {f}" for f in r["likely_files"][:3])
+            lines.append("")
+        if r["required_refinement"]:
+            lines.append("Required refinement:")
+            lines.extend(f"- {item}" for item in r["required_refinement"][:3])
+            lines.append("")
+        lines.append("Next action:")
+        lines.append(r["recommended_next_action"])
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_build_ready_sprints_markdown(gate: dict) -> str:
+    ready = [r for r in gate["sprints"] if r["build_ready"]]
+    lines = ["# Build-Ready Sprints", ""]
+    if not ready:
+        lines.append("No sprints are currently build-ready. See sprint_quality_gate.md.")
+    for r in ready:
+        lines.append(f"## Sprint {r['sprint_number']} — {r['title']}")
+        lines.append(f"Quality score: {r['quality_score']} · Risk: {r['risk_level'].capitalize()}")
+        lines.append(r["recommended_next_action"])
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_decomposition_needed_sprints_markdown(gate: dict) -> str:
+    needs = [r for r in gate["sprints"] if r["requires_decomposition"]]
+    lines = ["# Sprints Needing Decomposition", ""]
+    if not needs:
+        lines.append("No sprints currently require decomposition.")
+    for r in needs:
+        lines.append(f"## Sprint {r['sprint_number']} — {r['title']}")
+        lines.append(f"Quality score: {r['quality_score']} · Risk: {r['risk_level'].capitalize()}")
+        if r["required_refinement"]:
+            lines.append("Required refinement:")
+            lines.extend(f"- {item}" for item in r["required_refinement"][:3])
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def write_sprint_quality_gate_artifacts(plan_json: dict, run_dir, existing_app_files: set[str] | None = None) -> dict:
+    """Evaluates every sprint, writes sprint_quality_gate.md/.json,
+    build_ready_sprints.md, decomposition_needed_sprints.md into run_dir, and
+    mirrors each sprint's quality result onto plan_json["sprints"][i]["quality"]
+    (and plan_json["sprint_quality_summary"]) so feature_sprint_plan.json and the
+    UI get this data without a second fetch. Planning/safety only."""
+    gate = build_sprint_quality_gate(plan_json, existing_app_files)
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "sprint_quality_gate.json").write_text(json.dumps(gate, indent=2), encoding="utf-8")
+    (run_dir / "sprint_quality_gate.md").write_text(render_sprint_quality_gate_markdown(gate), encoding="utf-8")
+    (run_dir / "build_ready_sprints.md").write_text(render_build_ready_sprints_markdown(gate), encoding="utf-8")
+    (run_dir / "decomposition_needed_sprints.md").write_text(
+        render_decomposition_needed_sprints_markdown(gate), encoding="utf-8",
+    )
+    by_number = {r["sprint_number"]: r for r in gate["sprints"]}
+    for sprint in plan_json.get("sprints") or []:
+        result = by_number.get(sprint.get("sprint_number"))
+        if result:
+            sprint["quality"] = result
+    plan_json["sprint_quality_summary"] = gate["summary"]
+    return gate
+
+
 def generate_feature_sprint_plan(
     existing_app_summary: str,
     new_feature_requirements: str,
@@ -7493,6 +7877,14 @@ def generate_feature_sprint_plan(
     violations_detailed = _overlap_violations_detailed(plan_json, overlap_check)
     plan_json["overlap_warnings"] = [v["message"] for v in violations_detailed]
     _apply_overlap_status_to_sprints(plan_json.get("sprints") or [], violations_detailed)
+
+    # Sprint Quality Gate — planning/safety only. Evaluates build-readiness for
+    # every sprint and mirrors the result onto plan_json before it's serialized,
+    # so feature_sprint_plan.json and the UI carry this data without a second
+    # fetch. Never runs Claude Code; never changes build execution behavior
+    # beyond marking non-build-ready sprints so they can be blocked downstream.
+    existing_app_files = set((scan or {}).get("all_files") or [])
+    write_sprint_quality_gate_artifacts(plan_json, run_dir, existing_app_files)
 
     plan_md = render_feature_sprint_plan_markdown(plan_json)
 
@@ -9178,7 +9570,17 @@ def pipeline_existing_app_upgrade(
         print(f"{'='*60}\n")
         return run_id
 
-    selected_sprint = select_feature_sprint(plan_json, selected_feature_sprint)
+    try:
+        selected_sprint = select_feature_sprint(plan_json, selected_feature_sprint)
+    except SprintNotBuildReadyError as e:
+        _update_state(run_id, {"status": "blocked_sprint_not_build_ready", "current_step": "blocked"})
+        log_event(run_id, "build_blocked_sprint_not_build_ready", str(e))
+        print(f"\n{'='*60}")
+        print("  ⛔ BLOCKED — selected sprint is not build-ready")
+        print(f"  {e}")
+        print("  See sprint_quality_gate.md / decomposition_needed_sprints.md.")
+        print(f"{'='*60}\n")
+        return run_id
     total = plan_json.get("total_sprints", len(plan_json.get("sprints", [])))
     print(f"Selected Feature Sprint: Sprint {selected_feature_sprint} of {total}")
 
@@ -12555,6 +12957,17 @@ if __name__ == "__main__":
         sys.exit(1)
     except ContinuationError as e:
         print(f"\n  ❌  {e}\n")
+        sys.exit(1)
+    except SprintNotBuildReadyError as e:
+        if run_id_arg:
+            try:
+                _update_state(run_id_arg, {
+                    "status": "blocked_sprint_not_build_ready", "current_step": "blocked",
+                    "error": str(e),
+                })
+            except Exception:
+                pass
+        print(f"\n  ⛔ BLOCKED — selected sprint is not build-ready: {e}\n")
         sys.exit(1)
     except KeyboardInterrupt:
         if run_id_arg:
