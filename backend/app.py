@@ -67,6 +67,278 @@ def load_feature_sprint_quality(continue_run: str, sprint_number: int) -> dict |
     return None
 
 
+# ── Operator Summary ──────────────────────────────────────────────────────────
+# Normalizes a run's scattered run_state.json / artifact fields into one
+# deterministic, decision-focused summary so the UI can answer "what happened,
+# what's the status, is it safe to build/commit/deliver, what's blocking it,
+# what's the next safe action, which artifacts matter" without the user having
+# to read raw artifacts. Read-only — never writes into the run folder, never
+# makes an LLM call, and never breaks on a run that predates these fields
+# (everything here degrades to "unknown" rather than crashing or guessing).
+
+WORKFLOW_TYPES = (
+    "existing_app_plan", "existing_app_build", "bugfix_plan", "backend_inventory",
+    "backend_safety", "git_sync", "pr_delivery", "unknown",
+)
+EXECUTION_MODES = (
+    "plan_only", "build", "build_blocked", "sandbox_build", "bugfix_plan", "inventory", "unknown",
+)
+BUILD_STATUSES = ("not_run", "blocked", "running", "passed", "failed", "interrupted", "unknown")
+DELIVERY_STATUSES = ("not_requested", "blocked", "ready", "committed", "pushed", "pr_opened", "unknown")
+REPO_HEALTHS = (
+    "clean", "dirty_dependency_files", "dirty_source_files", "dirty_secrets_or_env", "blocked", "unknown",
+)
+
+# Priority-ordered — the first N of these that actually exist for a run become
+# its primary_artifacts. Keeps the "Primary Outputs" section to the handful of
+# files that actually drive a decision, never a dump of everything written.
+PRIMARY_ARTIFACT_PRIORITY = [
+    "feature_sprint_plan.md", "sprint_quality_gate.md", "existing_feature_overlap_check.md",
+    "feature_gap_matrix.md", "additive_architecture.md", "selected_feature_sprint_scope.md",
+    "repo_hygiene_summary.md", "sandbox_patch_summary.md", "sandbox_changed_files.md",
+    "sandbox_patch.diff", "apply_patch_instructions.md", "minimal_fix_plan.md",
+    "backend_route_map.md", "backend_boundary_summary.md", "git_sync_report.md",
+    "pr_remote_delivery_report.md", "feature_completion_report.md",
+]
+
+_INTERRUPTED_LIKE_STATUSES = {"interrupted", "cancelled"}
+_BLOCKED_STATUSES = {
+    "build_blocked", "blocked_sprint_not_build_ready", "blocked_dirty_target_repo",
+    "blocked_git_pull", "blocked_consistency_violation",
+}
+
+
+def _read_json_artifact(run_dir: Path, filename: str) -> dict | None:
+    p = run_dir / filename
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def build_operator_run_summary(run_dir: Path, run_state: dict, artifacts: list[str]) -> dict:
+    """Deterministic, read-only normalization of one run's state + artifacts into
+    an operator-focused summary. Never makes an LLM call; never writes anything.
+    Missing/older fields always degrade to "unknown" rather than raising."""
+    run_state = run_state or {}
+    artifact_set = set(artifacts or [])
+    status = run_state.get("status") or "unknown"
+    raw_execution_mode = run_state.get("execution_mode")
+    claude_build_ran = "claude_build_output.txt" in artifact_set
+
+    # ── workflow_type ────────────────────────────────────────────────────────
+    if run_state.get("bugfix_mode"):
+        workflow_type = "bugfix_plan"
+    elif run_state.get("backend_inventory_mode"):
+        workflow_type = "backend_inventory"
+    elif run_state.get("backend_boundary_status") is not None or run_state.get("backend_smoke_status") is not None:
+        workflow_type = "backend_safety"
+    elif run_state.get("mode") == "existing_app_upgrade":
+        workflow_type = "existing_app_build" if claude_build_ran else "existing_app_plan"
+    elif run_state.get("pr_remote_decision") or run_state.get("pr_plan_status"):
+        workflow_type = "pr_delivery"
+    elif run_state.get("git_sync_status") is not None:
+        workflow_type = "git_sync"
+    else:
+        workflow_type = "unknown"
+
+    # ── execution_mode ───────────────────────────────────────────────────────
+    if workflow_type == "bugfix_plan":
+        execution_mode = "bugfix_plan"
+    elif workflow_type == "backend_inventory":
+        execution_mode = "inventory"
+    elif raw_execution_mode == "build" and run_state.get("build_workspace_mode") == "sandbox":
+        execution_mode = "sandbox_build"
+    elif raw_execution_mode in ("plan_only", "build", "build_blocked"):
+        execution_mode = raw_execution_mode
+    else:
+        execution_mode = "unknown"
+
+    # ── build_status ─────────────────────────────────────────────────────────
+    if status in _INTERRUPTED_LIKE_STATUSES:
+        build_status = "interrupted"
+    elif status in _BLOCKED_STATUSES or execution_mode == "build_blocked":
+        build_status = "blocked"
+    elif status == "building":
+        build_status = "running"
+    elif claude_build_ran:
+        build_failed = (
+            run_state.get("regression_status") == "FAIL"
+            or run_state.get("change_boundary_status") == "FAIL"
+            or bool(run_state.get("smoke_mutation_blocked_delivery"))
+        )
+        build_status = "failed" if build_failed else "passed"
+    elif execution_mode in ("plan_only", "bugfix_plan", "inventory"):
+        build_status = "not_run"
+    elif status == "unknown":
+        build_status = "unknown"
+    else:
+        build_status = "not_run"
+
+    # ── delivery_status ──────────────────────────────────────────────────────
+    delivery_state = _read_json_artifact(run_dir / "delivery", "delivery_state.json")
+    pr_remote_decision = run_state.get("pr_remote_decision")
+    if pr_remote_decision == "PR_CREATED":
+        delivery_status = "pr_opened"
+    elif pr_remote_decision == "PUSHED_BRANCH":
+        delivery_status = "pushed"
+    elif run_state.get("local_delivery_blocked_by_boundary"):
+        delivery_status = "blocked"
+    elif delivery_state and delivery_state.get("decision") == "BLOCKED":
+        delivery_status = "blocked"
+    elif delivery_state and delivery_state.get("decision") in ("PASS_LOCAL_ONLY", "PASS_SANDBOX_PUSH"):
+        delivery_status = "committed"
+    elif run_state.get("pr_plan_status") == "blocked":
+        delivery_status = "blocked"
+    elif run_state.get("pr_plan_status") in ("ready", "warning", "pr_workflow_required"):
+        delivery_status = "ready"
+    else:
+        delivery_status = "not_requested"
+
+    # ── repo_health ───────────────────────────────────────────────────────────
+    hygiene_severity = run_state.get("repo_hygiene_severity")
+    hygiene_text = (run_state.get("repo_hygiene_summary_text") or "").lower()
+    if hygiene_severity == "clean":
+        repo_health = "clean"
+    elif hygiene_severity in ("warn", "review", "blocked"):
+        if "secret" in hygiene_text or "credential" in hygiene_text or ".env" in hygiene_text:
+            repo_health = "dirty_secrets_or_env"
+        elif "dependency" in hygiene_text:
+            repo_health = "dirty_dependency_files"
+        elif "source" in hygiene_text:
+            repo_health = "dirty_source_files"
+        else:
+            repo_health = "blocked" if hygiene_severity == "blocked" else "unknown"
+    elif run_state.get("original_repo_modified") is True:
+        repo_health = "blocked"
+    elif run_state.get("original_repo_modified") is False:
+        repo_health = "clean"
+    else:
+        repo_health = "unknown"
+
+    # ── workspace_mode ────────────────────────────────────────────────────────
+    raw_workspace_mode = run_state.get("build_workspace_mode")
+    if raw_workspace_mode == "sandbox":
+        workspace_mode = "sandbox"
+    elif raw_workspace_mode == "direct":
+        workspace_mode = "direct_branch"
+    elif execution_mode == "plan_only" or workflow_type in ("existing_app_plan", "bugfix_plan", "backend_inventory", "backend_safety"):
+        workspace_mode = "planning_only"
+    else:
+        workspace_mode = "unknown"
+
+    # ── target repo ───────────────────────────────────────────────────────────
+    target_repo_path = (
+        run_state.get("original_repo_path") or run_state.get("existing_app_path")
+        or run_state.get("existing_app") or (delivery_state or {}).get("repo_path")
+    )
+    target_repo_name = Path(target_repo_path).name if target_repo_path else None
+
+    # ── current_status / blocking_issue / next_safe_action ──────────────────
+    sprint_quality = _read_json_artifact(run_dir, "sprint_quality_gate.json")
+    sprint_quality_summary = (sprint_quality or {}).get("summary") or {}
+    build_ready_count = sprint_quality_summary.get("build_ready_count", 0)
+    requires_decomposition_count = sprint_quality_summary.get("requires_decomposition_count", 0)
+    if not sprint_quality:
+        sprint_quality_status = "unknown"
+    elif build_ready_count:
+        sprint_quality_status = "has_build_ready_sprints"
+    elif requires_decomposition_count:
+        sprint_quality_status = "needs_decomposition"
+    else:
+        sprint_quality_status = "unknown"
+
+    blocking_issue = None
+    current_status = None
+    next_safe_action = None
+
+    if status == "sandbox_original_repo_modified_warning":
+        current_status = "Sandbox build completed with a warning"
+        blocking_issue = "Original repo changed unexpectedly during sandbox flow."
+        next_safe_action = "Investigate immediately before trusting this run."
+    elif status == "blocked_sprint_not_build_ready":
+        current_status = "Build blocked"
+        blocking_issue = "Selected sprint needs decomposition before build."
+        next_safe_action = "Decompose selected sprint."
+    elif status == "build_blocked" or execution_mode == "build_blocked":
+        current_status = "Build blocked"
+        blocking_issue = run_state.get("build_gate_reason") or "Build blocked by safety gate."
+        next_safe_action = "Use a sandbox workspace or a prepared feature branch."
+    elif status in ("blocked_dirty_target_repo", "blocked_git_pull"):
+        current_status = "Build blocked"
+        blocking_issue = "Target repo has local changes that must be resolved first."
+        next_safe_action = "Resolve repo hygiene issues, then re-run."
+    elif status in _INTERRUPTED_LIKE_STATUSES:
+        current_status = "Run interrupted before completion."
+        next_safe_action = "Ignore or rerun."
+    elif status == "started":
+        current_status = "Run started but may not have completed."
+        next_safe_action = "Check pipeline.log, or rerun."
+    elif status == "failed":
+        current_status = "Run failed."
+        next_safe_action = "Check pipeline.log for the error."
+    elif workflow_type == "existing_app_build" and claude_build_ran:
+        if execution_mode == "sandbox_build":
+            current_status = "Sandbox build completed"
+            next_safe_action = "Review sandbox patch"
+        else:
+            current_status = "Build completed"
+            next_safe_action = "Review changes, then run delivery"
+    elif workflow_type == "existing_app_plan":
+        current_status = "Sprint plan ready"
+        next_safe_action = "Review build-ready sprints" if build_ready_count else "Review sprint plan"
+    elif workflow_type == "bugfix_plan":
+        current_status = "Bugfix plan ready"
+        next_safe_action = "Review minimal fix plan"
+    elif workflow_type == "backend_inventory":
+        current_status = "Backend inventory complete"
+        next_safe_action = "Review backend route map"
+    elif workflow_type == "backend_safety":
+        current_status = "Backend safety analysis complete"
+        next_safe_action = "Review backend boundary / smoke plan"
+    elif status == "done":
+        current_status = "Run complete"
+        next_safe_action = "Review outputs"
+    elif status == "queued":
+        current_status = "Run queued"
+        next_safe_action = "Wait for the run to start"
+    elif status == "unknown":
+        current_status = "Unknown"
+        next_safe_action = "Review run details"
+    else:
+        current_status = str(status).replace("_", " ").capitalize()
+        next_safe_action = "Review run details"
+
+    if not blocking_issue and delivery_status == "blocked":
+        blocking_issue = "Delivery is blocked — see boundary/smoke mutation report."
+    if not blocking_issue and repo_health in ("dirty_dependency_files", "dirty_source_files", "dirty_secrets_or_env"):
+        blocking_issue = (
+            run_state.get("repo_hygiene_recommended_action")
+            or "Repo hygiene issues must be resolved before pulling, building, or delivering."
+        )
+
+    primary_artifacts = [a for a in PRIMARY_ARTIFACT_PRIORITY if a in artifact_set][:6]
+
+    return {
+        "workflow_type": workflow_type,
+        "target_repo_name": target_repo_name,
+        "target_repo_path": target_repo_path,
+        "execution_mode": execution_mode,
+        "build_status": build_status,
+        "delivery_status": delivery_status,
+        "repo_health": repo_health,
+        "sprint_quality_status": sprint_quality_status,
+        "workspace_mode": workspace_mode,
+        "current_status": current_status,
+        "next_safe_action": next_safe_action,
+        "blocking_issue": blocking_issue,
+        "safe_to_show": True,
+        "primary_artifacts": primary_artifacts,
+    }
+
+
 def list_runs() -> list[dict]:
     if not RUNS_DIR.exists():
         return []
@@ -84,6 +356,7 @@ def list_runs() -> list[dict]:
             "created":      state.get("created"),
             "current_step": state.get("current_step"),
             "fix_iteration": state.get("fix_iteration", 0),
+            "operator_summary": build_operator_run_summary(d, state, state.get("artifacts") or []),
         })
     return runs
 
@@ -491,7 +764,11 @@ def get_run(run_id: str):
     state = load_state(run_id)
     if state is None:
         abort(404, f"Run {run_id} not found")
-    return jsonify(state)
+    response = dict(state)
+    response["operator_summary"] = build_operator_run_summary(
+        RUNS_DIR / run_id, state, state.get("artifacts") or [],
+    )
+    return jsonify(response)
 
 
 @app.route("/api/runs/<run_id>/artifacts/<filename>", methods=["GET"])

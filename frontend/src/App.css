@@ -665,6 +665,17 @@ button { cursor: pointer; border: none; outline: none; background: none; font-fa
 .run-card-top  { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
 .run-card-id   { font-family: monospace; font-weight: 600; font-size: 13.5px; }
 .run-card-meta { display: flex; gap: 14px; font-size: 11.5px; color: var(--text3); }
+.run-card-workflow { font-size: 11.5px; color: var(--text3); margin-bottom: 2px; }
+.run-card-status { font-size: 13px; color: var(--text); font-weight: 500; margin-bottom: 2px; }
+.run-card-next-action { font-size: 12px; color: var(--text2); margin-bottom: 6px; }
+
+.runs-filter-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
+.runs-filter-chip {
+  font-size: 12px; font-weight: 500; color: var(--text2); background: var(--bg2);
+  border: 1px solid var(--border); border-radius: 99px; padding: 5px 12px; cursor: pointer;
+}
+.runs-filter-chip:hover { border-color: var(--border2); }
+.runs-filter-chip.active { color: #fff; background: #7c3aed; border-color: #7c3aed; }
 
 /* ── Status badge ─────────────────────────────────────────────────────────── */
 .status-badge {
@@ -984,6 +995,18 @@ button { cursor: pointer; border: none; outline: none; background: none; font-fa
   letter-spacing: 0.04em; flex: 0 0 130px;
 }
 .repo-status-row code { font-size: 11.5px; color: var(--text); }
+
+.operator-summary-card { border-width: 2px; }
+
+.primary-outputs-grid {
+  margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px;
+}
+.primary-output-chip {
+  font-size: 12px; font-weight: 500; color: var(--text); background: var(--bg3);
+  border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; cursor: pointer;
+}
+.primary-output-chip:hover { border-color: var(--border2); }
+.primary-output-chip.active { border-color: #7c3aed; background: #f5f3ff; color: #5b21b6; }
 
 .advanced-git-details { margin: 10px 20px 20px; }
 .advanced-git-details > summary {

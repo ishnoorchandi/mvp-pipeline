@@ -2487,6 +2487,146 @@ function BackendSafetyCard({ runId, run, selectedArtifact, onSelectArtifact }: {
   );
 }
 
+// Operator Summary — the first thing a user should read on any run: what
+// happened, is it safe to build/commit/deliver, what's blocking it, what's the
+// next safe action. Purely derived from run.operator_summary (computed
+// read-only by backend.app.build_operator_run_summary) — never makes its own
+// decision. Renders gracefully when operator_summary is absent (older runs
+// the backend couldn't classify), falling back to the raw status string
+// rather than showing nothing.
+const BADGE_LABELS: Record<string, string> = {
+  not_run: "Not run", blocked: "Blocked", running: "Running", passed: "Passed",
+  failed: "Failed", interrupted: "Interrupted", unknown: "Unknown",
+  not_requested: "Not requested", ready: "Ready", committed: "Committed",
+  pushed: "Pushed", pr_opened: "PR opened",
+  clean: "Clean", dirty_dependency_files: "Dependency folder dirty",
+  dirty_source_files: "Source files dirty", dirty_secrets_or_env: "Possible secrets/env dirty",
+  sandbox: "Sandbox copy", direct_branch: "Direct feature branch", planning_only: "Planning only",
+};
+const BADGE_SEVERITY: Record<string, "ok" | "warn" | "fail"> = {
+  blocked: "fail", failed: "fail", interrupted: "warn", dirty_secrets_or_env: "fail",
+  dirty_source_files: "warn", dirty_dependency_files: "warn", running: "warn",
+  passed: "ok", clean: "ok", committed: "ok", pushed: "ok", pr_opened: "ok", ready: "ok",
+};
+
+function OperatorBadge({ value }: { value?: string | null }) {
+  if (!value) return null;
+  const label = BADGE_LABELS[value] ?? value.replace(/_/g, " ");
+  const severity = BADGE_SEVERITY[value] ?? "ok";
+  return <span className={`delivery-badge delivery-badge-${severity}`}>{label}</span>;
+}
+
+function OperatorSummaryCard({ run }: { run: RunDetail | null }) {
+  if (!run) return null;
+  const s = run.operator_summary;
+  const statusOverride: Record<string, string> = {
+    started: "Run started but may not have completed.",
+    interrupted: "Run interrupted before completion.",
+    cancelled: "Run interrupted before completion.",
+    failed: "Run failed.",
+    build_blocked: "Build blocked by safety gate.",
+    blocked_sprint_not_build_ready: "Selected sprint needs decomposition before build.",
+    sandbox_original_repo_modified_warning: "Warning: original repo changed unexpectedly during sandbox flow.",
+  };
+  const currentStatus = statusOverride[run.status] ?? s?.current_status ?? run.status.replace(/_/g, " ");
+  const isSevere = run.status === "sandbox_original_repo_modified_warning"
+    || s?.build_status === "blocked" || s?.repo_health === "dirty_secrets_or_env";
+
+  return (
+    <div className="delivery-card operator-summary-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Run Summary</div>
+        </div>
+      </div>
+      <div className="repo-status-rows">
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Current status</span>
+          <span>{currentStatus}</span>
+        </div>
+        {s?.next_safe_action && (
+          <div className="repo-status-row">
+            <span className="repo-status-row-label">Next safe action</span>
+            <span>{s.next_safe_action}</span>
+          </div>
+        )}
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Build</span>
+          <OperatorBadge value={s?.build_status} />
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Delivery</span>
+          <OperatorBadge value={s?.delivery_status} />
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Repo health</span>
+          <OperatorBadge value={s?.repo_health} />
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Workspace</span>
+          <OperatorBadge value={s?.workspace_mode} />
+        </div>
+      </div>
+      {s?.blocking_issue && (
+        <div className={`delivery-warning-panel ${isSevere ? "delivery-warning-panel-severe" : ""}`}>
+          <strong>Blocking issue:</strong> {s.blocking_issue}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Primary Outputs — the handful of artifacts that actually matter for this
+// run, in priority order, reusing the existing artifact viewer (no new viewer
+// component). Only ever shows artifacts that exist; renders nothing if none do.
+const PRIMARY_ARTIFACT_LABELS: Record<string, string> = {
+  "feature_sprint_plan.md": "Sprint Plan",
+  "sprint_quality_gate.md": "Sprint Quality Gate",
+  "existing_feature_overlap_check.md": "Overlap Check",
+  "feature_gap_matrix.md": "Gap Matrix",
+  "additive_architecture.md": "Additive Architecture",
+  "selected_feature_sprint_scope.md": "Selected Sprint Scope",
+  "repo_hygiene_summary.md": "Repo Hygiene Summary",
+  "sandbox_patch_summary.md": "Sandbox Patch Summary",
+  "sandbox_changed_files.md": "Sandbox Changed Files",
+  "sandbox_patch.diff": "Sandbox Patch Diff",
+  "apply_patch_instructions.md": "Apply Patch Instructions",
+};
+
+function PrimaryOutputsCard({ run, selectedArtifact, onSelectArtifact }: {
+  run: RunDetail | null;
+  selectedArtifact?: string | null;
+  onSelectArtifact: (artifact: string) => void;
+}) {
+  if (!run) return null;
+  const fromSummary = run.operator_summary?.primary_artifacts ?? [];
+  const files = fromSummary.length > 0
+    ? fromSummary.filter(f => (run.artifacts ?? []).includes(f))
+    : Object.keys(PRIMARY_ARTIFACT_LABELS).filter(f => (run.artifacts ?? []).includes(f));
+  if (files.length === 0) return null;
+
+  return (
+    <div className="delivery-card">
+      <div className="delivery-card-header">
+        <div>
+          <div className="delivery-card-title">Primary Outputs</div>
+        </div>
+      </div>
+      <div className="primary-outputs-grid">
+        {files.map(f => (
+          <button
+            key={f}
+            className={`primary-output-chip ${selectedArtifact === f ? "active" : ""}`}
+            onClick={() => onSelectArtifact(f)}
+          >
+            {PRIMARY_ARTIFACT_LABELS[f] ?? artifactDisplayName(f)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // Build Workspace — compact visibility into WHERE Claude Code actually built
 // (sandbox copy vs. the real repo directly), so a sandbox run never looks
 // indistinguishable from a direct build. Purely derived from run_state.json
@@ -3400,7 +3540,15 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
               </span>
             </div>
             {planReady && <div className="sprint-mode-banner">Review the plan, then build exactly one selected feature sprint.</div>}
+
+            {/* 1. Operator Summary — decision-focused, always first. */}
+            <OperatorSummaryCard run={run} />
+            {/* 2. Primary Outputs — the handful of artifacts that matter. */}
+            <PrimaryOutputsCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            {/* 3. Planning Progress / Build Workspace. */}
             <PlanningProgressCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            <BuildWorkspaceCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            {/* 4. Sprint Roadmap / Quality Gate. */}
             {plan && (
               <FeatureSprintRoadmap
                 plan={plan}
@@ -3411,21 +3559,24 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
                 onSelectArtifact={setSelected}
               />
             )}
+            {/* 5. Repository Status. */}
+            <RepositoryStatusCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            <PrPlanCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            {/* 6. What Happened. */}
             <WhatHappenedCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <DemoWorkflowTimelineCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            {/* 7. Advanced Git Safety Details. */}
+            <details className="advanced-git-details">
+              <summary>Show advanced Git safety details</summary>
+              <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />
+            </details>
+            {/* 8. Raw/detailed cards — below the fold. */}
             <ReviewCommitCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <ChangeBoundaryBanner run={run} />
             <SmokeMutationBanner run={run} />
             <BugfixPlanCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <BackendInventoryCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             <BackendSafetyCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
-            <BuildWorkspaceCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
-            <RepositoryStatusCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
-            <PrPlanCard runId={runId} run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
-            <details className="advanced-git-details">
-              <summary>Show advanced Git safety details</summary>
-              <DeliveryCard runId={runId} selectedArtifact={selected} onSelectArtifact={setSelected} />
-            </details>
           </div>
         </div>
         <div className="right-panel">
@@ -3588,6 +3739,8 @@ function ContinuationView({ runId, run, onBack }: {
                 {selectedSprintNum ? ` — Sprint ${selectedSprintNum}` : ""}. Status: {run?.status ?? "running"}
               </span>
             </div>
+            <OperatorSummaryCard run={run} />
+            <PrimaryOutputsCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             {plan && <ContinuationRoadmap plan={plan} />}
           </div>
         </div>
@@ -4345,34 +4498,131 @@ function InputView({ mode, onBack, onCreated }: { mode: EntryMode; onBack: () =>
 
 // ── Runs view ──────────────────────────────────────────────────────────────────
 
+// Past Runs filter chips — classify purely from operator_summary, which is
+// already deterministic and backward-compatible (older runs degrade to
+// "unknown" fields rather than throwing), so a run with no metadata simply
+// never matches anything beyond "All".
+type RunFilterId = "all" | "plan_only" | "builds" | "sandbox" | "bugfix" | "pr_delivery"
+  | "blocked" | "needs_attention" | "onehr" | "clean";
+
+const RUN_FILTERS: { id: RunFilterId; label: string }[] = [
+  { id: "all", label: "All" },
+  { id: "plan_only", label: "Plan only" },
+  { id: "builds", label: "Builds" },
+  { id: "sandbox", label: "Sandbox" },
+  { id: "bugfix", label: "Bugfix" },
+  { id: "pr_delivery", label: "PR / Delivery" },
+  { id: "blocked", label: "Blocked" },
+  { id: "needs_attention", label: "Needs attention" },
+  { id: "onehr", label: "OneHR" },
+  { id: "clean", label: "Clean" },
+];
+
+function runMatchesFilter(run: RunSummary, filter: RunFilterId): boolean {
+  const s = run.operator_summary;
+  if (filter === "all") return true;
+  if (!s) return false;
+  switch (filter) {
+    case "plan_only":
+      return s.execution_mode === "plan_only" || s.workflow_type === "existing_app_plan";
+    case "builds":
+      return (!!s.build_status && s.build_status !== "not_run" && s.build_status !== "unknown")
+        || s.execution_mode === "build" || s.execution_mode === "sandbox_build";
+    case "sandbox":
+      return s.workspace_mode === "sandbox";
+    case "bugfix":
+      return s.workflow_type === "bugfix_plan";
+    case "pr_delivery":
+      return (!!s.delivery_status && s.delivery_status !== "not_requested") || s.workflow_type === "pr_delivery";
+    case "blocked":
+      return s.build_status === "blocked" || s.delivery_status === "blocked" || s.repo_health === "blocked";
+    case "needs_attention":
+      return s.build_status === "blocked" || s.build_status === "failed" || s.build_status === "interrupted"
+        || s.delivery_status === "blocked" || s.repo_health === "blocked"
+        || s.repo_health === "dirty_source_files" || s.repo_health === "dirty_secrets_or_env"
+        || s.sprint_quality_status === "needs_decomposition";
+    case "onehr":
+      return /onehr/i.test(s.target_repo_name ?? "") || /onehr/i.test(s.target_repo_path ?? "");
+    case "clean":
+      return s.repo_health === "clean" && !s.blocking_issue;
+    default:
+      return true;
+  }
+}
+
+// Old/interrupted runs get a clear, finite-sounding summary instead of looking
+// like they're still running forever.
+const RUN_STATUS_OVERRIDE_TEXT: Record<string, string> = {
+  started: "Run started but may not have completed.",
+  interrupted: "Run interrupted before completion.",
+  cancelled: "Run interrupted before completion.",
+  failed: "Run failed.",
+  build_blocked: "Build blocked by safety gate.",
+  blocked_sprint_not_build_ready: "Selected sprint needs decomposition before build.",
+  sandbox_original_repo_modified_warning: "Warning: original repo changed unexpectedly during sandbox flow.",
+};
+
+function RunListCard({ run, onSelect }: { run: RunSummary; onSelect: (id: string) => void }) {
+  const s = run.operator_summary;
+  const statusOverride = RUN_STATUS_OVERRIDE_TEXT[run.status];
+  const currentStatus = statusOverride ?? s?.current_status ?? run.status.replace(/_/g, " ");
+  const workflowLabel = s?.workflow_type && s.workflow_type !== "unknown"
+    ? s.workflow_type.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
+    : null;
+
+  return (
+    <div className="run-card" onClick={() => onSelect(run.run_id)}>
+      <div className="run-card-top">
+        <span className="run-card-id">{run.run_id}</span>
+        <StatusBadge status={run.status} />
+      </div>
+      {(workflowLabel || s?.target_repo_name) && (
+        <div className="run-card-workflow">
+          {workflowLabel}{workflowLabel && s?.target_repo_name ? " · " : ""}{s?.target_repo_name}
+        </div>
+      )}
+      <div className="run-card-status">{currentStatus}</div>
+      {s?.next_safe_action && <div className="run-card-next-action">Next: {s.next_safe_action}</div>}
+      <div className="run-card-meta">
+        {run.created && <span>{new Date(run.created).toLocaleString()}</span>}
+        {run.current_step && <span>Step: {run.current_step.replace(/_/g, " ")}</span>}
+        {run.fix_iteration > 0 && <span>Fix cycles: {run.fix_iteration}</span>}
+      </div>
+    </div>
+  );
+}
+
 function RunsView({ onSelect, onBack }: { onSelect: (id: string) => void; onBack: () => void }) {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState<RunFilterId>("all");
   useEffect(() => {
     getRuns().then(r => { setRuns(r); setLoading(false); }).catch(() => setLoading(false));
     const i = setInterval(() => getRuns().then(setRuns).catch(() => {}), 5000);
     return () => clearInterval(i);
   }, []);
+  const filtered = [...runs].reverse().filter(r => runMatchesFilter(r, filter));
   return (
     <div className="runs-view">
       <button className="back-btn" onClick={onBack}><IconBack /> Back</button>
       <div className="runs-header"><h2 className="runs-title">Past Runs</h2></div>
-      {loading && <div className="runs-loading">Loading…</div>}
-      {!loading && runs.length === 0 && <div className="runs-empty">No runs yet.</div>}
-      <div className="runs-list">
-        {[...runs].reverse().map(r => (
-          <div key={r.run_id} className="run-card" onClick={() => onSelect(r.run_id)}>
-            <div className="run-card-top">
-              <span className="run-card-id">{r.run_id}</span>
-              <StatusBadge status={r.status} />
-            </div>
-            <div className="run-card-meta">
-              {r.created && <span>{new Date(r.created).toLocaleString()}</span>}
-              {r.current_step && <span>Step: {r.current_step.replace(/_/g, " ")}</span>}
-              {r.fix_iteration > 0 && <span>Fix cycles: {r.fix_iteration}</span>}
-            </div>
-          </div>
+      <div className="runs-filter-chips">
+        {RUN_FILTERS.map(f => (
+          <button
+            key={f.id}
+            className={`runs-filter-chip ${filter === f.id ? "active" : ""}`}
+            onClick={() => setFilter(f.id)}
+          >
+            {f.label}
+          </button>
         ))}
+      </div>
+      {loading && <div className="runs-loading">Loading…</div>}
+      {!loading && filtered.length === 0 && (
+        <div className="runs-empty">{runs.length === 0 ? "No runs yet." : "No runs match this filter."}</div>
+      )}
+      <div className="runs-list">
+        {filtered.map(r => <RunListCard key={r.run_id} run={r} onSelect={onSelect} />)}
       </div>
     </div>
   );

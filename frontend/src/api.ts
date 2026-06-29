@@ -2,12 +2,38 @@
 
 const BASE = "http://127.0.0.1:5001";
 
+// Operator Summary — deterministic, read-only normalization of a run's status/
+// artifacts into the handful of facts an operator actually needs: what
+// happened, is it safe to build/commit/deliver, what's blocking it, what's the
+// next safe action, and which artifacts matter most. Computed by
+// backend.app.build_operator_run_summary(); always optional since older runs
+// (or runs the backend can't fully classify) fall back to "unknown" fields
+// rather than omitting the object — but treat every field as possibly absent.
+export interface OperatorSummary {
+  workflow_type?: "existing_app_plan" | "existing_app_build" | "bugfix_plan" | "backend_inventory"
+    | "backend_safety" | "git_sync" | "pr_delivery" | "unknown";
+  execution_mode?: "plan_only" | "build" | "build_blocked" | "sandbox_build" | "bugfix_plan" | "inventory" | "unknown";
+  build_status?: "not_run" | "blocked" | "running" | "passed" | "failed" | "interrupted" | "unknown";
+  delivery_status?: "not_requested" | "blocked" | "ready" | "committed" | "pushed" | "pr_opened" | "unknown";
+  repo_health?: "clean" | "dirty_dependency_files" | "dirty_source_files" | "dirty_secrets_or_env" | "blocked" | "unknown";
+  sprint_quality_status?: "has_build_ready_sprints" | "needs_decomposition" | "unknown";
+  workspace_mode?: "sandbox" | "direct_branch" | "planning_only" | "unknown";
+  target_repo_name?: string | null;
+  target_repo_path?: string | null;
+  current_status?: string | null;
+  next_safe_action?: string | null;
+  blocking_issue?: string | null;
+  safe_to_show?: boolean;
+  primary_artifacts?: string[];
+}
+
 export interface RunSummary {
   run_id: string;
   status: string;
   created: string | null;
   current_step: string | null;
   fix_iteration: number;
+  operator_summary?: OperatorSummary;
 }
 
 export interface RunDetail {
@@ -17,6 +43,7 @@ export interface RunDetail {
   current_step: string | null;
   fix_iteration: number;
   artifacts: string[];
+  operator_summary?: OperatorSummary;
   log: { time: string; event: string; detail: string }[];
   step_timings: Record<string, number>;
   pipeline_elapsed_s: number | null;
