@@ -60,6 +60,11 @@ export interface RunDetail {
   git_sync_blocked?: boolean;
   git_sync_summary?: string;
   git_sync_artifacts?: string[];
+  // Repo Hygiene — compact classify_repo_hygiene() summary fields mirrored onto
+  // run_state.json for quick access without reading repo_hygiene_state.json.
+  repo_hygiene_severity?: "clean" | "warn" | "review" | "blocked";
+  repo_hygiene_summary_text?: string;
+  repo_hygiene_recommended_action?: string;
   // Build gate — single source of truth for whether Claude Code build (Step 12) ran,
   // was skipped (plan-only), or was blocked (e.g. company-protected repo on a protected
   // branch). Written by resolve_build_gate() in pipeline_mvp_builder.py.
@@ -249,6 +254,42 @@ export interface RepoHygieneInfo {
   requires_human_approval: boolean;
 }
 
+// Repo Hygiene Summary — classify_repo_hygiene()'s compact, UI-ready output.
+// Counts every dirty/changed path into one bucket (source, dependency, generated,
+// env_or_secret, lockfile, config, test, unknown) so the UI never needs to render
+// thousands of `node_modules` paths inline. example_paths/source_examples are
+// capped at 3 — the full path list lives in full_details_artifact instead.
+// See repo_hygiene_summary.md/.json and delivery.classify_repo_hygiene.
+export interface RepoHygieneSummary {
+  source_files_dirty: number;
+  dependency_files_dirty: number;
+  generated_files_dirty: number;
+  env_or_secret_files_dirty: number;
+  lockfiles_dirty: number;
+  config_files_dirty: number;
+  test_files_dirty: number;
+  unknown_files_dirty: number;
+  safe_to_pull: boolean;
+  safe_to_build: boolean;
+  safe_to_commit: boolean;
+  severity: "clean" | "warn" | "review" | "blocked";
+  summary: string;
+  recommended_action: string;
+  example_paths: string[];
+  source_examples: string[];
+  full_details_artifact: string;
+  denied_path_count: number;
+}
+
+export async function getRepoHygieneState(runId: string): Promise<RepoHygieneSummary | null> {
+  try {
+    const a = await getArtifact(runId, "repo_hygiene_state.json");
+    return JSON.parse(a.content) as RepoHygieneSummary;
+  } catch {
+    return null;
+  }
+}
+
 // Stable block-reason codes the UI can switch on. DENIED_TRACKED_DEPENDENCY_FILES means
 // the target repo itself has a hygiene problem (e.g. tracked node_modules) — not a
 // generated-feature defect.
@@ -287,6 +328,7 @@ export interface DeliveryState {
   blocked_reason?: string;
   block_reason?: DeliveryBlockReason;
   repo_hygiene?: RepoHygieneInfo;
+  repo_hygiene_summary?: RepoHygieneSummary;
   note?: string;
   timestamp: number;
 }
@@ -382,6 +424,7 @@ export interface GitSyncState {
   fetch_succeeded: boolean | null;
   build_should_proceed: "yes" | "no" | "warn";
   recommended_command: string | null;
+  repo_hygiene?: RepoHygieneSummary;
 }
 
 export async function getGitSyncState(runId: string): Promise<GitSyncState | null> {

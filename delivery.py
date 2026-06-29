@@ -217,6 +217,227 @@ def detect_repo_hygiene(repo_path, denied_now: list[str]) -> dict:
     }
 
 
+# ── Repo Hygiene Classification ──────────────────────────────────────────────
+# Classifies dirty/changed paths into actionable buckets so the UI and markdown
+# reports never need to render thousands of `node_modules` (or similar) paths
+# inline. Purely descriptive — it never decides on its own whether a pull/build/
+# commit is safe; that still comes from analyze_git_sync / delivery preconditions.
+# This only explains WHY in a compact, structured way, and keeps the full path
+# list available in a JSON artifact instead of markdown/UI text.
+
+_HYGIENE_DEPENDENCY_RE = re.compile(r"(^|/)(node_modules|venv|\.venv|vendor)(/|$)")
+_HYGIENE_GENERATED_RE = re.compile(
+    r"(^|/)(dist|build|\.next|\.turbo|coverage|\.pytest_cache|__pycache__)(/|$)"
+)
+_HYGIENE_ENV_FILE_RE = re.compile(r"(^|/)\.env(\.[\w-]+)?$")
+_HYGIENE_SECRET_WORD_RE = re.compile(r"(secret|credential|token|api[_-]?key|private[_-]?key)", re.IGNORECASE)
+_HYGIENE_SECRET_EXT_RE = re.compile(r"\.(json|ya?ml|txt|env|pem|key)$", re.IGNORECASE)
+_HYGIENE_LOCKFILE_NAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "Pipfile.lock",
+}
+_HYGIENE_CONFIG_RE = re.compile(
+    r"(^|/)(package\.json|vite\.config\.\w+|tsconfig.*\.json|pyproject\.toml|"
+    r"requirements\.txt|\.eslintrc(\.\w+)?|babel\.config\.\w+|webpack\.config\.\w+)$"
+)
+_HYGIENE_TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec)(/|$)|(\.(test|spec)\.\w+$)")
+_HYGIENE_SOURCE_RE = re.compile(
+    r"(^|/)(src|app|components|pages|backend|frontend|server|api)(/|$)"
+)
+
+HYGIENE_CATEGORIES = (
+    "source", "dependency", "generated", "env_or_secret", "lockfile", "config", "test", "unknown",
+)
+
+
+def _classify_hygiene_path(path: str) -> str:
+    """Single-path classifier. Order matters: dependency/generated/env-secret are
+    checked before source so e.g. `frontend/node_modules/...` is never miscounted
+    as a source change."""
+    basename = path.rsplit("/", 1)[-1]
+    if _HYGIENE_DEPENDENCY_RE.search(path):
+        return "dependency"
+    if _HYGIENE_GENERATED_RE.search(path):
+        return "generated"
+    if _HYGIENE_ENV_FILE_RE.search(path):
+        return "env_or_secret"
+    if _HYGIENE_SECRET_WORD_RE.search(basename) and _HYGIENE_SECRET_EXT_RE.search(basename):
+        return "env_or_secret"
+    if basename in _HYGIENE_LOCKFILE_NAMES:
+        return "lockfile"
+    if _HYGIENE_CONFIG_RE.search(path):
+        return "config"
+    if _HYGIENE_TEST_RE.search(path):
+        return "test"
+    if _HYGIENE_SOURCE_RE.search(path):
+        return "source"
+    return "unknown"
+
+
+def _format_denied_paths_reason(paths: list[str], label: str = "denied paths are dirty") -> str:
+    """Compact, human-readable block-reason string for a denied/dirty path list —
+    never embeds a raw Python list repr (which can be thousands of `node_modules/...`
+    entries). Full list stays available in the relevant JSON artifact."""
+    count = len(paths)
+    if count == 0:
+        return f"{label} (0 file(s))"
+    examples = ", ".join(f"`{p}`" for p in paths[:3])
+    more = f", and {count - 3} more" if count > 3 else ""
+    return f"{label} ({count} file(s)): {examples}{more}"
+
+
+def _collapse_path_list_lines(paths: list[str], bullet: str = "- ") -> list[str]:
+    """Markdown bullet lines for a path list — collapses to a single calm sentence
+    once there are more than 10 paths, instead of dumping every path (which can be
+    thousands of `node_modules/...` entries). Full list always stays in the JSON
+    artifact, never just in markdown."""
+    if not paths:
+        return []
+    if len(paths) > 10:
+        return [
+            f"{bullet}Large dependency/generated file list collapsed "
+            "(" + str(len(paths)) + " path(s)). Full details are available in the JSON artifact."
+        ]
+    return [f"{bullet}`{p}`" for p in paths]
+
+
+def classify_repo_hygiene(
+    dirty_paths: list[str],
+    denied_paths: list[str] | None = None,
+    block_reasons: list[str] | None = None,
+    full_details_artifact: str = "repo_hygiene_state.json",
+) -> dict:
+    """Classifies every dirty/changed path into one bucket (source, dependency,
+    generated, env_or_secret, lockfile, config, test, unknown) and returns a
+    compact, UI-ready summary — counts, a one-line summary, a recommended action,
+    and at most 3 example paths per the bucket driving the headline. Always keeps
+    the same conservative safety posture: safe_to_pull/safe_to_build/safe_to_commit
+    are only True when the repo is fully clean (severity == "clean"); this never
+    loosens existing block_reasons/pull_blocked decisions, it only explains them.
+    """
+    dirty_paths = list(dirty_paths or [])
+    denied_paths = list(denied_paths or [])
+    block_reasons = list(block_reasons or [])
+
+    by_category: dict[str, list[str]] = {cat: [] for cat in HYGIENE_CATEGORIES}
+    for path in dirty_paths:
+        by_category[_classify_hygiene_path(path)].append(path)
+
+    counts = {cat: len(paths) for cat, paths in by_category.items()}
+
+    if counts["env_or_secret"]:
+        severity = "blocked"
+        summary = "Possible environment/secret file changes detected."
+        recommended_action = (
+            "Review env/secret files manually before pulling, building, or committing. "
+            "These are never staged or committed automatically."
+        )
+        headline_paths = by_category["env_or_secret"]
+    elif counts["dependency"]:
+        severity = "blocked"
+        summary = "Dependency folder changes detected under node_modules/venv/vendor."
+        recommended_action = "Resolve dependency folder changes before pulling, building, or committing."
+        headline_paths = by_category["dependency"]
+    elif counts["source"]:
+        severity = "blocked"
+        summary = f"Source file changes detected ({counts['source']} file(s))."
+        recommended_action = "Review source changes before pulling, building, or committing."
+        headline_paths = by_category["source"]
+    elif counts["generated"]:
+        severity = "warn"
+        summary = "Generated output folder changes detected."
+        recommended_action = "Generated/build output files are usually safe to ignore, but review before committing."
+        headline_paths = by_category["generated"]
+    elif counts["lockfile"] or counts["config"]:
+        severity = "warn"
+        summary = "Lockfile or config file changes detected."
+        recommended_action = "Review lockfile/config changes before committing."
+        headline_paths = by_category["lockfile"] + by_category["config"]
+    elif counts["test"]:
+        severity = "review"
+        summary = "Test file changes detected."
+        recommended_action = "Review test changes before committing."
+        headline_paths = by_category["test"]
+    elif counts["unknown"]:
+        severity = "review"
+        summary = "Unclassified file changes detected."
+        recommended_action = "Review changes before pulling, building, or committing."
+        headline_paths = by_category["unknown"]
+    else:
+        severity = "clean"
+        summary = "No dirty files detected."
+        recommended_action = "Safe to pull, build, or commit."
+        headline_paths = []
+
+    is_clean = severity == "clean"
+
+    return {
+        "source_files_dirty": counts["source"],
+        "dependency_files_dirty": counts["dependency"],
+        "generated_files_dirty": counts["generated"],
+        "env_or_secret_files_dirty": counts["env_or_secret"],
+        "lockfiles_dirty": counts["lockfile"],
+        "config_files_dirty": counts["config"],
+        "test_files_dirty": counts["test"],
+        "unknown_files_dirty": counts["unknown"],
+        "safe_to_pull": is_clean and not block_reasons,
+        "safe_to_build": is_clean,
+        "safe_to_commit": is_clean,
+        "severity": severity,
+        "summary": summary,
+        "recommended_action": recommended_action,
+        "example_paths": headline_paths[:3],
+        "source_examples": by_category["source"][:3],
+        "full_details_artifact": full_details_artifact,
+        "denied_path_count": len(denied_paths),
+    }
+
+
+def generate_repo_hygiene_summary(hygiene: dict, output_dir) -> tuple[str, str]:
+    """Writes repo_hygiene_summary.md/.json — the compact, classifier-driven
+    counterpart to repo_hygiene_report.md/.json (which is specifically about
+    `node_modules` tracked-in-git for Local Delivery). Never renders the full
+    path list — only up to 3 examples; the full list lives in
+    `hygiene["full_details_artifact"]`. Returns (markdown, json_text)."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    status_label = {"clean": "Clean", "warn": "Warning", "review": "Review", "blocked": "Blocked"}.get(
+        hygiene.get("severity"), "Unknown"
+    )
+    lines = ["# Repo Hygiene Summary", "", f"Status: {status_label}", ""]
+    lines.append("## Summary")
+    lines.append(hygiene.get("summary", ""))
+    lines.append("")
+    lines.append("## Counts")
+    lines.append(f"- Source files dirty: {hygiene.get('source_files_dirty', 0)}")
+    lines.append(f"- Dependency files dirty: {hygiene.get('dependency_files_dirty', 0)}")
+    lines.append(f"- Generated files dirty: {hygiene.get('generated_files_dirty', 0)}")
+    lines.append(f"- Env/secret files dirty: {hygiene.get('env_or_secret_files_dirty', 0)}")
+    lines.append(f"- Lockfiles dirty: {hygiene.get('lockfiles_dirty', 0)}")
+    lines.append(f"- Config files dirty: {hygiene.get('config_files_dirty', 0)}")
+    lines.append("")
+    lines.append("## Recommended Action")
+    lines.append(hygiene.get("recommended_action", ""))
+    lines.append("")
+    if hygiene.get("example_paths"):
+        lines.append("## Examples")
+        lines.extend(f"- {p}" for p in hygiene["example_paths"])
+        lines.append("")
+    if hygiene.get("source_examples") and hygiene.get("source_files_dirty", 0) > 0:
+        lines.append("## Source Changes Detected")
+        lines.append(f"Source changes detected: {hygiene['source_files_dirty']}")
+        lines.append("Examples:")
+        lines.extend(f"- {p}" for p in hygiene["source_examples"])
+        lines.append("")
+    lines.append(f"Full path list is available in {hygiene.get('full_details_artifact', 'repo_hygiene_state.json')}.")
+
+    md_content = "\n".join(lines) + "\n"
+    json_content = json.dumps(hygiene, indent=2)
+    (output_dir / "repo_hygiene_summary.md").write_text(md_content, encoding="utf-8")
+    (output_dir / "repo_hygiene_state.json").write_text(json_content, encoding="utf-8")
+    return md_content, json_content
+
+
 def detect_repo_type(repo_path, remote_info: dict) -> str:
     """company-protected | personal-sandbox | unknown."""
     if (
@@ -263,6 +484,7 @@ def analyze_git_sync(
             "repo_path": str(repo_path), "current_branch": None, "fetch_url": None,
             "push_url": None, "base_branch": base_branch, "repo_type": "unknown",
             "is_company_repo": False, "is_dirty": None, "dirty_file_count": 0,
+            "dirty_paths": [],
             "denied_paths_dirty": False, "denied_dirty_paths": [],
             "origin_base_exists": False, "sync_status": "unknown",
             "commits_ahead": 0, "commits_behind": 0, "fast_forward_safe": False,
@@ -297,7 +519,7 @@ def analyze_git_sync(
     if is_dirty:
         block_reasons.append(f"working tree is dirty ({len(dirty_paths)} changed file(s))")
     if denied_dirty:
-        block_reasons.append(f"denied paths are dirty: {denied_dirty}")
+        block_reasons.append(_format_denied_paths_reason(denied_dirty))
     if sync_status == "ahead":
         block_reasons.append(
             f"local branch is {ab['ahead']} commit(s) ahead of origin/{base_branch} — "
@@ -342,6 +564,10 @@ def analyze_git_sync(
         "is_company_repo": is_company,
         "is_dirty": is_dirty,
         "dirty_file_count": len(dirty_paths),
+        # Full dirty path list — kept for repo hygiene classification. Never render
+        # this directly in markdown/UI text; it can be thousands of entries for a
+        # repo with tracked node_modules. JSON artifacts only.
+        "dirty_paths": dirty_paths,
         "denied_paths_dirty": bool(denied_dirty),
         "denied_dirty_paths": denied_dirty,
         "origin_base_exists": ab["origin_base_exists"],
@@ -379,9 +605,9 @@ def generate_git_sync_report(sync_state: dict, output_path) -> str:
     lines.append("")
     lines.append("## Working Tree")
     lines.append(f"- Dirty: {sync_state['is_dirty']} ({sync_state['dirty_file_count']} changed file(s))")
-    lines.append(f"- Denied paths dirty: {sync_state['denied_paths_dirty']}")
-    if sync_state.get("denied_dirty_paths"):
-        lines.extend(f"  - `{p}`" for p in sync_state["denied_dirty_paths"])
+    denied_paths = sync_state.get("denied_dirty_paths") or []
+    lines.append(f"- Denied paths dirty: {sync_state['denied_paths_dirty']} ({len(denied_paths)} file(s))")
+    lines.extend(_collapse_path_list_lines(denied_paths, bullet="  - "))
     lines.append("")
     if sync_state.get("is_company_repo"):
         lines.append(
@@ -420,16 +646,24 @@ def run_git_sync_check(
     skip_fetch: bool = False,
 ) -> dict:
     """Orchestrator: analyze sync state and, if output_dir is given, write
-    git_sync_report.md + git_sync_state.json into it. Never runs git pull, push,
-    reset, or stash — analysis and reporting only."""
+    git_sync_report.md + git_sync_state.json + repo_hygiene_summary.md/.json into
+    it. Never runs git pull, push, reset, or stash — analysis and reporting only."""
     sync_state = analyze_git_sync(
         repo_path, base_branch, allow_branch_mismatch=allow_branch_mismatch, skip_fetch=skip_fetch,
     )
+    hygiene = classify_repo_hygiene(
+        sync_state.get("dirty_paths") or [],
+        sync_state.get("denied_dirty_paths") or [],
+        sync_state.get("block_reasons") or [],
+        full_details_artifact="git_sync_state.json",
+    )
+    sync_state["repo_hygiene"] = hygiene
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         generate_git_sync_report(sync_state, output_dir / "git_sync_report.md")
         (output_dir / "git_sync_state.json").write_text(json.dumps(sync_state, indent=2), encoding="utf-8")
+        generate_repo_hygiene_summary(hygiene, output_dir)
     return sync_state
 
 
@@ -674,7 +908,7 @@ def assert_clean_delivery_preconditions(
 
     denied_now = scan_denied_paths([line[3:].strip() for line in status["porcelain"]])
     checks["denied_files_not_staged"] = (
-        {"status": "fail", "detail": f"Denied paths present in working tree: {denied_now}"}
+        {"status": "fail", "detail": _format_denied_paths_reason(denied_now, "Denied paths present in working tree")}
         if denied_now else
         {"status": "pass", "detail": "No denied paths (.env, node_modules, runs, logs, secrets) detected."}
     )
@@ -842,7 +1076,7 @@ def generate_changed_files_report(repo_path, output_path) -> tuple[str, dict]:
     lines.append(f"## Denied / Risky Paths Detected ({len(denied)})")
     if denied:
         lines.append("**These paths were detected and were NOT included in the delivery commit:**")
-        lines.extend(f"- `{f}`" for f in denied)
+        lines.extend(_collapse_path_list_lines(denied))
     else:
         lines.append("- (none — no `.env`, `node_modules/`, `runs/`, `venv/`, logs, or secret-like files detected)")
     lines.append("")
@@ -1055,6 +1289,16 @@ def run_local_delivery(
     generate_github_delivery_plan(precheck, mode, branch_name, output_dir / "github_delivery_plan.md")
     generate_repo_hygiene_report(precheck.get("repo_hygiene") or {}, output_dir)
 
+    porcelain = (precheck.get("git_status") or {}).get("porcelain") or []
+    dirty_paths_for_hygiene = [line[3:].strip() for line in porcelain if line.strip()]
+    denied_for_hygiene = scan_denied_paths(dirty_paths_for_hygiene)
+    hygiene_summary = classify_repo_hygiene(
+        dirty_paths_for_hygiene, denied_for_hygiene,
+        precheck.get("push_blocked_reasons") or [],
+        full_details_artifact="delivery_state.json",
+    )
+    generate_repo_hygiene_summary(hygiene_summary, output_dir)
+
     state = {
         "repo_path": str(repo_path),
         "mode": mode,
@@ -1063,6 +1307,9 @@ def run_local_delivery(
         "decision": precheck["decision"],
         "block_reason": precheck.get("block_reason"),
         "repo_hygiene": precheck.get("repo_hygiene"),
+        "repo_hygiene_summary": hygiene_summary,
+        # Full dirty path list — JSON artifact only, never rendered in markdown/UI text.
+        "dirty_paths": dirty_paths_for_hygiene,
         "plan_only": plan_only,
         "commit_hash": None,
         "files_committed": [],
@@ -1349,7 +1596,7 @@ def analyze_pr_delivery_plan(
                 "stash your own changes before planning a PR"
             )
         if denied_files:
-            block_reasons.append(f"denied paths detected in changed files: {denied_files}")
+            block_reasons.append(_format_denied_paths_reason(denied_files, "denied paths detected in changed files"))
         if sync["sync_status"] == "ahead":
             block_reasons.append(
                 f"local branch already has {sync['commits_ahead']} unpushed commit(s) ahead of "
@@ -1792,7 +2039,7 @@ def run_prepare_pr_branch(
                 f"current branch '{current_before}' is not base branch '{base_branch}' or intended feature branch '{feature_branch}'"
             )
         if sync.get("denied_dirty_paths"):
-            block_reasons.append(f"denied paths are dirty: {sync['denied_dirty_paths']}")
+            block_reasons.append(_format_denied_paths_reason(sync["denied_dirty_paths"]))
 
         if current_before == base_branch:
             if sync.get("is_dirty") and not allow_dirty_from_run:
@@ -1814,7 +2061,7 @@ def run_prepare_pr_branch(
             dirty_paths = _changed_paths_from_status(get_git_status(repo_path))
             denied_dirty = scan_denied_paths(dirty_paths)
             if denied_dirty:
-                block_reasons.append(f"denied paths are dirty: {denied_dirty}")
+                block_reasons.append(_format_denied_paths_reason(denied_dirty))
 
         if repo_is_git and feature_branch:
             branch_exists = _branch_exists(repo_path, feature_branch)
@@ -1847,7 +2094,7 @@ def run_prepare_pr_branch(
         changed_paths = _changed_paths_from_status(status_after)
         denied = scan_denied_paths(changed_paths)
         if denied:
-            block_reasons.append(f"denied paths detected in changed files: {denied}")
+            block_reasons.append(_format_denied_paths_reason(denied, "denied paths detected in changed files"))
         boundary_result = _check_pr_branch_boundary(_changed_files_by_status(status_after), boundary)
         if boundary_result["status"] == "FAIL":
             block_reasons.append("changed files are outside the selected feature change boundary")
@@ -2119,7 +2366,7 @@ def run_pr_remote_delivery(
         if not status["clean"]:
             block_reasons.append(f"working tree is dirty ({len(changed_paths)} changed file(s))")
         if denied_dirty:
-            block_reasons.append(f"denied paths are dirty: {denied_dirty}")
+            block_reasons.append(_format_denied_paths_reason(denied_dirty))
         if ahead_base["ahead"] <= 0:
             block_reasons.append(f"feature branch must contain at least one commit not on origin/{base_branch}")
         if is_company:

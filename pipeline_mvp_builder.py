@@ -341,11 +341,18 @@ def run_existing_app_git_sync_check(run_id: str, existing_app_path, base_branch:
         f"{sync_state['sync_status']} (ahead {sync_state['commits_ahead']}, "
         f"behind {sync_state['commits_behind']})"
     )
+    hygiene = sync_state.get("repo_hygiene") or {}
     _update_state(run_id, {
         "git_sync_status": sync_state["sync_status"],
         "git_sync_blocked": sync_state["pull_blocked"],
         "git_sync_summary": summary,
-        "git_sync_artifacts": ["git_sync_report.md", "git_sync_state.json"],
+        "git_sync_artifacts": [
+            "git_sync_report.md", "git_sync_state.json",
+            "repo_hygiene_summary.md", "repo_hygiene_state.json",
+        ],
+        "repo_hygiene_severity": hygiene.get("severity"),
+        "repo_hygiene_summary_text": hygiene.get("summary"),
+        "repo_hygiene_recommended_action": hygiene.get("recommended_action"),
     })
     return sync_state
 
@@ -370,8 +377,16 @@ def run_existing_app_git_pull_ff_only(run_id: str, existing_app_path, base_branc
     pull_state = outcome["state"]
     sync_state = outcome["after"] or outcome["before"]
 
+    hygiene = delivery_mod.classify_repo_hygiene(
+        sync_state.get("dirty_paths") or [],
+        sync_state.get("denied_dirty_paths") or [],
+        sync_state.get("block_reasons") or [],
+        full_details_artifact="git_sync_state.json",
+    )
+    sync_state["repo_hygiene"] = hygiene
     delivery_mod.generate_git_sync_report(sync_state, rdir / "git_sync_report.md")
     (rdir / "git_sync_state.json").write_text(json.dumps(sync_state, indent=2), encoding="utf-8")
+    delivery_mod.generate_repo_hygiene_summary(hygiene, rdir)
 
     sync_summary = (
         f"{sync_state['sync_status']} (ahead {sync_state['commits_ahead']}, "
@@ -384,7 +399,13 @@ def run_existing_app_git_pull_ff_only(run_id: str, existing_app_path, base_branc
         "git_sync_status": sync_state["sync_status"],
         "git_sync_blocked": sync_state["pull_blocked"],
         "git_sync_summary": sync_summary,
-        "git_sync_artifacts": ["git_sync_report.md", "git_sync_state.json"],
+        "git_sync_artifacts": [
+            "git_sync_report.md", "git_sync_state.json",
+            "repo_hygiene_summary.md", "repo_hygiene_state.json",
+        ],
+        "repo_hygiene_severity": hygiene.get("severity"),
+        "repo_hygiene_summary_text": hygiene.get("summary"),
+        "repo_hygiene_recommended_action": hygiene.get("recommended_action"),
         "git_pull_status": pull_state["decision"],
         "git_pull_blocked": pull_state["decision"] in ("BLOCKED", "FAILED"),
         "git_pull_summary": pull_summary,

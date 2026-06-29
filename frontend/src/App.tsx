@@ -4,11 +4,11 @@ import {
   getRuns, getRun, getArtifact, createUpgradeRun, createContinuationRun,
   getDeliveryInfo, getDeliveryPrecheck, createDeliveryCommit, pushDeliverySandbox,
   getGitSyncState, getGitPullState, getPrDeliveryPlanState, getPrBranchPrepState,
-  getPrRemoteDeliveryState,
+  getPrRemoteDeliveryState, getRepoHygieneState,
 } from "./api";
 import type {
   RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState,
-  PrDeliveryPlanState, PrBranchPrepState, PrRemoteDeliveryState,
+  PrDeliveryPlanState, PrBranchPrepState, PrRemoteDeliveryState, RepoHygieneSummary,
 } from "./api";
 import "./App.css";
 
@@ -1583,15 +1583,26 @@ function buildPlanningWhatHappenedSummary(run: RunDetail | null): { bullets: str
   const artifacts = run?.artifacts ?? [];
   const bullets: string[] = [];
 
-  if (artifacts.includes("existing_app_inventory.md")) {
-    bullets.push("The pipeline scanned the existing app structure.");
-  }
+  bullets.push("The pipeline scanned the existing app and generated a planning run.");
+
   if (artifacts.includes("feature_sprint_plan.md")) {
     bullets.push("The pipeline analyzed the requirements and generated an additive sprint roadmap.");
   }
   if (artifacts.includes("existing_feature_overlap_check.md")) {
     bullets.push("The pipeline checked for overlap so existing functionality is extended instead of duplicated.");
   }
+
+  // Repo hygiene leads here instead of a raw "pull was blocked" Git message — the
+  // headline for a planning run should explain WHY delivery is blocked in plain
+  // English, not surface a Git-sync-specific phrase. See classify_repo_hygiene.
+  const hygieneSeverity = run?.repo_hygiene_severity;
+  const hygieneIsDependencyIssue = !!run?.repo_hygiene_summary_text?.toLowerCase().includes("dependency");
+  if (hygieneSeverity && hygieneSeverity !== "clean" && hygieneIsDependencyIssue) {
+    bullets.push("Repo hygiene issue detected: dependency folder changes are dirty.");
+  } else if (run?.git_sync_blocked) {
+    bullets.push("Repository delivery is blocked until repo hygiene issues are resolved.");
+  }
+
   if (!artifacts.includes("claude_build_output.txt")) {
     bullets.push("No Claude Code build was run for this planning demo.");
   }
@@ -2389,7 +2400,7 @@ function BackendSafetyCard({ runId, run, selectedArtifact, onSelectArtifact }: {
 // pull/update action here — this is fetch + status only, never push/reset/stash/pull.
 // Collapses a long/dependency-heavy block-reason list into one calm sentence instead
 // of dumping potentially thousands of node_modules paths inline. Full detail always
-// stays available via the Git Sync Report artifact link.
+// stays available via the Git Sync Report / Repo Hygiene State JSON artifact links.
 function summarizeBlockReasons(reasons: string[]): { collapsed: boolean; text?: string; examples: string[] } {
   const hasNodeModules = reasons.some(r => r.toLowerCase().includes("node_modules"));
   if (hasNodeModules || reasons.length > 10) {
@@ -2411,8 +2422,10 @@ function RepositoryStatusCard({ runId, run, selectedArtifact, onSelectArtifact }
 }) {
   const [state, setState] = useState<GitSyncState | null>(null);
   const [pull, setPull] = useState<GitPullState | null>(null);
+  const [hygiene, setHygiene] = useState<RepoHygieneSummary | null>(null);
   const hasArtifact = (run?.artifacts ?? []).includes("git_sync_state.json");
   const hasPullArtifact = (run?.artifacts ?? []).includes("git_pull_state.json");
+  const hasHygieneArtifact = (run?.artifacts ?? []).includes("repo_hygiene_state.json");
 
   useEffect(() => {
     if (!hasArtifact) { setState(null); return; }
@@ -2423,6 +2436,11 @@ function RepositoryStatusCard({ runId, run, selectedArtifact, onSelectArtifact }
     if (!hasPullArtifact) { setPull(null); return; }
     getGitPullState(runId).then(setPull).catch(() => setPull(null));
   }, [runId, hasPullArtifact]);
+
+  useEffect(() => {
+    if (!hasHygieneArtifact) { setHygiene(null); return; }
+    getRepoHygieneState(runId).then(setHygiene).catch(() => setHygiene(null));
+  }, [runId, hasHygieneArtifact]);
 
   if (!run?.git_sync_status && !state) return null;
 
@@ -2447,15 +2465,37 @@ function RepositoryStatusCard({ runId, run, selectedArtifact, onSelectArtifact }
     : status === "diverged" ? `Diverged from origin/${baseBranch}`
     : "Not checked yet";
 
+  // Prefer the structured repo hygiene classifier (source/dependency/generated/...)
+  // over the old "guess from block-reason text" heuristic, once it's loaded.
+  const effectiveHygiene = hygiene ?? state?.repo_hygiene ?? null;
   const blockReasons = blocked ? (state?.block_reasons ?? pull?.block_reasons ?? []) : [];
   const blockedSummary = summarizeBlockReasons(blockReasons);
+
   const pullStatusText =
     pullAction === "not requested" ? "No pull needed for this planning run"
     : pullAction === "no update needed" ? "No pull needed — already up to date"
     : pullAction === "succeeded" ? "Pulled safely (fast-forward only)"
     : pullAction === "failed" ? "Pull attempted but failed — see Git Sync Report"
-    : blockedSummary.collapsed ? "Pull blocked — local dependency changes detected"
-    : "Pull blocked — see details below";
+    : effectiveHygiene && effectiveHygiene.dependency_files_dirty > 0
+      ? "Blocked — dependency folder changes detected"
+    : blockedSummary.collapsed ? "Blocked — dependency folder changes detected"
+    : "Blocked — see details below";
+
+  const buildStatusText =
+    effectiveHygiene && effectiveHygiene.env_or_secret_files_dirty > 0
+      ? "Blocked — possible env/secret file changes detected"
+    : effectiveHygiene && effectiveHygiene.source_files_dirty > 0
+      ? "Blocked — source files have local changes"
+    : effectiveHygiene && effectiveHygiene.dependency_files_dirty > 0
+      ? "Blocked — dependency folder dirty"
+    : effectiveHygiene && effectiveHygiene.severity === "clean"
+      ? "Not blocked by repo hygiene"
+    : "Not checked yet";
+
+  const commitStatusText =
+    effectiveHygiene
+      ? (effectiveHygiene.safe_to_commit ? "Not blocked by repo hygiene" : "Blocked — resolve repo hygiene issues first")
+      : "Not checked yet";
 
   const companyRepoText = isCompanyRepo
     ? "Protected — no automatic push or destructive Git action"
@@ -2464,6 +2504,8 @@ function RepositoryStatusCard({ runId, run, selectedArtifact, onSelectArtifact }
   const quickLinks = [
     { file: "git_sync_report.md", label: "Git Sync Report" },
     { file: "git_sync_state.json", label: "Git Sync State JSON" },
+    { file: "repo_hygiene_summary.md", label: "Repo Hygiene Summary" },
+    { file: "repo_hygiene_state.json", label: "Repo Hygiene State JSON" },
   ].filter(l => (run?.artifacts ?? []).includes(l.file));
 
   return (
@@ -2496,15 +2538,39 @@ function RepositoryStatusCard({ runId, run, selectedArtifact, onSelectArtifact }
           <span>{pullStatusText}</span>
         </div>
         <div className="repo-status-row">
+          <span className="repo-status-row-label">Build status</span>
+          <span>{buildStatusText}</span>
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Commit status</span>
+          <span>{commitStatusText}</span>
+        </div>
+        <div className="repo-status-row">
           <span className="repo-status-row-label">Company repository</span>
           <span>{companyRepoText}</span>
         </div>
       </div>
 
-      {blocked && blockedSummary.collapsed && (
+      {effectiveHygiene && effectiveHygiene.dependency_files_dirty > 0 && (
+        <div className="delivery-warning-panel">
+          Dependency folder changes detected. The pipeline will not pull, build, commit, or push
+          while dependency files are dirty. See Repo Hygiene Summary for full details.
+        </div>
+      )}
+      {effectiveHygiene && effectiveHygiene.source_files_dirty > 0 && (
+        <div className="delivery-warning-panel">
+          <strong>Source changes detected: {effectiveHygiene.source_files_dirty}</strong>
+          {effectiveHygiene.source_examples.length > 0 && (
+            <ul>
+              {effectiveHygiene.source_examples.slice(0, 3).map(p => <li key={p}><code>{p}</code></li>)}
+            </ul>
+          )}
+        </div>
+      )}
+      {!effectiveHygiene && blocked && blockedSummary.collapsed && (
         <div className="delivery-warning-panel">{blockedSummary.text}</div>
       )}
-      {blocked && !blockedSummary.collapsed && blockedSummary.examples.length > 0 && (
+      {!effectiveHygiene && blocked && !blockedSummary.collapsed && blockedSummary.examples.length > 0 && (
         <div className="delivery-warning-panel">
           <strong>Pull blocked.</strong>
           <ul>{blockedSummary.examples.map(r => <li key={r}>{r}</li>)}</ul>
@@ -2844,6 +2910,16 @@ function DeliveryCard({ runId, selectedArtifact, onSelectArtifact }: {
   const precheckBlocked = precheck?.decision === "BLOCKED";
   const deliveryBlocked = boundaryBlocked || precheckBlocked;
 
+  // Compact, classifier-driven summary for "blocked by repo hygiene" instead of
+  // dumping raw block-reason/path lists — see delivery.classify_repo_hygiene.
+  const hygieneSummary = info.state?.repo_hygiene_summary;
+  const hygieneBlockedLabel =
+    !hygieneSummary || hygieneSummary.severity === "clean" ? null
+    : hygieneSummary.env_or_secret_files_dirty > 0 ? "Blocked by repo hygiene: possible env/secret file changes detected."
+    : hygieneSummary.dependency_files_dirty > 0 ? "Blocked by repo hygiene: dependency folder changes detected."
+    : hygieneSummary.source_files_dirty > 0 ? "Blocked by repo hygiene: source files have local changes."
+    : null;
+
   const doCommit = async () => {
     setBusy("commit"); setError(null);
     try {
@@ -2911,6 +2987,13 @@ function DeliveryCard({ runId, selectedArtifact, onSelectArtifact }: {
             </>
           )}
           No branch, commit, or push can be created until this is resolved.
+        </div>
+      )}
+
+      {deliveryBlocked && hygieneBlockedLabel && !nodeModulesHygieneBlocked && (
+        <div className="delivery-warning-panel">
+          <strong>{hygieneBlockedLabel}</strong>
+          {" "}See Repo Hygiene Summary for full details — never rendered as a raw path list here.
         </div>
       )}
 

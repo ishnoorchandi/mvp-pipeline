@@ -233,14 +233,20 @@ def test_existing_app_upgrade_git_sync_helper_writes_artifacts_and_state():
             rdir = p.run_dir(run_id)
             assert (rdir / "git_sync_report.md").exists()
             assert (rdir / "git_sync_state.json").exists()
+            assert (rdir / "repo_hygiene_summary.md").exists()
+            assert (rdir / "repo_hygiene_state.json").exists()
 
             state = p.load_state(run_id)
             assert state["git_sync_status"] == "up_to_date"
             assert state["git_sync_blocked"] is False
             assert "up_to_date" in state["git_sync_summary"]
-            assert state["git_sync_artifacts"] == ["git_sync_report.md", "git_sync_state.json"]
+            assert state["git_sync_artifacts"] == [
+                "git_sync_report.md", "git_sync_state.json",
+                "repo_hygiene_summary.md", "repo_hygiene_state.json",
+            ]
             assert "git_sync_report.md" in state["artifacts"]
             assert "git_sync_state.json" in state["artifacts"]
+            assert state["repo_hygiene_severity"] == "clean"
         finally:
             p.RUNS_DIR = original_runs_dir
 
