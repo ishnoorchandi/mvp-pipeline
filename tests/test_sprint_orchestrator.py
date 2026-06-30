@@ -484,7 +484,7 @@ def test_compute_next_action_phases():
 
     cases = [
         (so.PHASE_INITIALIZED, "Generate sprint build prompt"),
-        (so.PHASE_BUILD_PROMPT_READY, "Start the sprint build"),
+        (so.PHASE_BUILD_PROMPT_READY, "copy"),
         (so.PHASE_SMOKE_PENDING, "smoke"),
         (so.PHASE_SMOKE_FAILED, "fix"),
         (so.PHASE_REVIEW_PENDING, "review"),
@@ -512,6 +512,159 @@ def test_compute_next_action_phases():
     # build_attempted + interrupted → handoff
     s = _state(so.PHASE_BUILD_ATTEMPTED, attempt_status="interrupted")
     assert "handoff" in so.compute_next_action(s)["next_action"].lower()
+
+
+# ── Issue 2: raw-idea fallback sprint scope ───────────────────────────────────
+
+def _raw_idea_run(run_dir: Path) -> None:
+    """Minimal raw-idea run: planning gate approved, three required docs, no sprint plan."""
+    _make_req_signoff(run_dir)
+    _make_arch_signoff(run_dir)
+    _make_approved_req(run_dir)
+    _make_approved_arch(run_dir)
+    _make_requirements_md(run_dir)
+    _make_global_instructions(run_dir)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({"entry_point": "raw_idea", "execution_mode": "build"}), encoding="utf-8"
+    )
+    # Deliberately omit feature_sprint_plan.json and selected_feature_sprint_scope.md
+
+
+def _raw_idea_run_with_arch(run_dir: Path) -> None:
+    """Raw idea run with architecture_questions.json providing answered stack choices."""
+    _raw_idea_run(run_dir)
+    arch_state = {
+        "entry_point": "raw_idea",
+        "architecture_status": "approved",
+        "answers": {
+            "frontend_stack": "React + TypeScript",
+            "backend_stack": "No backend / frontend-only",
+            "data_storage": "Mock data",
+            "auth_scope": "No auth in v1",
+            "external_services": ["None"],
+            "build_workflow": "Sandbox build",
+            "first_build_scope": "Frontend-only MVP",
+            "deployment_now": "No",
+        },
+        "questions": [],
+    }
+    (run_dir / "architecture_questions.json").write_text(json.dumps(arch_state), encoding="utf-8")
+
+
+# Test 1: raw idea run generates selected_feature_sprint_scope.md
+def test_ensure_sprint_scope_creates_artifact():
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        _raw_idea_run_with_arch(run_dir)
+        result = so.ensure_selected_sprint_scope(run_dir, 1, entry_point="raw_idea")
+        assert (run_dir / "selected_feature_sprint_scope.md").exists(), (
+            "ensure_selected_sprint_scope must create selected_feature_sprint_scope.md"
+        )
+        assert result["selected_sprint_artifact"] == "selected_feature_sprint_scope.md"
+        assert result["sprint_title"] is not None
+        assert result["sprint_goal"] is not None
+
+
+# Test 2: orchestrator state gets non-null sprint_title, sprint_goal, selected_sprint_artifact
+def test_raw_idea_init_state_non_null_sprint_fields():
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        _raw_idea_run_with_arch(run_dir)
+        state = so.initialize_orchestrator(run_dir, 1)
+        assert state["sprint_title"] is not None, "sprint_title must not be None for raw-idea run"
+        assert state["sprint_goal"] is not None, "sprint_goal must not be None for raw-idea run"
+        assert state["selected_sprint_artifact"] == "selected_feature_sprint_scope.md", (
+            "selected_sprint_artifact must point to fallback scope file"
+        )
+
+
+# Test 3: existing-app upgrade with feature_sprint_plan preserves sprint metadata unchanged
+def test_existing_app_upgrade_preserves_sprint_metadata():
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        _full_run(run_dir)  # includes feature_sprint_plan.json + existing_app_upgrade run_state
+        state = so.initialize_orchestrator(run_dir, 1)
+        assert state["sprint_title"] == "Dashboard Sprint", (
+            "Existing sprint plan title must not be overwritten by fallback"
+        )
+        assert state["sprint_goal"] == "Build the main dashboard", (
+            "Existing sprint plan goal must not be overwritten by fallback"
+        )
+        assert not (run_dir / "selected_feature_sprint_scope.md").exists(), (
+            "ensure_selected_sprint_scope must not run when sprint plan metadata is present"
+        )
+
+
+# Test 4: copy-only next_action does not contain banned phrases
+def test_next_action_copy_only_wording():
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        _raw_idea_run_with_arch(run_dir)
+        state = so.initialize_orchestrator(run_dir, 1)
+        na = state["next_action"].lower()
+        banned = ["start the build", "run the build", "execute the sprint", "launch claude"]
+        for phrase in banned:
+            assert phrase not in na, (
+                f"next_action must not contain '{phrase}'; got: {state['next_action']}"
+            )
+
+
+# Test 5: generated build prompt contains copy-into-Claude instruction
+def test_build_prompt_contains_copy_instruction():
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        _raw_idea_run_with_arch(run_dir)
+        so.initialize_orchestrator(run_dir, 1)
+        result = so.generate_sprint_build_prompt(run_dir)
+        assert result["success"], f"generate_sprint_build_prompt failed: {result.get('error')}"
+        artifact_path = run_dir / result["artifact"]
+        content = artifact_path.read_text(encoding="utf-8")
+        assert "manually" in content.lower() or "copy" in content.lower(), (
+            "Build prompt must instruct user to copy it into Claude Code manually"
+        )
+
+
+# Test 6: handoff/continuation prompt says do not restart and implies no auto-execution
+def test_handoff_no_restart_no_auto_execution():
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        _full_run(run_dir)
+        so.initialize_orchestrator(run_dir, 1)
+        so.record_build_attempt(run_dir, "interrupted", summary="Interrupted mid-build.")
+        result = so.generate_handoff(run_dir)
+        assert result["success"], f"generate_handoff failed: {result.get('error')}"
+        artifact_path = run_dir / result["artifact"]
+        content = artifact_path.read_text(encoding="utf-8")
+        content_lower = content.lower()
+        assert "do not restart" in content_lower or "restart" in content_lower, (
+            "Handoff must mention not restarting"
+        )
+        auto_exec_phrases = ["start the build", "run the build", "execute the sprint", "launch claude"]
+        for phrase in auto_exec_phrases:
+            assert phrase not in content_lower, (
+                f"Handoff must not contain auto-execution phrase '{phrase}'"
+            )
+
+
+# Test 7: ensure_selected_sprint_scope is idempotent — pre-existing file is not overwritten
+def test_ensure_sprint_scope_idempotent():
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        _raw_idea_run_with_arch(run_dir)
+        pre_existing = (
+            "# Selected Sprint 1 Scope\n\n"
+            "## Sprint Title\nPre-existing Title\n\n"
+            "## Sprint Goal\nPre-existing goal text.\n"
+        )
+        scope_path = run_dir / "selected_feature_sprint_scope.md"
+        scope_path.write_text(pre_existing, encoding="utf-8")
+
+        result = so.ensure_selected_sprint_scope(run_dir, 1)
+        assert scope_path.read_text(encoding="utf-8") == pre_existing, (
+            "ensure_selected_sprint_scope must not overwrite a pre-existing scope file"
+        )
+        assert result["sprint_title"] == "Pre-existing Title"
+        assert result["sprint_goal"] == "Pre-existing goal text."
 
 
 if __name__ == "__main__":

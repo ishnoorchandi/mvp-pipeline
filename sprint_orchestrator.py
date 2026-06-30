@@ -27,6 +27,8 @@ _APPROVED_ARCH_MD = "approved_architecture.md"
 _SPRINT_PLAN = "feature_sprint_plan.json"
 _SPRINT_SCOPE_MD = "selected_feature_sprint_scope.md"
 _SPRINT_QUALITY = "sprint_quality_gate.json"
+_ARCH_QUESTIONS = "architecture_questions.json"
+_REQ_QUESTIONS = "requirements_questions.json"
 
 # ── Status / phase constants ───────────────────────────────────────────────────
 STATUS_NOT_STARTED = "not_started"
@@ -167,6 +169,198 @@ def _load_sprint_meta(run_dir: Path, sprint_number: int) -> dict:
     }
 
 
+# ── Fallback sprint scope (raw idea / written requirements runs) ──────────────
+
+def _lower_first(text: str) -> str:
+    return (text[:1].lower() + text[1:]) if text else text
+
+
+def _as_list(value) -> list:
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if value in (None, ""):
+        return []
+    return [str(value)]
+
+
+def _extract_md_bullets(md_text: str, heading: str, max_items: int = 6) -> list[str]:
+    """Extract '- ' / '* ' bullet items under a markdown heading, no LLM involved."""
+    heading_lower = heading.strip().lower()
+    items: list[str] = []
+    in_section = False
+    for raw_line in (md_text or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("#"):
+            if in_section:
+                break
+            if line.lstrip("#").strip().lower() == heading_lower:
+                in_section = True
+            continue
+        if in_section and (line.startswith("- ") or line.startswith("* ")):
+            item = line[2:].strip()
+            if item and not item.startswith("*"):
+                items.append(item)
+    return items[:max_items]
+
+
+def _derive_fallback_sprint_scope(
+    requirements_text: str,
+    arch_answers: dict,
+) -> tuple[str, str, list[str], list[str]]:
+    """Deterministically derive title/goal/in-scope/out-of-scope from approved docs."""
+    frontend = arch_answers.get("frontend_stack") or "React + TypeScript"
+    data = arch_answers.get("data_storage") or "Mock data"
+    scope_choice = arch_answers.get("first_build_scope") or "Frontend-only MVP"
+    auth_scope = str(arch_answers.get("auth_scope") or "No auth in v1")
+    deployment_now = str(arch_answers.get("deployment_now") or "No")
+    external_services = _as_list(arch_answers.get("external_services")) or ["None"]
+
+    if "applicant tracking" in requirements_text.lower():
+        title = "Frontend ATS MVP"
+        goal = (
+            f"Build a {_lower_first(scope_choice)} applicant tracking dashboard "
+            f"using {frontend} and {data.lower()}."
+        )
+    else:
+        title = "Frontend MVP"
+        goal = f"Build the approved {_lower_first(scope_choice)} using the approved stack and scope."
+
+    in_scope = _extract_md_bullets(requirements_text, "Must-Have Features")
+    if not in_scope:
+        in_scope = ["Core MVP functionality described in requirements.md"]
+
+    out_scope = []
+    if "no auth" in auth_scope.lower():
+        out_scope.append("Authentication")
+    if not any("email" in s.lower() for s in external_services):
+        out_scope.append("Email automation")
+    if not any("payment" in s.lower() for s in external_services):
+        out_scope.append("Payments")
+    if not external_services or all(s.lower() == "none" for s in external_services):
+        out_scope.append("External APIs")
+    if deployment_now.strip().lower() in ("no", "false", ""):
+        out_scope.append("Deployment")
+    if not out_scope:
+        out_scope = ["Items outside the approved architecture scope"]
+
+    return title, goal, in_scope, out_scope
+
+
+def _render_sprint_scope_md(
+    title: str, goal: str, in_scope: list[str], out_scope: list[str], arch_answers: dict
+) -> str:
+    frontend = arch_answers.get("frontend_stack") or "React + TypeScript"
+    backend = arch_answers.get("backend_stack") or "No backend / frontend-only"
+    data = arch_answers.get("data_storage") or "Mock data"
+    auth = arch_answers.get("auth_scope") or "No auth in v1"
+    workflow = arch_answers.get("build_workflow") or "Sandbox build"
+    scope_choice = arch_answers.get("first_build_scope") or "Frontend-only MVP"
+
+    in_scope_md = "\n".join(f"- {item}" for item in in_scope)
+    out_scope_md = "\n".join(f"- {item}" for item in out_scope)
+
+    return f"""# Selected Sprint 1 Scope
+
+## Sprint Title
+{title}
+
+## Sprint Goal
+{goal}
+
+## Source
+Generated fallback sprint scope from approved requirements and architecture because no feature_sprint_plan.json was present.
+
+## In Scope
+{in_scope_md}
+
+## Out of Scope
+{out_scope_md}
+
+## Approved Architecture
+- Frontend: {frontend}
+- Backend: {backend}
+- Data storage: {data}
+- Auth: {auth}
+- Build workflow: {workflow}
+- First sprint scope: {scope_choice}
+
+## Build Rules
+- Read GLOBAL_INSTRUCTIONS.md first.
+- Stay within this sprint scope.
+- Generate a prompt only; do not run build execution from the app.
+"""
+
+
+def _parse_sprint_scope_md(content: str) -> tuple[Optional[str], Optional[str]]:
+    """Read sprint_title/sprint_goal back out of an existing scope artifact."""
+    lines = content.splitlines()
+    title = None
+    goal = None
+
+    def _next_nonblank(idx: int) -> Optional[str]:
+        for j in range(idx + 1, min(idx + 4, len(lines))):
+            candidate = lines[j].strip()
+            if candidate:
+                return candidate
+        return None
+
+    for idx, raw_line in enumerate(lines):
+        line = raw_line.strip().lower()
+        if line == "## sprint title":
+            title = _next_nonblank(idx) or title
+        elif line == "## sprint goal":
+            goal = _next_nonblank(idx) or goal
+
+    return title, goal
+
+
+def ensure_selected_sprint_scope(
+    run_dir: Path,
+    sprint_number: int,
+    entry_point: Optional[str] = None,
+) -> dict:
+    """
+    Ensure selected_feature_sprint_scope.md exists for runs with no
+    feature_sprint_plan.json (raw idea / written requirements fallback).
+
+    Deterministic — no LLM calls. Idempotent — never overwrites an existing
+    scope artifact; if one already exists, its title/goal are read back instead.
+
+    Returns {"sprint_title": str|None, "sprint_goal": str|None,
+             "selected_sprint_artifact": str|None}.
+    """
+    run_dir = Path(run_dir)
+    scope_path = run_dir / _SPRINT_SCOPE_MD
+
+    if scope_path.exists():
+        title, goal = _parse_sprint_scope_md(_read_text(scope_path))
+        return {
+            "sprint_title": title,
+            "sprint_goal": goal,
+            "selected_sprint_artifact": _SPRINT_SCOPE_MD,
+        }
+
+    if not (
+        (run_dir / _REQUIREMENTS_MD).exists()
+        and (run_dir / _APPROVED_ARCH_MD).exists()
+        and (run_dir / _GLOBAL_INSTRUCTIONS_MD).exists()
+    ):
+        return {"sprint_title": None, "sprint_goal": None, "selected_sprint_artifact": None}
+
+    requirements_text = _read_text(run_dir / _REQUIREMENTS_MD)
+    arch_answers = (_read_json(run_dir / _ARCH_QUESTIONS) or {}).get("answers") or {}
+
+    title, goal, in_scope, out_scope = _derive_fallback_sprint_scope(requirements_text, arch_answers)
+    content = _render_sprint_scope_md(title, goal, in_scope, out_scope, arch_answers)
+    _write_text(scope_path, content)
+
+    return {
+        "sprint_title": title,
+        "sprint_goal": goal,
+        "selected_sprint_artifact": _SPRINT_SCOPE_MD,
+    }
+
+
 def _check_sprint_build_ready(run_dir: Path, sprint_number: int) -> tuple[bool, Optional[str]]:
     """Return (True, None) if the sprint is build-ready or no quality gate exists."""
     plan = _read_json(run_dir / _SPRINT_PLAN) or {}
@@ -206,13 +400,13 @@ def compute_next_action(state: dict) -> dict:
 
     if phase == PHASE_INITIALIZED:
         return {
-            "next_action": "Generate sprint build prompt and start the build.",
+            "next_action": "Generate sprint build prompt, then copy it into Claude Code manually.",
             "blocking_reason": None,
         }
 
     if phase == PHASE_BUILD_PROMPT_READY:
         return {
-            "next_action": "Start the sprint build.",
+            "next_action": "Copy the build prompt into Claude Code manually, then record the build result.",
             "blocking_reason": None,
         }
 
@@ -336,6 +530,8 @@ def initialize_orchestrator(
     If a different sprint is active, raises ValueError with a 409-like message.
     """
     run_dir = Path(run_dir)
+    if run_state is None:
+        run_state = _read_json(run_dir / "run_state.json") or {}
 
     # Planning gate + document check
     ok, reason = can_initialize_orchestration(run_dir, run_state=run_state)
@@ -361,18 +557,30 @@ def initialize_orchestrator(
             )
 
     meta = _load_sprint_meta(run_dir, sprint_number)
-    scope_artifact = _SPRINT_SCOPE_MD if (run_dir / _SPRINT_SCOPE_MD).exists() else None
+    if meta.get("sprint_title") is None:
+        # No feature_sprint_plan.json entry for this sprint (raw idea / written
+        # requirements runs). Fall back to a deterministically generated scope.
+        fallback = ensure_selected_sprint_scope(
+            run_dir, sprint_number, entry_point=run_state.get("entry_point")
+        )
+        sprint_title = fallback.get("sprint_title")
+        sprint_goal = fallback.get("sprint_goal")
+        scope_artifact = fallback.get("selected_sprint_artifact")
+    else:
+        sprint_title = meta.get("sprint_title")
+        sprint_goal = meta.get("sprint_goal")
+        scope_artifact = _SPRINT_SCOPE_MD if (run_dir / _SPRINT_SCOPE_MD).exists() else None
 
     now = _now()
     state: dict = {
         "status": STATUS_ACTIVE,
         "active_sprint": sprint_number,
-        "sprint_title": meta.get("sprint_title"),
-        "sprint_goal": meta.get("sprint_goal"),
+        "sprint_title": sprint_title,
+        "sprint_goal": sprint_goal,
         "sprint_quality": meta.get("sprint_quality", {}),
         "current_phase": PHASE_INITIALIZED,
         "last_completed_step": None,
-        "next_action": "Generate sprint build prompt and start the build.",
+        "next_action": None,
         "blocking_reason": None,
         "requirements_artifact": _REQUIREMENTS_MD,
         "global_instructions_artifact": _GLOBAL_INSTRUCTIONS_MD,
@@ -388,6 +596,7 @@ def initialize_orchestrator(
         "created_at": now,
         "updated_at": now,
     }
+    _apply_next_action(state)
 
     return save_orchestrator_state(run_dir, state)
 
@@ -847,9 +1056,6 @@ def generate_sprint_build_prompt(run_dir: Path) -> dict:
     state["build_prompt_artifact"] = artifact_name
     state["current_phase"] = PHASE_BUILD_PROMPT_READY
     state["last_completed_step"] = "Sprint build prompt generated."
-    state["next_action"] = (
-        "Copy sprint build prompt into Claude Code and record the build attempt result."
-    )
     _apply_next_action(state)
     save_orchestrator_state(run_dir, state)
 
