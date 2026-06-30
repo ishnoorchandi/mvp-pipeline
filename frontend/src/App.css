@@ -941,6 +941,12 @@ button { cursor: pointer; border: none; outline: none; background: none; font-fa
 .delivery-card-title { font-size: 14.5px; font-weight: 700; color: var(--text); }
 .delivery-card-sub { font-size: 12px; color: var(--text2); margin-top: 3px; line-height: 1.45; max-width: 520px; }
 
+.guided-workflow-note {
+  margin: -6px 20px 14px; padding: 9px 12px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--bg3); color: var(--text2); font-size: 12px;
+  line-height: 1.45;
+}
+
 .delivery-badge {
   font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 99px; flex-shrink: 0;
   text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap;

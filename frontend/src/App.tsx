@@ -106,6 +106,12 @@ const TERMINAL = new Set([
 // Clean display names for sprint-mode artifacts (requirement: artifact sidebar should
 // show readable labels, not raw filenames, for sprint planning outputs).
 const ARTIFACT_LABELS: Record<string, string> = {
+  "requirements.md":                  "Requirements",
+  "approved_requirements.md":         "Approved Requirements",
+  "requirements_signoff_state.json":  "Requirements Sign-off State",
+  "approved_architecture.md":         "Approved Architecture",
+  "architecture_signoff_state.json":  "Architecture Sign-off State",
+  "GLOBAL_INSTRUCTIONS.md":           "Global Instructions",
   "sprint_plan.md":                    "Sprint Plan",
   "sprint_plan.json":                  "Sprint Plan JSON",
   "selected_sprint_scope.md":          "Selected Sprint Scope",
@@ -162,12 +168,41 @@ function artifactDisplayName(filename: string): string {
   return filename;
 }
 
-const ARTIFACT_ORDER = [
-  "raw_input.md",
+const GUIDED_BUILD_ARTIFACTS = new Set([
   "mvp_scope.md",
   "clean_requirements.md",
   "mvp_spec.md",
   "ARCHITECTURE.md",
+  "feature_sprint_plan.md",
+  "requirements_signoff_state.json",
+  "architecture_signoff_state.json",
+  "GLOBAL_INSTRUCTIONS.md",
+]);
+
+function shouldShowGuidedBuildWorkflow(run: RunDetail | null): boolean {
+  if (!run) return false;
+  if (run.continue_run) return false;
+  if (run.bugfix_mode || run.backend_inventory_mode) return false;
+  if (run.pr_remote_decision || run.pr_plan_status || run.git_sync_status) return false;
+  if (run.backend_boundary_status != null || run.backend_smoke_status != null) return false;
+  if (run.upgrade_mode || run.status === "feature_plan_only_done") return true;
+  if (run.input_mode === "idea" || run.input_mode === "requirements") return true;
+  if (run.status === "plan_only_done" || run.status === "sprint_plan_only_done") return true;
+  return (run.artifacts ?? []).some(a => GUIDED_BUILD_ARTIFACTS.has(a));
+}
+
+const ARTIFACT_ORDER = [
+  "raw_input.md",
+  "mvp_scope.md",
+  "clean_requirements.md",
+  "requirements.md",
+  "approved_requirements.md",
+  "requirements_signoff_state.json",
+  "mvp_spec.md",
+  "ARCHITECTURE.md",
+  "approved_architecture.md",
+  "architecture_signoff_state.json",
+  "GLOBAL_INSTRUCTIONS.md",
   "smoke_checks.md",
   "build_prompt.txt",
   "sprint_plan.md",
@@ -5280,6 +5315,7 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
     runArtifacts: run?.artifacts ?? [],
     sprintModeActive,
   });
+  const showGuidedBuildWorkflow = shouldShowGuidedBuildWorkflow(run);
 
   // Existing App Upgrade mode has a different artifact shape (existing_app_summary.md,
   // change_gap_analysis.md, feature_sprint_plan.json, regression_check.md, ...) than the
@@ -5315,6 +5351,21 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
           {sprintModeActive && <SprintModeBanner info={sprintInfo} fallbackSelected={selectedSprintNum} planOnly={sprintPlanOnlyActive} />}
 
           <div className="steps-panel-scroll">
+            {showGuidedBuildWorkflow && (
+              <>
+                <OperatorSummaryCard run={run} />
+                <div className="guided-workflow-note">
+                  Guided workflow prepares sign-offs and copyable Claude Code prompts. It does not run Claude Code automatically.
+                </div>
+                <GuidedWorkflowCard runId={runId} run={run} onSelectArtifact={setSelectedArtifact} />
+                <RequirementsConversationCard runId={runId} onSelectArtifact={setSelectedArtifact} />
+                <ArchitectureConversationCard runId={runId} onSelectArtifact={setSelectedArtifact} />
+                <GlobalInstructionsCard runId={runId} onSelectArtifact={setSelectedArtifact} />
+                <SprintOrchestratorCard runId={runId} onSelectArtifact={setSelectedArtifact} />
+                <PrimaryOutputsCard run={run} selectedArtifact={selectedArtifact} onSelectArtifact={setSelectedArtifact} />
+              </>
+            )}
+
             <PipelineSectionOverview sections={sections} />
 
             {/* Run timeline — explicit history of loop cycles/rounds. */}
@@ -5715,7 +5766,7 @@ function InputView({ mode, onBack, onCreated }: { mode: EntryMode; onBack: () =>
       const base =
         mode === "jira" ? { jira_key: jiraKey.trim().toUpperCase() } :
         mode === "idea" ? { raw_input: text.trim(), mode: "idea" } :
-                          { raw_input: text.trim() };
+                          { raw_input: text.trim(), mode: "requirements" };
       // Plan-only / sprint-plan-only let the dashboard exercise the pipeline's cheap,
       // no-Claude-Code / no-DeepSeek paths (same as the CLI's --plan-only /
       // --sprint-plan --sprint-plan-only flags) for quick testing.

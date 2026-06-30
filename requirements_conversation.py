@@ -487,6 +487,12 @@ def lazy_init_from_run_state(run_dir: Path, run_state: dict) -> dict:
         entry_point = "backend_inventory"
     elif run_state.get("mode") == "existing_app_upgrade" or run_state.get("upgrade_mode"):
         entry_point = "existing_app_upgrade"
+    elif run_state.get("entry_point") in SUPPORTED_ENTRY_POINTS:
+        entry_point = run_state.get("entry_point")
+    elif run_state.get("input_mode") == "requirements":
+        entry_point = "written_requirements"
+    elif run_state.get("input_mode") == "idea":
+        entry_point = "raw_idea"
     else:
         entry_point = "raw_idea"
 

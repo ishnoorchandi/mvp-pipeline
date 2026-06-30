@@ -85,6 +85,7 @@ export interface RunDetail {
   sprint_plan_only?: boolean;
   selected_sprint?: number;
   no_deepseek?: boolean;
+  input_mode?: "idea" | "requirements" | string;
   upgrade_mode?: boolean;
   existing_app?: string;
   selected_feature_sprint?: number;

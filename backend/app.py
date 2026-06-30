@@ -616,6 +616,7 @@ def create_run():
         "selected_sprint": selected_sprint,
         "sprint_plan_only": sprint_plan_only,
         "no_deepseek": no_deepseek,
+        "input_mode": mode if mode in ("idea", "requirements") else None,
     }
     (run_path / "run_state.json").write_text(json.dumps(state, indent=2))
 
