@@ -356,6 +356,58 @@ export async function approveArchitecture(runId: string): Promise<ArchitectureCo
   return r.json();
 }
 
+// ── Global Instructions ───────────────────────────────────────────────────────
+
+export interface GlobalInstructionsStatus {
+  run_id?: string;
+  requirements_md_exists: boolean;
+  global_instructions_exists: boolean;
+  can_generate_requirements: boolean;
+  can_generate_global_instructions: boolean;
+  blocking_reason?: string | null;
+  state?: {
+    status?: string;
+    created_at?: string;
+    requirements_artifact?: string;
+    architecture_artifact?: string;
+    global_instructions_artifact?: string;
+    source_artifacts?: string[];
+  } | null;
+  planning_gate?: PlanningGateState;
+}
+
+export async function getGlobalInstructions(runId: string): Promise<GlobalInstructionsStatus> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/global-instructions`);
+  if (!r.ok) throw new Error(`Failed to fetch global instructions status for ${runId}`);
+  return r.json();
+}
+
+export async function generateRequirementsMd(runId: string): Promise<GlobalInstructionsStatus & { artifact?: string }> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/global-instructions/generate-requirements`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to generate requirements.md: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function generateGlobalInstructions(runId: string): Promise<GlobalInstructionsStatus & { artifacts?: string[] }> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/global-instructions/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to generate GLOBAL_INSTRUCTIONS.md: ${msg}`);
+  }
+  return r.json();
+}
+
 export async function getRuns(): Promise<RunSummary[]> {
   const r = await fetch(`${BASE}/api/runs`);
   if (!r.ok) throw new Error("Failed to fetch runs");

@@ -7,11 +7,12 @@ import {
   getPrRemoteDeliveryState, getRepoHygieneState,
   getRequirementsConversation, saveRequirementsAnswer, approveRequirements,
   getArchitectureConversation, saveArchitectureAnswer, approveArchitecture,
+  getGlobalInstructions, generateRequirementsMd, generateGlobalInstructions,
 } from "./api";
 import type {
   RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState,
   PrDeliveryPlanState, PrBranchPrepState, PrRemoteDeliveryState, RepoHygieneSummary,
-  PlanningGateState, RequirementsQuestion, ArchitectureQuestion,
+  PlanningGateState, RequirementsQuestion, ArchitectureQuestion, GlobalInstructionsStatus,
 } from "./api";
 import "./App.css";
 
@@ -3179,6 +3180,146 @@ function ArchitectureConversationCard({
   );
 }
 
+// Global Instructions — generates requirements.md and GLOBAL_INSTRUCTIONS.md after
+// requirements + architecture are both approved. Gated: req approval required for
+// requirements.md; both approvals required for GLOBAL_INSTRUCTIONS.md.
+function GlobalInstructionsCard({
+  runId, onSelectArtifact, onPlanningGateUpdated,
+}: {
+  runId: string;
+  onSelectArtifact?: (artifact: string) => void;
+  onPlanningGateUpdated?: () => void;
+}) {
+  const [status, setStatus] = useState<GlobalInstructionsStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [generating, setGenerating] = useState<"requirements" | "global" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = () => {
+    setLoading(true);
+    getGlobalInstructions(runId)
+      .then((s) => { setStatus(s); setError(null); })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { load(); }, [runId]);
+
+  const handleGenerateRequirements = async () => {
+    setGenerating("requirements");
+    setError(null);
+    try {
+      const s = await generateRequirementsMd(runId);
+      setStatus(s);
+      onPlanningGateUpdated?.();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGenerating(null);
+    }
+  };
+
+  const handleGenerateGlobal = async () => {
+    setGenerating("global");
+    setError(null);
+    try {
+      const s = await generateGlobalInstructions(runId);
+      setStatus(s);
+      onPlanningGateUpdated?.();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGenerating(null);
+    }
+  };
+
+  if (loading && !status) return null;
+
+  const reqMdExists = status?.requirements_md_exists ?? false;
+  const giExists = status?.global_instructions_exists ?? false;
+  const canGenReq = status?.can_generate_requirements ?? false;
+  const canGenGI = status?.can_generate_global_instructions ?? false;
+  const blockingReason = status?.blocking_reason;
+
+  return (
+    <div className="delivery-card">
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}>
+        <strong>Global Instructions</strong>
+        {giExists ? (
+          <span className="delivery-badge" style={{ background: "#22863a", color: "#fff" }}>Created</span>
+        ) : canGenGI ? (
+          <span className="delivery-badge" style={{ background: "#0550ae", color: "#fff" }}>Ready</span>
+        ) : (
+          <span className="delivery-badge" style={{ background: "#6e7781", color: "#fff" }}>Locked</span>
+        )}
+      </div>
+
+      {error && (
+        <div className="delivery-warning-panel" style={{ marginBottom: "0.5rem" }}>
+          {error}
+        </div>
+      )}
+
+      {!canGenReq && !giExists && (
+        <p style={{ color: "#6e7781", fontSize: "0.85rem", margin: "0 0 0.5rem" }}>
+          {blockingReason ?? "Approve requirements to unlock."}
+        </p>
+      )}
+
+      {canGenReq && !giExists && (
+        <p style={{ color: "#24292f", fontSize: "0.85rem", margin: "0 0 0.5rem" }}>
+          {canGenGI
+            ? "Requirements and architecture are approved. Generate the final build instructions."
+            : "Requirements are approved. Generate requirements.md, then approve architecture to unlock GLOBAL_INSTRUCTIONS.md."}
+        </p>
+      )}
+
+      {giExists && (
+        <p style={{ color: "#22863a", fontSize: "0.85rem", margin: "0 0 0.5rem" }}>
+          Build instructions are ready. All planning gates can now allow the build.
+        </p>
+      )}
+
+      <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginTop: "0.25rem" }}>
+        {canGenReq && !reqMdExists && (
+          <button
+            className="delivery-card-action"
+            disabled={generating !== null}
+            onClick={handleGenerateRequirements}
+          >
+            {generating === "requirements" ? "Generating…" : "Generate requirements.md"}
+          </button>
+        )}
+        {reqMdExists && (
+          <button
+            className="delivery-card-action"
+            onClick={() => onSelectArtifact?.("requirements.md")}
+          >
+            View requirements.md
+          </button>
+        )}
+        {canGenGI && !giExists && (
+          <button
+            className="delivery-card-action"
+            disabled={generating !== null}
+            onClick={handleGenerateGlobal}
+          >
+            {generating === "global" ? "Generating…" : "Generate GLOBAL_INSTRUCTIONS.md"}
+          </button>
+        )}
+        {giExists && (
+          <button
+            className="delivery-card-action"
+            onClick={() => onSelectArtifact?.("GLOBAL_INSTRUCTIONS.md")}
+          >
+            View GLOBAL_INSTRUCTIONS.md
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // Primary Outputs — the handful of artifacts that actually matter for this
 // run, in priority order, reusing the existing artifact viewer (no new viewer
 // component). Only ever shows artifacts that exist; renders nothing if none do.
@@ -4150,6 +4291,8 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             <RequirementsConversationCard runId={runId} onSelectArtifact={setSelected} />
             {/* 1c. Architecture Conversation — stack/data/workflow decisions before build. */}
             <ArchitectureConversationCard runId={runId} onSelectArtifact={setSelected} />
+            {/* 1d. Global Instructions — generates requirements.md + GLOBAL_INSTRUCTIONS.md. */}
+            <GlobalInstructionsCard runId={runId} onSelectArtifact={setSelected} />
             {/* 2. Primary Outputs — the handful of artifacts that matter. */}
             <PrimaryOutputsCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             {/* 3. Planning Progress / Build Workspace. */}

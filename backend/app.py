@@ -40,6 +40,7 @@ import delivery as delivery_mod  # noqa: E402 — needs BASE_DIR on sys.path fir
 import planning_gate as planning_gate_mod  # noqa: E402
 import requirements_conversation as req_conv_mod  # noqa: E402
 import architecture_conversation as arch_conv_mod  # noqa: E402
+import global_instructions as gi_mod  # noqa: E402
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -986,6 +987,67 @@ def approve_architecture(run_id: str):
         "approved": True,
         "conversation": result["state"],
         "planning_gate": planning_gate,
+    })
+
+
+# ── Global Instructions ────────────────────────────────────────────────────────
+
+@app.route("/api/runs/<run_id>/global-instructions", methods=["GET"])
+def get_global_instructions(run_id: str):
+    """Return global instructions status: existence, gate checks, blocking reasons."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    state = load_state(run_id)
+    status = gi_mod.get_global_instructions_status(run_dir)
+    planning_gate = planning_gate_mod.build_planning_gate_from_run_state(
+        state or {}, run_dir=run_dir
+    )
+    return jsonify({"run_id": run_id, "planning_gate": planning_gate, **status})
+
+
+@app.route("/api/runs/<run_id>/global-instructions/generate-requirements", methods=["POST"])
+def generate_requirements_md(run_id: str):
+    """Generate requirements.md from approved requirements artifacts."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    result = gi_mod.generate_requirements_md(run_dir)
+    if not result["success"]:
+        abort(400, result.get("error") or "Could not generate requirements.md")
+    state = load_state(run_id)
+    status = gi_mod.get_global_instructions_status(run_dir)
+    planning_gate = planning_gate_mod.build_planning_gate_from_run_state(
+        state or {}, run_dir=run_dir
+    )
+    return jsonify({
+        "run_id": run_id,
+        "artifact": result["artifact"],
+        "planning_gate": planning_gate,
+        **status,
+    })
+
+
+@app.route("/api/runs/<run_id>/global-instructions/generate", methods=["POST"])
+def generate_global_instructions(run_id: str):
+    """Generate GLOBAL_INSTRUCTIONS.md + global_instructions_state.json."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    state = load_state(run_id)
+    existing_app = (state or {}).get("existing_app")
+    result = gi_mod.generate_global_instructions(run_dir, existing_app_path=existing_app)
+    if not result["success"]:
+        abort(400, result.get("error") or "Could not generate GLOBAL_INSTRUCTIONS.md")
+    gi_status = gi_mod.get_global_instructions_status(run_dir)
+    planning_gate = planning_gate_mod.build_planning_gate_from_run_state(
+        state or {}, run_dir=run_dir
+    )
+    return jsonify({
+        "run_id": run_id,
+        "artifacts": result["artifacts"],
+        "planning_gate": planning_gate,
+        **gi_status,
     })
 
 

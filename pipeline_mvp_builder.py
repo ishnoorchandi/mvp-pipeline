@@ -8026,7 +8026,21 @@ def generate_selected_feature_sprint_build_prompt(
     may_modify = selected_sprint.get("likely_files_modified") or []
     must_not_modify = selected_sprint.get("must_not_modify") or []
 
-    parts = [
+    gi_path = Path(run_dir) / "GLOBAL_INSTRUCTIONS.md"
+    req_path = Path(run_dir) / "requirements.md"
+    gi_preamble: list[str] = []
+    if gi_path.exists():
+        gi_preamble = [
+            "## BUILD CONSTITUTION",
+            f"Before editing anything, read GLOBAL_INSTRUCTIONS.md at: {gi_path}",
+            "Treat it as the source of truth for product requirements, approved architecture,",
+            "safety rules, and sprint execution rules. Do not violate it.",
+        ]
+        if req_path.exists():
+            gi_preamble.append(f"requirements.md path: {req_path}")
+        gi_preamble.append("")
+
+    parts = gi_preamble + [
         "## CONTEXT: EXISTING APP",
         "You are extending an existing application. Do NOT rewrite it.",
         "",
@@ -10415,7 +10429,21 @@ def generate_continuation_sprint_build_prompt(
     must_not_modify = _sprint_must_not_modify(next_sprint, detected_mode)
     completion = _sprint_completion_criteria(next_sprint, detected_mode)
 
-    parts = [
+    gi_path = Path(run_dir) / "GLOBAL_INSTRUCTIONS.md"
+    req_path = Path(run_dir) / "requirements.md"
+    gi_preamble_cont: list[str] = []
+    if gi_path.exists():
+        gi_preamble_cont = [
+            "## BUILD CONSTITUTION",
+            f"Before editing anything, read GLOBAL_INSTRUCTIONS.md at: {gi_path}",
+            "Treat it as the source of truth for product requirements, approved architecture,",
+            "safety rules, and sprint execution rules. Do not violate it.",
+        ]
+        if req_path.exists():
+            gi_preamble_cont.append(f"requirements.md path: {req_path}")
+        gi_preamble_cont.append("")
+
+    parts = gi_preamble_cont + [
         "## CONTEXT: MULTI-SPRINT CONTINUATION",
         "You are continuing an EXISTING multi-sprint product. Previous sprints have already been "
         "built and are working. Do not rebuild Sprint 1 or any other previously completed sprint. "
@@ -10905,8 +10933,23 @@ def build_mvp(run_id: str, build_prompt_text: str) -> Path:
     mvp_dir = run_dir(run_id) / "mvp"
     mvp_dir.mkdir(parents=True, exist_ok=True)
 
+    rdir = run_dir(run_id)
+    gi_path = rdir / "GLOBAL_INSTRUCTIONS.md"
+    req_path = rdir / "requirements.md"
+    gi_preamble = ""
+    if gi_path.exists():
+        gi_preamble = (
+            f"## BUILD CONSTITUTION\n"
+            f"Before editing anything, read GLOBAL_INSTRUCTIONS.md at: {gi_path}\n"
+            "Treat it as the source of truth for product requirements, approved architecture,\n"
+            "safety rules, and sprint execution rules. Do not violate it.\n"
+        )
+        if req_path.exists():
+            gi_preamble += f"requirements.md path: {req_path}\n"
+        gi_preamble += "\n"
+
     full_prompt = (
-        f"{build_prompt_text}\n\n"
+        f"{gi_preamble}{build_prompt_text}\n\n"
         "---\n"
         "Save all files into the current directory.\n"
         "Create a complete, runnable local app.\n"
