@@ -21,6 +21,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import delivery as d
 import pipeline_mvp_builder as p
+import planning_gate as pg
+
+
+def _write_planning_approval_fixtures(run_dir: Path, app_dir: Path) -> None:
+    """Write the sign-off artifacts that the planning gate requires before build.
+
+    Signoff state files go in run_dir (where the pipeline reads them).
+    GLOBAL_INSTRUCTIONS.md is committed into the fixture app repo so the repo
+    stays clean (dirty working trees are blocked before Step 12).
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / pg.REQUIREMENTS_SIGNOFF_FILE).write_text(json.dumps({"status": "approved"}))
+    (run_dir / pg.ARCHITECTURE_SIGNOFF_FILE).write_text(json.dumps({"status": "approved"}))
+    gi_path = app_dir / pg.GLOBAL_INSTRUCTIONS_FILE
+    gi_path.write_text("# Global instructions\n")
+    _git(app_dir, "add", str(gi_path))
+    _git(app_dir, "commit", "-m", "add global instructions")
 
 
 def _git(repo: Path, *args):
@@ -210,13 +227,20 @@ def test_sandbox_repo_build_mode_reaches_claude(monkeypatch):
         called = []
         monkeypatch.setattr(p, "build_feature_sprint", lambda *_a, **_k: called.append(True) or "fake build output")
 
+        # Planning gate requires sign-off before build. Pre-write fixtures into the
+        # first run dir (run_001) so the gate sees approval without a UI interaction.
+        run_id_to_use = "run_001"
+        _write_planning_approval_fixtures(p.RUNS_DIR / run_id_to_use, app)
+
         run_id = p.pipeline_existing_app_upgrade(
             str(app), "save filters", feature_plan_only=False, use_deepseek=False,
+            run_id=run_id_to_use,
         )
         state = p.load_state(run_id)
-        assert called, "a non-company, non-plan-only build must reach Claude Code"
+        assert called, "a non-company, non-plan-only build with planning approval must reach Claude Code"
         assert state["execution_mode"] == "build"
         assert state["claude_build_allowed"] is True
+        assert state["build_allowed_by_planning_gate"] is True, "planning gate must allow build when signed off"
 
 
 # ── 8. run_state includes the required build-gate fields ───────────────────

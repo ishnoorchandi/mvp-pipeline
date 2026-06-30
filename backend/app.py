@@ -31,6 +31,7 @@ PIPELINE_SCRIPT = BASE_DIR / "pipeline_mvp_builder.py"
 
 sys.path.insert(0, str(BASE_DIR))
 import delivery as delivery_mod  # noqa: E402 — needs BASE_DIR on sys.path first
+import planning_gate as planning_gate_mod  # noqa: E402
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -321,6 +322,11 @@ def build_operator_run_summary(run_dir: Path, run_state: dict, artifacts: list[s
 
     primary_artifacts = [a for a in PRIMARY_ARTIFACT_PRIORITY if a in artifact_set][:6]
 
+    # Planning gate — infer from run_state; safe for older runs (falls back to unknown)
+    planning_gate = planning_gate_mod.build_planning_gate_from_run_state(
+        run_state, run_dir=run_dir,
+    )
+
     return {
         "workflow_type": workflow_type,
         "target_repo_name": target_repo_name,
@@ -336,6 +342,7 @@ def build_operator_run_summary(run_dir: Path, run_state: dict, artifacts: list[s
         "blocking_issue": blocking_issue,
         "safe_to_show": True,
         "primary_artifacts": primary_artifacts,
+        "planning_gate": planning_gate,
     }
 
 

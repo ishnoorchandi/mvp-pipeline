@@ -36,6 +36,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import delivery as d
 import pipeline_mvp_builder as p
 import backend.app as app_mod
+import planning_gate as pg
+
+
+def _write_planning_approval_fixtures(run_dir: Path, app_dir: Path, git_fn) -> None:
+    """Write sign-off files required by the planning gate before any build."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / pg.REQUIREMENTS_SIGNOFF_FILE).write_text(json.dumps({"status": "approved"}))
+    (run_dir / pg.ARCHITECTURE_SIGNOFF_FILE).write_text(json.dumps({"status": "approved"}))
+    gi = app_dir / pg.GLOBAL_INSTRUCTIONS_FILE
+    gi.write_text("# Global instructions\n")
+    git_fn(app_dir, "add", str(gi))
+    git_fn(app_dir, "commit", "-m", "add global instructions")
 
 
 def _git(repo: Path, *args):
@@ -251,9 +263,15 @@ def test_pipeline_existing_app_upgrade_uses_sandbox_as_active_build_path(monkeyp
         monkeypatch.setattr(p, "build_feature_sprint", fake_build)
         monkeypatch.setattr(p, "run_smoke_checks", lambda *_a, **_k: "PASS")
 
+        # Planning gate requires sign-off before build; pre-write fixtures so the
+        # gate sees approval without a UI interaction.
+        run_id_to_use = "run_001"
+        _write_planning_approval_fixtures(p.RUNS_DIR / run_id_to_use, repo, _git)
+
         run_id = p.pipeline_existing_app_upgrade(
             str(repo), "save filters", feature_plan_only=False, use_deepseek=False,
             use_sandbox_workspace=True, sandbox_workspace_path=str(sandbox_root / "mysandbox"),
+            run_id=run_id_to_use,
         )
         state = p.load_state(run_id)
         assert state["build_workspace_mode"] == "sandbox"

@@ -41,6 +41,7 @@ import requests
 from openai import OpenAI
 
 import delivery as delivery_mod
+import planning_gate as planning_gate_mod
 
 from config import (
     OPENAI_API_KEY, GPT_MODEL, GPT4O_MODEL,
@@ -9411,7 +9412,15 @@ def pipeline_existing_app_upgrade(
         bug_state = run_existing_app_bugfix_planning(
             run_id, existing_app_path, bug_report_text or feature_request_text, bug_title=bug_title,
         )
-        _update_state(run_id, {"status": "bugfix_plan_done", "current_step": "done"})
+        _update_state(run_id, {
+            "status": "bugfix_plan_done", "current_step": "done",
+            "entry_point": "bugfix",
+            "requirements_status": "not_applicable",
+            "architecture_status": "not_applicable",
+            "global_instructions_status": "not_applicable",
+            "build_allowed_by_planning_gate": True,
+            "planning_gate_reason": "Planning approval is not required for this read-only workflow.",
+        })
         print(f"  Bugfix plan: {bug_state['bugfix_summary']} (see bug_report_summary.md)")
         print("  Planning only — no code changes, commits, pushes, or PRs were created by bugfix mode.")
         print(f"\n{'='*60}")
@@ -9427,7 +9436,15 @@ def pipeline_existing_app_upgrade(
             run_id, existing_app_path, backend_root=backend_root, frontend_root=frontend_root,
         )
         record_step_time(run_id, "backend_inventory", t0)
-        _update_state(run_id, {"status": "backend_inventory_done", "current_step": "done"})
+        _update_state(run_id, {
+            "status": "backend_inventory_done", "current_step": "done",
+            "entry_point": "backend_inventory",
+            "requirements_status": "not_applicable",
+            "architecture_status": "not_applicable",
+            "global_instructions_status": "not_applicable",
+            "build_allowed_by_planning_gate": True,
+            "planning_gate_reason": "Planning approval is not required for this read-only workflow.",
+        })
         print(f"  {inv['route_count']} route(s), {inv['frontend_api_call_count']} frontend API call(s), "
               f"{inv['env_var_count']} env var(s) detected.")
         print("  Inventory only — no code changes, commits, pushes, or PRs were created.")
@@ -9472,7 +9489,15 @@ def pipeline_existing_app_upgrade(
                 failed = sum(1 for r in outcome["results"] if r["status"] == "fail")
                 print(f"  Checks executed: {len(outcome['results'])} ({failed} failed)")
             print("  No migrations, DB writes, seed/reset, or production commands were run.")
-        _update_state(run_id, {"status": "backend_safety_done", "current_step": "done"})
+        _update_state(run_id, {
+            "status": "backend_safety_done", "current_step": "done",
+            "entry_point": "backend_safety",
+            "requirements_status": "not_applicable",
+            "architecture_status": "not_applicable",
+            "global_instructions_status": "not_applicable",
+            "build_allowed_by_planning_gate": True,
+            "planning_gate_reason": "Planning approval is not required for this read-only workflow.",
+        })
         print(f"\n{'='*60}")
         print("  Backend safety analysis complete")
         print(f"  Run folder : {rdir}")
@@ -9607,6 +9632,13 @@ def pipeline_existing_app_upgrade(
               f"'{state['feature_branch']}' (see pr_remote_delivery_report.md)")
 
     if feature_plan_only:
+        _pg_plan_only = planning_gate_mod.build_planning_gate_state(
+            entry_point="existing_app_upgrade",
+            execution_mode="plan_only",
+            build_requested=False,
+            run_dir=rdir,
+            existing_app_path=existing_app_path,
+        )
         _update_state(run_id, {
             "status": "feature_plan_only_done", "current_step": "done",
             "execution_mode": build_gate["execution_mode"],
@@ -9619,6 +9651,17 @@ def pipeline_existing_app_upgrade(
             "original_repo_path": build_gate["original_repo_path"],
             "active_build_path": build_gate["active_build_path"],
             "sandbox_workspace": build_gate["sandbox_workspace"],
+            "entry_point": _pg_plan_only["entry_point"],
+            "planning_stage": _pg_plan_only["planning_stage"],
+            "requirements_status": _pg_plan_only["requirements_status"],
+            "architecture_status": _pg_plan_only["architecture_status"],
+            "global_instructions_status": _pg_plan_only["global_instructions_status"],
+            "requirements_approved": _pg_plan_only["requirements_approved"],
+            "architecture_approved": _pg_plan_only["architecture_approved"],
+            "global_instructions_created": _pg_plan_only["global_instructions_created"],
+            "build_requires_approval": _pg_plan_only["build_requires_approval"],
+            "build_allowed_by_planning_gate": _pg_plan_only["build_allowed_by_planning_gate"],
+            "planning_gate_reason": _pg_plan_only["planning_gate_reason"],
         })
         log_event(run_id, "feature_plan_only_done")
         _maybe_write_pr_delivery_plan()
@@ -9686,6 +9729,16 @@ def pipeline_existing_app_upgrade(
         repo_hygiene_severity=(git_sync_state or {}).get("repo_hygiene", {}).get("severity"),
     )
 
+    # ── Planning gate — enforce requirements/architecture/global-instructions ──
+    _pg_state = planning_gate_mod.build_planning_gate_state(
+        entry_point="existing_app_upgrade",
+        execution_mode=build_gate["execution_mode"],
+        build_requested=not feature_plan_only,
+        run_dir=rdir,
+        existing_app_path=existing_app_path,
+    )
+    build_gate = planning_gate_mod.merge_planning_gate_into_build_gate(build_gate, _pg_state)
+
     # ── Hard Step 12 guard ────────────────────────────────────────────────────
     # This must run before any Claude Code invocation, and before any
     # path-dependent build prep (snapshots, the build prompt's target). Do not
@@ -9704,6 +9757,17 @@ def pipeline_existing_app_upgrade(
             "original_repo_path": build_gate["original_repo_path"],
             "active_build_path": build_gate["active_build_path"],
             "sandbox_workspace": build_gate["sandbox_workspace"],
+            "entry_point": _pg_state["entry_point"],
+            "planning_stage": _pg_state["planning_stage"],
+            "requirements_status": _pg_state["requirements_status"],
+            "architecture_status": _pg_state["architecture_status"],
+            "global_instructions_status": _pg_state["global_instructions_status"],
+            "requirements_approved": _pg_state["requirements_approved"],
+            "architecture_approved": _pg_state["architecture_approved"],
+            "global_instructions_created": _pg_state["global_instructions_created"],
+            "build_requires_approval": _pg_state["build_requires_approval"],
+            "build_allowed_by_planning_gate": _pg_state["build_allowed_by_planning_gate"],
+            "planning_gate_reason": _pg_state["planning_gate_reason"],
         })
         log_event(run_id, "build_blocked_company_repo_protection", build_gate["reason"])
         print(f"\n{'='*60}")
@@ -9738,6 +9802,17 @@ def pipeline_existing_app_upgrade(
         "active_build_path": str(active_build_path),
         "sandbox_workspace": build_gate["sandbox_workspace"],
         "original_repo_modified": False,
+        "entry_point": _pg_state["entry_point"],
+        "planning_stage": _pg_state["planning_stage"],
+        "requirements_status": _pg_state["requirements_status"],
+        "architecture_status": _pg_state["architecture_status"],
+        "global_instructions_status": _pg_state["global_instructions_status"],
+        "requirements_approved": _pg_state["requirements_approved"],
+        "architecture_approved": _pg_state["architecture_approved"],
+        "global_instructions_created": _pg_state["global_instructions_created"],
+        "build_requires_approval": _pg_state["build_requires_approval"],
+        "build_allowed_by_planning_gate": _pg_state["build_allowed_by_planning_gate"],
+        "planning_gate_reason": _pg_state["planning_gate_reason"],
     })
 
     print("▶ Step 11  Writing selected feature sprint scope + build prompt...")

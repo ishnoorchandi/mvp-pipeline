@@ -1,5 +1,28 @@
 // MVP Pipeline — API client
 
+// Planning Gate — universal pre-build sign-off state. Mirrors planning_gate.py's
+// build_planning_gate_state() return shape. All fields are optional since older
+// runs won't have explicit sign-off artifacts and the backend infers safe defaults.
+export interface PlanningGateState {
+  entry_point?: "raw_idea" | "written_requirements" | "existing_app_upgrade"
+    | "bugfix" | "backend_inventory" | "backend_safety" | "git_delivery" | "unknown";
+  planning_stage?: "intake" | "requirements_conversation" | "requirements_review"
+    | "requirements_approved" | "architecture_conversation" | "architecture_review"
+    | "architecture_approved" | "global_instructions_created" | "ready_for_build"
+    | "build_not_applicable" | "unknown";
+  requirements_status?: "not_started" | "draft" | "questions_pending" | "review"
+    | "approved" | "not_applicable" | "unknown";
+  architecture_status?: "not_started" | "draft" | "questions_pending" | "review"
+    | "approved" | "not_applicable" | "unknown";
+  global_instructions_status?: "not_created" | "created" | "not_applicable" | "unknown";
+  requirements_approved?: boolean;
+  architecture_approved?: boolean;
+  global_instructions_created?: boolean;
+  build_requires_approval?: boolean;
+  build_allowed_by_planning_gate?: boolean;
+  planning_gate_reason?: string;
+}
+
 const BASE = "http://127.0.0.1:5001";
 
 // Operator Summary — deterministic, read-only normalization of a run's status/
@@ -25,6 +48,7 @@ export interface OperatorSummary {
   blocking_issue?: string | null;
   safe_to_show?: boolean;
   primary_artifacts?: string[];
+  planning_gate?: PlanningGateState;
 }
 
 export interface RunSummary {

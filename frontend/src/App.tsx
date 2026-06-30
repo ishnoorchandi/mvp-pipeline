@@ -9,6 +9,7 @@ import {
 import type {
   RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState,
   PrDeliveryPlanState, PrBranchPrepState, PrRemoteDeliveryState, RepoHygieneSummary,
+  PlanningGateState,
 } from "./api";
 import "./App.css";
 
@@ -2570,6 +2571,68 @@ function OperatorSummaryCard({ run }: { run: RunDetail | null }) {
       {s?.blocking_issue && (
         <div className={`delivery-warning-panel ${isSevere ? "delivery-warning-panel-severe" : ""}`}>
           <strong>Blocking issue:</strong> {s.blocking_issue}
+        </div>
+      )}
+      <PlanningGateCard gate={s?.planning_gate} />
+    </div>
+  );
+}
+
+// Planning Gate — compact read-only status card. Shows requirements, architecture,
+// global instructions, and build approval status derived from the operator summary's
+// planning_gate field. Renders nothing when gate is not_applicable (read-only flows)
+// or when no gate data is available (older runs).
+function PlanningGateCard({ gate }: { gate?: PlanningGateState | null }): ReactElement | null {
+  if (!gate) return null;
+  // Don't render for pure read-only workflows
+  if (gate.planning_stage === "build_not_applicable") return null;
+
+  const statusLabel: Record<string, string> = {
+    not_started: "Not started", draft: "Draft", questions_pending: "Questions pending",
+    review: "Review", approved: "Approved", not_applicable: "N/A", unknown: "Unknown",
+    not_created: "Not created", created: "Created",
+  };
+  const label = (v?: string) => v ? (statusLabel[v] ?? v.replace(/_/g, " ")) : "Unknown";
+
+  const gateAllowed = gate.build_allowed_by_planning_gate === true;
+  const gateBlocked = gate.build_requires_approval && !gateAllowed;
+
+  return (
+    <div className="delivery-card operator-summary-card" style={{ marginTop: "0.75rem" }}>
+      <div className="delivery-card-header">
+        <div className="delivery-card-title">Planning Gate</div>
+      </div>
+      <div className="repo-status-rows">
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Requirements</span>
+          <span className={gate.requirements_status === "approved" ? "delivery-badge delivery-badge-ok" : "delivery-badge delivery-badge-warn"}>
+            {label(gate.requirements_status)}
+          </span>
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Architecture</span>
+          <span className={gate.architecture_status === "approved" ? "delivery-badge delivery-badge-ok" : "delivery-badge delivery-badge-warn"}>
+            {label(gate.architecture_status)}
+          </span>
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Global instructions</span>
+          <span className={gate.global_instructions_created ? "delivery-badge delivery-badge-ok" : "delivery-badge delivery-badge-warn"}>
+            {label(gate.global_instructions_status)}
+          </span>
+        </div>
+        <div className="repo-status-row">
+          <span className="repo-status-row-label">Build approval</span>
+          {gate.build_requires_approval === false
+            ? <span className="delivery-badge delivery-badge-ok">Not required</span>
+            : gateAllowed
+              ? <span className="delivery-badge delivery-badge-ok">Ready</span>
+              : <span className="delivery-badge delivery-badge-fail">Blocked</span>}
+        </div>
+      </div>
+      {gateBlocked && (
+        <div className="delivery-warning-panel delivery-warning-panel-severe">
+          Build blocked until architecture is approved and global instructions are created.
         </div>
       )}
     </div>
