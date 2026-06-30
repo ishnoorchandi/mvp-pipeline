@@ -398,6 +398,61 @@ def test_merge_does_not_override_existing_block():
     assert "planning_gate" in merged
 
 
+# ── input_mode → entry_point inference (bug fix coverage) ────────────────────
+
+def test_infer_entry_point_from_input_mode_idea():
+    """input_mode='idea' must map to raw_idea so planning gate blocks build."""
+    run_state = {"run_id": "run_103", "status": "plan_only_done", "input_mode": "idea"}
+    assert pg.infer_entry_point_from_run_state(run_state) == "raw_idea"
+
+
+def test_infer_entry_point_from_input_mode_requirements():
+    """input_mode='requirements' must map to written_requirements."""
+    run_state = {"run_id": "run_104", "status": "plan_only_done", "input_mode": "requirements"}
+    assert pg.infer_entry_point_from_run_state(run_state) == "written_requirements"
+
+
+def test_build_planning_gate_from_run_state_with_input_mode_idea_requires_approval():
+    """A raw idea run state (no explicit entry_point) must produce build_requires_approval=True
+    and entry_point=raw_idea — reproduces the bug from the terminal smoke test."""
+    run_state = {
+        "run_id": "run_103",
+        "status": "plan_only_done",
+        "input_mode": "idea",
+        "execution_mode": "build",
+    }
+    gate = pg.build_planning_gate_from_run_state(run_state)
+    assert gate["entry_point"] == "raw_idea", f"expected raw_idea, got {gate['entry_point']}"
+    assert gate["build_requires_approval"] is True
+    assert gate["build_allowed_by_planning_gate"] is False
+    assert "architecture" in gate["planning_gate_reason"].lower() or "requirements" in gate["planning_gate_reason"].lower()
+
+
+def test_build_planning_gate_from_run_state_with_input_mode_requirements_requires_approval():
+    """A written requirements run state without entry_point must also block build."""
+    run_state = {
+        "run_id": "run_105",
+        "status": "plan_only_done",
+        "input_mode": "requirements",
+        "execution_mode": "build",
+    }
+    gate = pg.build_planning_gate_from_run_state(run_state)
+    assert gate["entry_point"] == "written_requirements"
+    assert gate["build_requires_approval"] is True
+    assert gate["build_allowed_by_planning_gate"] is False
+
+
+def test_build_planning_gate_from_run_state_unknown_run_does_not_crash():
+    """Older runs with no input_mode and no entry_point must not crash or block silently."""
+    run_state = {"run_id": "run_000", "status": "done"}
+    gate = pg.build_planning_gate_from_run_state(run_state)
+    assert "entry_point" in gate
+    assert "build_allowed_by_planning_gate" in gate
+    assert gate["entry_point"] == "unknown"
+    # unknown entry point → no approval required (safe pass-through for old runs)
+    assert gate["build_requires_approval"] is False
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

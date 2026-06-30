@@ -898,7 +898,8 @@ def approve_requirements(run_id: str):
     if not result["approved"]:
         abort(400, result.get("error") or "Approval failed")
 
-    # Re-read planning gate from updated artifacts
+    # Reload run_state so any entry_point persisted during lazy-init is visible
+    state = load_state(run_id) or state
     planning_gate = planning_gate_mod.build_planning_gate_from_run_state(state, run_dir=run_dir)
     return jsonify({
         "run_id": run_id,
@@ -999,6 +1000,8 @@ def approve_architecture(run_id: str):
     if not result["approved"]:
         abort(400, result.get("error") or "Architecture approval failed")
 
+    # Reload run_state so any entry_point persisted during lazy-init is visible
+    state = load_state(run_id) or state
     planning_gate = planning_gate_mod.build_planning_gate_from_run_state(state, run_dir=run_dir)
     return jsonify({
         "run_id": run_id,

@@ -385,6 +385,11 @@ def infer_entry_point_from_run_state(run_state: dict) -> str:
         return "git_delivery"
     if run_state.get("mode") == "existing_app_upgrade" or run_state.get("upgrade_mode"):
         return "existing_app_upgrade"
+    # New runs store input_mode but not yet entry_point — map to canonical entry point
+    if run_state.get("input_mode") == "requirements":
+        return "written_requirements"
+    if run_state.get("input_mode") == "idea":
+        return "raw_idea"
     return "unknown"
 
 

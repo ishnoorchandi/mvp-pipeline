@@ -450,6 +450,100 @@ def test_get_unanswered_required_returns_empty_when_all_answered():
         assert unanswered == []
 
 
+# ── entry_point persistence (bug fix coverage) ────────────────────────────────
+
+def test_lazy_init_persists_entry_point_for_idea_run():
+    """lazy_init_from_run_state must write entry_point=raw_idea into run_state.json
+    when input_mode='idea' so planning_gate sees the correct value without a reload."""
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td) / "run_103"
+        run_dir.mkdir()
+        run_state = {"run_id": "run_103", "status": "plan_only_done", "input_mode": "idea"}
+        (run_dir / "run_state.json").write_text(json.dumps(run_state))
+
+        conv = rc.lazy_init_from_run_state(run_dir, run_state)
+        assert conv["entry_point"] == "raw_idea"
+
+        # run_state.json on disk must now have entry_point
+        persisted = json.loads((run_dir / "run_state.json").read_text())
+        assert persisted.get("entry_point") == "raw_idea", (
+            f"expected entry_point=raw_idea in run_state.json, got: {persisted}"
+        )
+
+
+def test_lazy_init_persists_entry_point_for_requirements_run():
+    """input_mode='requirements' → writes written_requirements into run_state.json."""
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td) / "run_104"
+        run_dir.mkdir()
+        run_state = {"run_id": "run_104", "status": "plan_only_done", "input_mode": "requirements"}
+        (run_dir / "run_state.json").write_text(json.dumps(run_state))
+        (run_dir / "raw_input.md").write_text("The system must track user sessions.")
+
+        rc.lazy_init_from_run_state(run_dir, run_state)
+
+        persisted = json.loads((run_dir / "run_state.json").read_text())
+        assert persisted.get("entry_point") == "written_requirements"
+
+
+def test_lazy_init_persists_entry_point_from_existing_conversation():
+    """When a conversation already exists on disk, its entry_point is propagated
+    back to run_state.json if run_state lacks it."""
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td) / "run_105"
+        run_dir.mkdir()
+        # Pre-write a conversation as if it was already initialized
+        rc.init_requirements_conversation(run_dir, "raw_idea", {"raw_input": "an app"})
+        # run_state does NOT have entry_point yet
+        run_state = {"run_id": "run_105", "status": "plan_only_done", "input_mode": "idea"}
+        (run_dir / "run_state.json").write_text(json.dumps(run_state))
+
+        rc.lazy_init_from_run_state(run_dir, run_state)
+
+        persisted = json.loads((run_dir / "run_state.json").read_text())
+        assert persisted.get("entry_point") == "raw_idea"
+
+
+def test_backend_approve_for_idea_run_planning_gate_has_correct_entry_point(monkeypatch):
+    """After approving requirements on a raw idea run, returned planning_gate must have
+    entry_point=raw_idea and build_requires_approval=True (regression for smoke test bug)."""
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td) / "run_103"
+        run_dir.mkdir()
+        run_state = {
+            "run_id": "run_103",
+            "status": "plan_only_done",
+            "input_mode": "idea",
+            # No entry_point — exactly the real-world bug condition
+        }
+        (run_dir / "run_state.json").write_text(json.dumps(run_state))
+
+        # Lazily init and answer all required questions (simulates GET then answers)
+        conv = rc.lazy_init_from_run_state(run_dir, run_state)
+        answer_all_required(run_dir, conv)
+
+        monkeypatch.setattr(app_mod, "RUNS_DIR", Path(td))
+        client = app_mod.app.test_client()
+        resp = client.post(
+            "/api/runs/run_103/requirements-conversation/approve",
+            json={},
+            content_type="application/json",
+        )
+        assert resp.status_code == 200, f"Expected 200: {resp.data}"
+        data = resp.get_json()
+        gate = data["planning_gate"]
+        assert gate["entry_point"] == "raw_idea", (
+            f"planning_gate entry_point must be raw_idea, got: {gate['entry_point']}"
+        )
+        assert gate["build_requires_approval"] is True, (
+            "raw_idea run must require planning approval"
+        )
+        assert gate["requirements_approved"] is True
+        assert gate["architecture_approved"] is False
+        assert gate["build_allowed_by_planning_gate"] is False
+        assert "architecture" in gate["planning_gate_reason"].lower()
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

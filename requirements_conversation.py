@@ -430,6 +430,27 @@ def load_requirements_conversation(run_dir: Path) -> Optional[dict]:
     return _safe_read_json(Path(run_dir) / QUESTIONS_ARTIFACT)
 
 
+def _persist_entry_point(run_dir: Path, entry_point: str) -> None:
+    """Write entry_point into run_state.json if it is absent or unknown.
+
+    Called after lazy init infers the entry_point so that subsequent calls to
+    planning_gate.build_planning_gate_from_run_state see the correct value even
+    without reloading state from disk in the caller.  Never raises.
+    """
+    if not entry_point or entry_point == "unknown":
+        return
+    state_path = run_dir / "run_state.json"
+    if not state_path.exists():
+        return
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if not data.get("entry_point") or data["entry_point"] == "unknown":
+            data["entry_point"] = entry_point
+            state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def init_requirements_conversation(
     run_dir: Path,
     entry_point: str,
@@ -478,6 +499,7 @@ def lazy_init_from_run_state(run_dir: Path, run_state: dict) -> dict:
     run_dir = Path(run_dir)
     existing = load_requirements_conversation(run_dir)
     if existing is not None:
+        _persist_entry_point(run_dir, existing.get("entry_point", ""))
         return existing
 
     # Infer entry point from run_state
@@ -533,6 +555,7 @@ def lazy_init_from_run_state(run_dir: Path, run_state: dict) -> dict:
         if raw_input_path.exists():
             ctx["raw_input"] = raw_input_path.read_text(encoding="utf-8")
 
+    _persist_entry_point(run_dir, entry_point)
     return init_requirements_conversation(run_dir, entry_point, ctx)
 
 
