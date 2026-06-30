@@ -106,12 +106,13 @@ const TERMINAL = new Set([
 // Clean display names for sprint-mode artifacts (requirement: artifact sidebar should
 // show readable labels, not raw filenames, for sprint planning outputs).
 const ARTIFACT_LABELS: Record<string, string> = {
-  "requirements.md":                  "Requirements",
+  "requirements.md":                  "Official Requirements",
   "approved_requirements.md":         "Approved Requirements",
   "requirements_signoff_state.json":  "Requirements Sign-off State",
   "approved_architecture.md":         "Approved Architecture",
   "architecture_signoff_state.json":  "Architecture Sign-off State",
   "GLOBAL_INSTRUCTIONS.md":           "Global Instructions",
+  "sprint_orchestrator_state.json":   "Sprint Orchestrator State",
   "sprint_plan.md":                    "Sprint Plan",
   "sprint_plan.json":                  "Sprint Plan JSON",
   "selected_sprint_scope.md":          "Selected Sprint Scope",
@@ -165,7 +166,26 @@ function artifactDisplayName(filename: string): string {
   if (m) return `Sprint ${m[1]} Scope`;
   m = filename.match(/^sprint_(\d+)_build_prompt\.txt$/);
   if (m) return `Sprint ${m[1]} Build Prompt`;
+  m = filename.match(/^sprint_(\d+)_build_prompt\.md$/);
+  if (m) return `Sprint ${m[1]} Build Prompt`;
+  m = filename.match(/^sprint_(\d+)_fix_prompt\.md$/);
+  if (m) return `Sprint ${m[1]} Fix Prompt`;
+  m = filename.match(/^sprint_(\d+)_continuation_prompt\.md$/);
+  if (m) return `Sprint ${m[1]} Continuation Prompt`;
+  m = filename.match(/^sprint_(\d+)_handoff\.md$/);
+  if (m) return `Sprint ${m[1]} Handoff`;
+  m = filename.match(/^sprint_(\d+)_completion_approval\.md$/);
+  if (m) return `Sprint ${m[1]} Completion Approval`;
   return filename;
+}
+
+function scrollToWorkflowCard(id: string) {
+  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function notifyWorkflowUpdated(onWorkflowUpdated?: () => void) {
+  window.dispatchEvent(new Event("mvp-pipeline-workflow-updated"));
+  onWorkflowUpdated?.();
 }
 
 const GUIDED_BUILD_ARTIFACTS = new Set([
@@ -2586,6 +2606,7 @@ function deriveGuidedWorkflowSteps(
   orchData: { state: SprintOrchestratorState | null; can_initialize: boolean } | null,
 ): WFStep[] {
   const has = (f: string) => artifacts.includes(f);
+  const firstMatchingArtifact = (pattern: RegExp) => artifacts.find(f => pattern.test(f));
 
   const reqDone = gate?.requirements_approved === true
     || gate?.requirements_status === "approved"
@@ -2616,6 +2637,11 @@ function deriveGuidedWorkflowSteps(
 
   const failPhases = new Set(["smoke_failed", "review_failed", "governance_failed"]);
   const isFailed = orch ? failPhases.has(orch.current_phase ?? "") : false;
+  const buildPromptArtifact = orch?.build_prompt_artifact ?? firstMatchingArtifact(/^sprint_\d+_build_prompt\.md$/);
+  const fixPromptArtifact = orch?.fix_prompt_artifact ?? firstMatchingArtifact(/^sprint_\d+_fix_prompt\.md$/);
+  const continuationPromptArtifact = orch?.continuation_prompt_artifact ?? firstMatchingArtifact(/^sprint_\d+_continuation_prompt\.md$/);
+  const handoffArtifact = orch?.handoff_artifact ?? firstMatchingArtifact(/^sprint_\d+_handoff\.md$/);
+  const completionArtifact = orch?.completion_approval_artifact ?? firstMatchingArtifact(/^sprint_\d+_completion_approval\.md$/);
 
   const steps: WFStep[] = [];
 
@@ -2678,7 +2704,7 @@ function deriveGuidedWorkflowSteps(
       : "Generate the build prompt, then copy it into Claude Code.",
     action: !buildPromptDone && orchActive ? "Generate Build Prompt." : undefined,
     anchorId: "sprint-orchestrator-card",
-    artifactHint: orch?.build_prompt_artifact ?? undefined,
+    artifactHint: buildPromptArtifact,
   });
 
   steps.push({
@@ -2691,6 +2717,7 @@ function deriveGuidedWorkflowSteps(
     action: !buildAttemptDone && buildPromptDone
       ? "Copy prompt into Claude Code, then record build result." : undefined,
     anchorId: "sprint-orchestrator-card",
+    artifactHint: buildPromptArtifact,
   });
 
   steps.push({
@@ -2730,7 +2757,7 @@ function deriveGuidedWorkflowSteps(
       : orch?.status === "ready_for_completion" ? "Approve Sprint Completion."
       : orchActive ? "Generate Handoff, Fix, or Continuation Prompt." : undefined,
     anchorId: "sprint-orchestrator-card",
-    artifactHint: orch?.completion_approval_artifact ?? orch?.handoff_artifact ?? undefined,
+    artifactHint: completionArtifact ?? handoffArtifact ?? fixPromptArtifact ?? continuationPromptArtifact,
   });
 
   return steps;
@@ -2757,6 +2784,30 @@ const WF_STATUS_BADGE: Record<WFStepStatus, { label: string; cls: string }> = {
   blocked:  { label: "Blocked",  cls: "delivery-badge-fail" },
 };
 
+function workflowPrimaryActionLabel(step: WFStep): string {
+  if (step.id === "requirements") return "Go to Requirements";
+  if (step.id === "architecture") return "Go to Architecture";
+  if (step.id === "global_instructions") return "Go to Global Instructions";
+  if (step.id === "sprint_orchestrator") return "Go to Sprint Orchestrator";
+  if (step.id === "build_prompt") return step.artifactHint ? "View Build Prompt" : "Go to Sprint Orchestrator";
+  if (step.id === "manual_build") return step.artifactHint ? "View Build Prompt" : "Go to Sprint Orchestrator";
+  if (step.id === "record_checks") return "Go to Manual Recording";
+  if (step.id === "handoff_or_completion") return step.artifactHint ? "View Workflow Artifact" : "Go to Sprint Orchestrator";
+  return "Go";
+}
+
+function artifactActionLabel(artifact: string): string {
+  return artifact.includes("build_prompt") ? "View Build Prompt"
+    : artifact.includes("fix_prompt") ? "View Fix Prompt"
+    : artifact.includes("continuation_prompt") ? "View Continuation Prompt"
+    : artifact.includes("handoff") ? "View Handoff"
+    : artifact.includes("completion_approval") ? "View Completion Approval"
+    : artifact === "GLOBAL_INSTRUCTIONS.md" ? "View Global Instructions"
+    : artifact === "approved_architecture.md" ? "View Approved Architecture"
+    : artifact === "requirements.md" ? "View Requirements"
+    : "View artifact";
+}
+
 function GuidedWorkflowCard({ runId, run, onSelectArtifact }: {
   runId: string;
   run: RunDetail | null;
@@ -2767,11 +2818,18 @@ function GuidedWorkflowCard({ runId, run, onSelectArtifact }: {
     can_initialize: boolean;
   } | null>(null);
 
-  useEffect(() => {
+  const loadOrchestrator = useCallback(() => {
     getSprintOrchestrator(runId)
       .then(r => setOrchData({ state: r.state, can_initialize: r.can_initialize ?? false }))
       .catch(() => {});
   }, [runId]);
+
+  useEffect(() => {
+    loadOrchestrator();
+    const handler = () => loadOrchestrator();
+    window.addEventListener("mvp-pipeline-workflow-updated", handler);
+    return () => window.removeEventListener("mvp-pipeline-workflow-updated", handler);
+  }, [loadOrchestrator]);
 
   const gate = run?.operator_summary?.planning_gate;
   if (gate?.planning_stage === "build_not_applicable") return null;
@@ -2784,8 +2842,21 @@ function GuidedWorkflowCard({ runId, run, onSelectArtifact }: {
     run?.operator_summary?.next_safe_action,
   );
 
-  const scrollTo = (id: string) => {
-    document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  const activeStep = steps.find(s => (s.status === "current" || s.status === "ready") && (s.anchorId || s.artifactHint))
+    ?? steps.find(s => s.anchorId || s.artifactHint);
+
+  const takePrimaryAction = (step: WFStep) => {
+    if ((step.id === "build_prompt" || step.id === "manual_build" || step.id === "handoff_or_completion") && step.artifactHint) {
+      onSelectArtifact?.(step.artifactHint);
+      return;
+    }
+    if (step.anchorId) scrollToWorkflowCard(step.anchorId);
+    else if (step.artifactHint) onSelectArtifact?.(step.artifactHint);
+  };
+
+  const takeMeThere = () => {
+    if (!activeStep) return;
+    takePrimaryAction(activeStep);
   };
 
   return (
@@ -2797,8 +2868,15 @@ function GuidedWorkflowCard({ runId, run, onSelectArtifact }: {
         </div>
       </div>
       <div className="gwf-next-action">
-        <span className="gwf-next-action-label">Next safe action</span>
-        <span className="gwf-next-action-text">{nextAction}</span>
+        <div>
+          <span className="gwf-next-action-label">Next safe action</span>
+          <span className="gwf-next-action-text">{nextAction}</span>
+        </div>
+        {activeStep && (
+          <button className="gwf-go-btn gwf-primary-btn" onClick={takeMeThere}>
+            Take me there
+          </button>
+        )}
       </div>
       <ol className="gwf-step-list">
         {steps.map((step, i) => {
@@ -2814,14 +2892,12 @@ function GuidedWorkflowCard({ runId, run, onSelectArtifact }: {
                 <div className="gwf-step-desc">{step.description}</div>
                 {(step.anchorId || step.artifactHint) && (
                   <div className="gwf-step-actions">
-                    {step.anchorId && (
-                      <button className="gwf-go-btn" onClick={() => scrollTo(step.anchorId!)}>
-                        Go to {step.label}
-                      </button>
-                    )}
-                    {step.artifactHint && (
+                    <button className="gwf-go-btn" onClick={() => takePrimaryAction(step)}>
+                      {workflowPrimaryActionLabel(step)}
+                    </button>
+                    {step.artifactHint && step.anchorId && !["build_prompt", "manual_build", "handoff_or_completion"].includes(step.id) && (
                       <button className="gwf-go-btn" onClick={() => onSelectArtifact?.(step.artifactHint!)}>
-                        View artifact
+                        {artifactActionLabel(step.artifactHint)}
                       </button>
                     )}
                   </div>
@@ -3005,7 +3081,12 @@ function RequirementsConversationCard({
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { reload(); }, [runId]);
+  useEffect(() => {
+    reload();
+    const handler = () => reload();
+    window.addEventListener("mvp-pipeline-workflow-updated", handler);
+    return () => window.removeEventListener("mvp-pipeline-workflow-updated", handler);
+  }, [runId]);
 
   if (loading) return (
     <div className="delivery-card operator-summary-card" style={{ marginTop: "0.75rem" }}>
@@ -3059,7 +3140,7 @@ function RequirementsConversationCard({
     try {
       const result = await approveRequirements(runId);
       setConvResp(result);
-      onPlanningGateUpdated?.();
+      notifyWorkflowUpdated(onPlanningGateUpdated);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Approval failed.");
     } finally {
@@ -3226,7 +3307,10 @@ function RequirementsConversationCard({
 
       {isApproved && (
         <div className="delivery-warning-panel" style={{ margin: "0.5rem 0.75rem 0.75rem", background: "var(--bg-success, #eafbea)", borderColor: "#22863a" }}>
-          Requirements approved. Architecture approval is still required before build.
+          <span>Requirements approved. Next: approve architecture.</span>
+          <button className="delivery-card-action workflow-inline-action" onClick={() => scrollToWorkflowCard("architecture-conversation-card")}>
+            Go to Architecture
+          </button>
         </div>
       )}
     </div>
@@ -3266,7 +3350,12 @@ function ArchitectureConversationCard({
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { reload(); }, [runId]);
+  useEffect(() => {
+    reload();
+    const handler = () => reload();
+    window.addEventListener("mvp-pipeline-workflow-updated", handler);
+    return () => window.removeEventListener("mvp-pipeline-workflow-updated", handler);
+  }, [runId]);
 
   if (loading) return (
     <div className="delivery-card operator-summary-card" style={{ marginTop: "0.75rem" }}>
@@ -3318,7 +3407,7 @@ function ArchitectureConversationCard({
     try {
       const result = await approveArchitecture(runId);
       setArchResp(result);
-      onPlanningGateUpdated?.();
+      notifyWorkflowUpdated(onPlanningGateUpdated);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Approval failed.");
     } finally {
@@ -3498,7 +3587,10 @@ function ArchitectureConversationCard({
 
       {isApproved && (
         <div className="delivery-warning-panel" style={{ margin: "0.5rem 0.75rem 0.75rem", background: "var(--bg-success, #eafbea)", borderColor: "#22863a" }}>
-          Architecture approved. Global instructions still need to be created before build.
+          <span>Architecture approved. Next: generate GLOBAL_INSTRUCTIONS.md.</span>
+          <button className="delivery-card-action workflow-inline-action" onClick={() => scrollToWorkflowCard("global-instructions-card")}>
+            Go to Global Instructions
+          </button>
         </div>
       )}
     </div>
@@ -3528,7 +3620,12 @@ function GlobalInstructionsCard({
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { load(); }, [runId]);
+  useEffect(() => {
+    load();
+    const handler = () => load();
+    window.addEventListener("mvp-pipeline-workflow-updated", handler);
+    return () => window.removeEventListener("mvp-pipeline-workflow-updated", handler);
+  }, [runId]);
 
   const handleGenerateRequirements = async () => {
     setGenerating("requirements");
@@ -3536,7 +3633,7 @@ function GlobalInstructionsCard({
     try {
       const s = await generateRequirementsMd(runId);
       setStatus(s);
-      onPlanningGateUpdated?.();
+      notifyWorkflowUpdated(onPlanningGateUpdated);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -3550,7 +3647,7 @@ function GlobalInstructionsCard({
     try {
       const s = await generateGlobalInstructions(runId);
       setStatus(s);
-      onPlanningGateUpdated?.();
+      notifyWorkflowUpdated(onPlanningGateUpdated);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -3601,7 +3698,7 @@ function GlobalInstructionsCard({
 
       {giExists && (
         <p style={{ color: "#22863a", fontSize: "0.85rem", margin: "0 0 0.5rem" }}>
-          Build instructions are ready. All planning gates can now allow the build.
+          Global instructions created. Next: initialize Sprint Orchestrator.
         </p>
       )}
 
@@ -3640,6 +3737,14 @@ function GlobalInstructionsCard({
             View GLOBAL_INSTRUCTIONS.md
           </button>
         )}
+        {giExists && (
+          <button
+            className="delivery-card-action"
+            onClick={() => scrollToWorkflowCard("sprint-orchestrator-card")}
+          >
+            Go to Sprint Orchestrator
+          </button>
+        )}
       </div>
     </div>
   );
@@ -3649,10 +3754,11 @@ function GlobalInstructionsCard({
 // attempts, smoke/review/governance results, computes next_action, and generates
 // handoff prompts for session continuations. Gated behind planning gate.
 function SprintOrchestratorCard({
-  runId, onSelectArtifact,
+  runId, onSelectArtifact, onWorkflowUpdated,
 }: {
   runId: string;
   onSelectArtifact?: (artifact: string) => void;
+  onWorkflowUpdated?: () => void;
 }) {
   const [data, setData] = useState<{
     state: SprintOrchestratorState | null;
@@ -3681,7 +3787,12 @@ function SprintOrchestratorCard({
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { load(); }, [runId]);
+  useEffect(() => {
+    load();
+    const handler = () => load();
+    window.addEventListener("mvp-pipeline-workflow-updated", handler);
+    return () => window.removeEventListener("mvp-pipeline-workflow-updated", handler);
+  }, [runId]);
 
   const updateState = (r: { state: SprintOrchestratorState | null }) => {
     setData((prev) => prev ? { ...prev, state: r.state } : { state: r.state, can_initialize: false, blocking_reason: null });
@@ -3693,6 +3804,7 @@ function SprintOrchestratorCard({
       const r = await fn();
       updateState(r);
       if (r.artifact) onSelectArtifact?.(r.artifact);
+      notifyWorkflowUpdated(onWorkflowUpdated);
     } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setBusy(null); }
   };
@@ -3750,6 +3862,7 @@ function SprintOrchestratorCard({
       }
       updateState(r);
       setRecSummary(""); setRecArtifact(""); setRecWaiverReason("");
+      notifyWorkflowUpdated(onWorkflowUpdated);
     } catch (e: unknown) { setRecError(e instanceof Error ? e.message : String(e)); }
     finally { setRecBusy(false); }
   };
@@ -3767,8 +3880,16 @@ function SprintOrchestratorCard({
         </span>
       </div>
       <p style={{ fontSize: "0.78rem", color: "var(--text3)", margin: "0 0 0.5rem" }}>
-        Tracks sprint state and generates prompts. Does not edit code or run checks.
+        The orchestrator tracks sprint state and generates copyable prompts. It never edits code or starts builds.
       </p>
+      <ol className="orchestrator-order-list">
+        <li>Initialize sprint</li>
+        <li>Generate build prompt</li>
+        <li>Copy prompt into Claude Code manually</li>
+        <li>Record build result</li>
+        <li>Record smoke/review/governance results</li>
+        <li>Generate handoff or approve completion</li>
+      </ol>
 
       {error && <div className="delivery-warning-panel" style={{ marginBottom: "0.5rem" }}>{error}</div>}
 
@@ -3797,9 +3918,24 @@ function SprintOrchestratorCard({
         </p>
       )}
 
+      {state?.build_prompt_artifact && !isCompleted && (
+        <div className="workflow-success-callout">
+          <span>Build prompt ready — copy it into Claude Code manually.</span>
+          <button className="delivery-card-action workflow-inline-action" onClick={() => onSelectArtifact?.(state.build_prompt_artifact!)}>
+            View Build Prompt
+          </button>
+        </div>
+      )}
+
+      {isReadyForCompletion && (
+        <div className="workflow-success-callout">
+          All required checks are passed or waived. You may approve sprint completion.
+        </div>
+      )}
+
       {/* Sprint # input for init */}
       {!isActive && canInit && (
-        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "0.5rem" }}>
+        <div className="orchestrator-init-panel">
           <label style={{ fontSize: "0.82rem", color: "#24292f" }}>Sprint #</label>
           <input
             type="number" min={1} value={sprintInput}
@@ -4829,8 +4965,8 @@ function DeliveryCard({ runId, selectedArtifact, onSelectArtifact }: {
   );
 }
 
-function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
-  runId: string; run: RunDetail | null; onBack: () => void; onNewRun: (id: string) => void;
+function ExistingAppUpgradeView({ runId, run, onBack, onNewRun, onWorkflowUpdated }: {
+  runId: string; run: RunDetail | null; onBack: () => void; onNewRun: (id: string) => void; onWorkflowUpdated?: () => void;
 }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [content, setContent] = useState<string>("");
@@ -4896,13 +5032,13 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             {/* 1a. Guided Workflow — stepper showing where we are and what comes next. */}
             <GuidedWorkflowCard runId={runId} run={run} onSelectArtifact={setSelected} />
             {/* 1b. Requirements Conversation — interactive sign-off before architecture. */}
-            <RequirementsConversationCard runId={runId} onSelectArtifact={setSelected} />
+            <RequirementsConversationCard runId={runId} onSelectArtifact={setSelected} onPlanningGateUpdated={onWorkflowUpdated} />
             {/* 1c. Architecture Conversation — stack/data/workflow decisions before build. */}
-            <ArchitectureConversationCard runId={runId} onSelectArtifact={setSelected} />
+            <ArchitectureConversationCard runId={runId} onSelectArtifact={setSelected} onPlanningGateUpdated={onWorkflowUpdated} />
             {/* 1d. Global Instructions — generates requirements.md + GLOBAL_INSTRUCTIONS.md. */}
-            <GlobalInstructionsCard runId={runId} onSelectArtifact={setSelected} />
+            <GlobalInstructionsCard runId={runId} onSelectArtifact={setSelected} onPlanningGateUpdated={onWorkflowUpdated} />
             {/* 1e. Sprint Orchestrator — manages one sprint at a time, generates handoff prompts. */}
-            <SprintOrchestratorCard runId={runId} onSelectArtifact={setSelected} />
+            <SprintOrchestratorCard runId={runId} onSelectArtifact={setSelected} onWorkflowUpdated={onWorkflowUpdated} />
             {/* 2. Primary Outputs — the handful of artifacts that matter. */}
             <PrimaryOutputsCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             {/* 3. Planning Progress / Build Workspace. */}
@@ -5256,23 +5392,25 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
       .catch(() => {});
   }, [run?.artifacts, runId, sprintInfo]);
 
+  const reloadRun = useCallback(() => {
+    getRun(runId).then(r => {
+      setRun(r);
+      const sorted = sortArtifacts(r.artifacts ?? []).filter(a => a !== "run_state.json");
+      // On transition to terminal: auto-open final report
+      if (TERMINAL.has(r.status) && prevStatus.current && !TERMINAL.has(prevStatus.current)) {
+        const final = sorted.find(a => a === "final_mvp_report.md") ?? sorted[sorted.length - 1] ?? null;
+        setSelectedArtifact(final);
+      }
+      prevStatus.current = r.status;
+    }).catch(() => {});
+  }, [runId]);
+
   // Poll run + detect terminal transition
   useEffect(() => {
-    const poll = () =>
-      getRun(runId).then(r => {
-        setRun(r);
-        const sorted = sortArtifacts(r.artifacts ?? []).filter(a => a !== "run_state.json");
-        // On transition to terminal: auto-open final report
-        if (TERMINAL.has(r.status) && prevStatus.current && !TERMINAL.has(prevStatus.current)) {
-          const final = sorted.find(a => a === "final_mvp_report.md") ?? sorted[sorted.length - 1] ?? null;
-          setSelectedArtifact(final);
-        }
-        prevStatus.current = r.status;
-      }).catch(() => {});
-    poll();
-    const i = setInterval(poll, 2000);
+    reloadRun();
+    const i = setInterval(reloadRun, 2000);
     return () => clearInterval(i);
-  }, [runId]);
+  }, [reloadRun]);
 
   // Load artifact
   useEffect(() => {
@@ -5325,7 +5463,7 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
   // sprint-mode runs, which fall through to the unchanged return below.
   if (upgradeModeActive) {
     return (
-      <ExistingAppUpgradeView runId={runId} run={run} onBack={onBack} onNewRun={onNewRun} />
+      <ExistingAppUpgradeView runId={runId} run={run} onBack={onBack} onNewRun={onNewRun} onWorkflowUpdated={reloadRun} />
     );
   }
 
@@ -5358,10 +5496,10 @@ function PipelineView({ runId, onBack, onNewRun }: { runId: string; onBack: () =
                   Guided workflow prepares sign-offs and copyable Claude Code prompts. It does not run Claude Code automatically.
                 </div>
                 <GuidedWorkflowCard runId={runId} run={run} onSelectArtifact={setSelectedArtifact} />
-                <RequirementsConversationCard runId={runId} onSelectArtifact={setSelectedArtifact} />
-                <ArchitectureConversationCard runId={runId} onSelectArtifact={setSelectedArtifact} />
-                <GlobalInstructionsCard runId={runId} onSelectArtifact={setSelectedArtifact} />
-                <SprintOrchestratorCard runId={runId} onSelectArtifact={setSelectedArtifact} />
+                <RequirementsConversationCard runId={runId} onSelectArtifact={setSelectedArtifact} onPlanningGateUpdated={reloadRun} />
+                <ArchitectureConversationCard runId={runId} onSelectArtifact={setSelectedArtifact} onPlanningGateUpdated={reloadRun} />
+                <GlobalInstructionsCard runId={runId} onSelectArtifact={setSelectedArtifact} onPlanningGateUpdated={reloadRun} />
+                <SprintOrchestratorCard runId={runId} onSelectArtifact={setSelectedArtifact} onWorkflowUpdated={reloadRun} />
                 <PrimaryOutputsCard run={run} selectedArtifact={selectedArtifact} onSelectArtifact={setSelectedArtifact} />
               </>
             )}
