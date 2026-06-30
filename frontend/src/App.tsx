@@ -9,6 +9,8 @@ import {
   getArchitectureConversation, saveArchitectureAnswer, approveArchitecture,
   getGlobalInstructions, generateRequirementsMd, generateGlobalInstructions,
   getSprintOrchestrator, initSprintOrchestrator, generateSprintHandoff,
+  generateSprintBuildPrompt, generateSprintFixPrompt, generateSprintContinuationPrompt,
+  approveSprintCompletion,
 } from "./api";
 import type {
   RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState,
@@ -3337,9 +3339,11 @@ function SprintOrchestratorCard({
     blocking_reason: string | null;
   } | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);  // which action is in-flight
   const [error, setError] = useState<string | null>(null);
   const [sprintInput, setSprintInput] = useState("1");
+  const [approvalNote, setApprovalNote] = useState("");
+  const [showApproval, setShowApproval] = useState(false);
 
   const load = () => {
     setLoading(true);
@@ -3351,25 +3355,18 @@ function SprintOrchestratorCard({
 
   useEffect(() => { load(); }, [runId]);
 
-  const handleInit = async () => {
-    setBusy(true); setError(null);
-    try {
-      const n = parseInt(sprintInput, 10);
-      if (isNaN(n) || n < 1) { setError("Enter a valid sprint number (≥ 1)."); setBusy(false); return; }
-      const r = await initSprintOrchestrator(runId, n);
-      setData((prev) => prev ? { ...prev, state: r.state } : { state: r.state, can_initialize: false, blocking_reason: null });
-    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setBusy(false); }
+  const updateState = (r: { state: SprintOrchestratorState | null }) => {
+    setData((prev) => prev ? { ...prev, state: r.state } : { state: r.state, can_initialize: false, blocking_reason: null });
   };
 
-  const handleHandoff = async () => {
-    setBusy(true); setError(null);
+  const run = async (action: string, fn: () => Promise<{ state: SprintOrchestratorState | null; artifact?: string | null }>) => {
+    setBusy(action); setError(null);
     try {
-      const r = await generateSprintHandoff(runId);
-      setData((prev) => prev ? { ...prev, state: r.state } : { state: r.state, can_initialize: false, blocking_reason: null });
+      const r = await fn();
+      updateState(r);
       if (r.artifact) onSelectArtifact?.(r.artifact);
     } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setBusy(false); }
+    finally { setBusy(null); }
   };
 
   if (loading && !data) return null;
@@ -3378,6 +3375,8 @@ function SprintOrchestratorCard({
   const canInit = data?.can_initialize ?? false;
   const blocking = data?.blocking_reason;
   const isActive = !!state && state.status !== "not_started";
+  const isCompleted = state?.status === "completed";
+  const isReadyForCompletion = state?.status === "ready_for_completion";
   const phase = state?.current_phase;
   const sprintNum = state?.active_sprint;
   const title = state?.sprint_title;
@@ -3385,74 +3384,142 @@ function SprintOrchestratorCard({
   const lastStep = state?.last_completed_step;
   const blockingReason = state?.blocking_reason;
 
+  const failurePhases = new Set(["smoke_failed", "review_failed", "governance_failed", "build_attempted"]);
+  const isFailed = phase ? failurePhases.has(phase) : false;
+
   const statusBadgeStyle = (s: string | undefined) => {
     if (s === "active") return { background: "#0550ae", color: "#fff" };
-    if (s === "ready_for_completion") return { background: "#22863a", color: "#fff" };
+    if (s === "ready_for_completion") return { background: "#d97706", color: "#fff" };
     if (s === "completed") return { background: "#22863a", color: "#fff" };
     if (s === "blocked") return { background: "#cf222e", color: "#fff" };
     return { background: "#6e7781", color: "#fff" };
   };
 
+  const Btn = ({ id, label, onClick, disabled }: { id: string; label: string; onClick: () => void; disabled?: boolean }) => (
+    <button className="delivery-card-action" disabled={!!busy || !!disabled} onClick={onClick}>
+      {busy === id ? "Generating…" : label}
+    </button>
+  );
+
   return (
     <div className="delivery-card">
       <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}>
         <strong>Sprint Orchestrator</strong>
-        <span className="delivery-badge" style={statusBadgeStyle(state?.status ?? (isActive ? "active" : "not_started"))}>
+        <span className="delivery-badge" style={statusBadgeStyle(state?.status ?? "not_started")}>
           {state?.status ? state.status.replace(/_/g, " ") : "Not started"}
         </span>
       </div>
 
       {error && <div className="delivery-warning-panel" style={{ marginBottom: "0.5rem" }}>{error}</div>}
 
+      {/* Locked state */}
       {!canInit && !isActive && (
         <p style={{ color: "#6e7781", fontSize: "0.85rem", margin: "0 0 0.5rem" }}>
           {blocking ?? "Sprint orchestration is locked until requirements, architecture, and GLOBAL_INSTRUCTIONS.md are approved."}
         </p>
       )}
 
+      {/* Active state info */}
       {isActive && (
         <div style={{ fontSize: "0.85rem", lineHeight: 1.6, marginBottom: "0.5rem" }}>
           {sprintNum != null && <div><strong>Active sprint:</strong> Sprint {sprintNum}{title ? ` — ${title}` : ""}</div>}
           {phase && <div><strong>Current phase:</strong> {phase.replace(/_/g, " ")}</div>}
           {lastStep && <div><strong>Last completed step:</strong> {lastStep}</div>}
           {nextAction && <div><strong>Next action:</strong> {nextAction}</div>}
-          {blockingReason && <div style={{ color: "#cf222e" }}><strong>Blocking reason:</strong> {blockingReason}</div>}
+          {blockingReason && <div style={{ color: "#cf222e" }}><strong>Blocking:</strong> {blockingReason}</div>}
         </div>
       )}
 
+      {/* Copy-only notice */}
+      {isActive && !isCompleted && (
+        <p style={{ fontSize: "0.78rem", color: "#6e7781", margin: "0 0 0.5rem", fontStyle: "italic" }}>
+          These prompts do not run Claude Code automatically — copy the generated prompt into Claude Code manually.
+        </p>
+      )}
+
+      {/* Sprint # input for init */}
       {!isActive && canInit && (
         <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "0.5rem" }}>
           <label style={{ fontSize: "0.82rem", color: "#24292f" }}>Sprint #</label>
           <input
-            type="number"
-            min={1}
-            value={sprintInput}
+            type="number" min={1} value={sprintInput}
             onChange={(e) => setSprintInput(e.target.value)}
             style={{ width: "4rem", padding: "2px 6px", fontSize: "0.85rem", border: "1px solid #d0d7de", borderRadius: 4 }}
           />
         </div>
       )}
 
+      {/* Completion approval panel */}
+      {isReadyForCompletion && showApproval && (
+        <div style={{ background: "#f6f8fa", border: "1px solid #d0d7de", borderRadius: 6, padding: "0.6rem", marginBottom: "0.5rem" }}>
+          <label style={{ fontSize: "0.82rem", display: "block", marginBottom: "0.25rem" }}>Approval note (optional):</label>
+          <textarea
+            value={approvalNote}
+            onChange={(e) => setApprovalNote(e.target.value)}
+            rows={2}
+            style={{ width: "100%", fontSize: "0.82rem", border: "1px solid #d0d7de", borderRadius: 4, padding: "4px 6px", boxSizing: "border-box" }}
+            placeholder="e.g. Smoke, review, and governance all passed."
+          />
+          <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.4rem" }}>
+            <button
+              className="delivery-card-action"
+              style={{ background: "#22863a", color: "#fff" }}
+              disabled={!!busy}
+              onClick={() => run("approve", () => approveSprintCompletion(runId, true, approvalNote || undefined))}
+            >
+              {busy === "approve" ? "Approving…" : "Confirm Sprint Completion"}
+            </button>
+            <button className="delivery-card-action" onClick={() => setShowApproval(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Action buttons */}
       <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+        {/* Init */}
         {!isActive && canInit && (
-          <button className="delivery-card-action" disabled={busy} onClick={handleInit}>
-            {busy ? "Initializing…" : "Initialize Sprint Orchestrator"}
+          <Btn id="init" label="Initialize Sprint Orchestrator" onClick={() => run("init", () => initSprintOrchestrator(runId, parseInt(sprintInput, 10) || 1))} />
+        )}
+
+        {/* Prompt generators */}
+        {isActive && !isCompleted && (
+          <Btn id="build" label="Generate Build Prompt" onClick={() => run("build", () => generateSprintBuildPrompt(runId))} />
+        )}
+        {isActive && !isCompleted && isFailed && (
+          <Btn id="fix" label="Generate Fix Prompt" onClick={() => run("fix", () => generateSprintFixPrompt(runId))} />
+        )}
+        {isActive && !isCompleted && (
+          <Btn id="cont" label="Generate Continuation Prompt" onClick={() => run("cont", () => generateSprintContinuationPrompt(runId))} />
+        )}
+        {isActive && !isCompleted && (
+          <Btn id="handoff" label="Generate Handoff" onClick={() => run("handoff", () => generateSprintHandoff(runId))} />
+        )}
+
+        {/* Completion */}
+        {isReadyForCompletion && !showApproval && (
+          <button className="delivery-card-action" style={{ background: "#22863a", color: "#fff" }} disabled={!!busy} onClick={() => setShowApproval(true)}>
+            Approve Sprint Completion
           </button>
         )}
-        {isActive && (
-          <button className="delivery-card-action" disabled={busy} onClick={handleHandoff}>
-            {busy ? "Generating…" : "Generate Handoff Prompt"}
-          </button>
+
+        {/* Artifact viewers */}
+        {state?.build_prompt_artifact && (
+          <button className="delivery-card-action" onClick={() => onSelectArtifact?.(state.build_prompt_artifact!)}>View Build Prompt</button>
+        )}
+        {state?.fix_prompt_artifact && (
+          <button className="delivery-card-action" onClick={() => onSelectArtifact?.(state.fix_prompt_artifact!)}>View Fix Prompt</button>
+        )}
+        {state?.continuation_prompt_artifact && (
+          <button className="delivery-card-action" onClick={() => onSelectArtifact?.(state.continuation_prompt_artifact!)}>View Continuation Prompt</button>
         )}
         {state?.handoff_artifact && (
-          <button className="delivery-card-action" onClick={() => onSelectArtifact?.(state.handoff_artifact!)}>
-            View Handoff
-          </button>
+          <button className="delivery-card-action" onClick={() => onSelectArtifact?.(state.handoff_artifact!)}>View Handoff</button>
+        )}
+        {state?.completion_approval_artifact && (
+          <button className="delivery-card-action" onClick={() => onSelectArtifact?.(state.completion_approval_artifact!)}>View Completion Approval</button>
         )}
         {isActive && (
-          <button className="delivery-card-action" onClick={() => onSelectArtifact?.("sprint_orchestrator_state.json")}>
-            View Orchestrator State
-          </button>
+          <button className="delivery-card-action" onClick={() => onSelectArtifact?.("sprint_orchestrator_state.json")}>View Orchestrator State</button>
         )}
       </div>
     </div>

@@ -782,3 +782,546 @@ Reference: {scope_ref}
 {continuation_prompt}
 ```
 """
+
+
+# ── Completion gate ────────────────────────────────────────────────────────────
+
+def _last_check_passed(checks: list) -> bool:
+    """True iff the last entry in the list is passed, or waived with a non-empty reason."""
+    if not checks:
+        return False
+    last = checks[-1]
+    status = last.get("status")
+    if status == "passed":
+        return True
+    if status == "waived" and last.get("waiver_reason"):
+        return True
+    return False
+
+
+def can_complete_sprint(state: dict) -> tuple[bool, Optional[str]]:
+    """
+    Return (True, None) if the sprint can be marked complete.
+    Return (False, reason) if smoke/review/governance checks are not satisfied.
+
+    Rules:
+    - Each check list must have at least one entry.
+    - The latest entry must be "passed" OR "waived" with a non-empty waiver_reason.
+    """
+    smoke = state.get("smoke_checks") or []
+    review = state.get("review_checks") or []
+    governance = state.get("governance_checks") or []
+
+    missing = []
+    if not _last_check_passed(smoke):
+        missing.append("smoke check not passed or waived with reason")
+    if not _last_check_passed(review):
+        missing.append("review check not passed or waived with reason")
+    if not _last_check_passed(governance):
+        missing.append("governance check not passed or waived with reason")
+
+    if missing:
+        return False, f"Cannot complete sprint: {'; '.join(missing)}."
+    return True, None
+
+
+# ── Sprint build prompt ────────────────────────────────────────────────────────
+
+def generate_sprint_build_prompt(run_dir: Path) -> dict:
+    """
+    Generate sprint_<n>_build_prompt.md from orchestrator state.
+
+    Advances phase to build_prompt_ready and records build_prompt_artifact.
+    Returns {"success": bool, "artifact": str|None, "error": str|None}.
+    """
+    run_dir = Path(run_dir)
+    state = load_orchestrator_state(run_dir)
+    if state is None:
+        return {"success": False, "artifact": None, "error": "Orchestrator not initialized."}
+
+    sprint_num = state.get("active_sprint", 0)
+    artifact_name = f"sprint_{sprint_num}_build_prompt.md"
+    content = _build_sprint_build_prompt_md(state, run_dir)
+    _write_text(run_dir / artifact_name, content)
+
+    state["build_prompt_artifact"] = artifact_name
+    state["current_phase"] = PHASE_BUILD_PROMPT_READY
+    state["last_completed_step"] = "Sprint build prompt generated."
+    state["next_action"] = (
+        "Copy sprint build prompt into Claude Code and record the build attempt result."
+    )
+    _apply_next_action(state)
+    save_orchestrator_state(run_dir, state)
+
+    return {"success": True, "artifact": artifact_name, "error": None}
+
+
+def _build_sprint_build_prompt_md(state: dict, run_dir: Path) -> str:
+    sprint_num = state.get("active_sprint", 0)
+    title = state.get("sprint_title") or f"Sprint {sprint_num}"
+    goal = state.get("sprint_goal") or "(no goal recorded)"
+    phase = state.get("current_phase", "unknown")
+    last_step = state.get("last_completed_step") or "None"
+    next_action = state.get("next_action") or "None"
+    blocking = state.get("blocking_reason") or "None"
+    user_note = state.get("user_note") or ""
+
+    quality = state.get("sprint_quality") or {}
+    build_ready = quality.get("build_ready", True)
+    risk = quality.get("risk_level", "unknown")
+    score = quality.get("quality_score")
+
+    req_ref = state.get("requirements_artifact", _REQUIREMENTS_MD)
+    arch_ref = state.get("approved_architecture_artifact", _APPROVED_ARCH_MD)
+    gi_ref = state.get("global_instructions_artifact", _GLOBAL_INSTRUCTIONS_MD)
+    scope_ref = state.get("selected_sprint_artifact") or _SPRINT_SCOPE_MD
+    handoff_ref = state.get("handoff_artifact") or f"sprint_{sprint_num}_handoff.md"
+
+    # Load sprint scope excerpt if it exists
+    scope_text = _read_text(run_dir / scope_ref)
+    scope_excerpt = scope_text[:1500].strip() if scope_text else "(not generated yet)"
+
+    # Likely / matched files
+    plan_meta = _load_sprint_meta(run_dir, sprint_num)
+    likely_created = plan_meta.get("likely_files_created") or []
+    likely_modified = plan_meta.get("likely_files_modified") or []
+
+    likely_block = ""
+    if likely_created:
+        likely_block += "Files likely to be created:\n" + "\n".join(f"  - {f}" for f in likely_created) + "\n"
+    if likely_modified:
+        likely_block += "Files likely to be modified:\n" + "\n".join(f"  - {f}" for f in likely_modified) + "\n"
+    if not likely_block:
+        likely_block = "(see selected_feature_sprint_scope.md)"
+
+    note_block = f"\n**User note:** {user_note}\n" if user_note else ""
+    quality_line = f"Build-ready: {build_ready}, Risk: {risk}" + (f", Score: {score}" if score else "")
+
+    return f"""# Sprint {sprint_num} Build Prompt
+
+> **Generated at:** {_now()}
+> **These prompts do not run Claude Code automatically. Copy this prompt into Claude Code manually.**
+
+You are Claude Code working on Sprint {sprint_num}.
+
+---
+
+## Mandatory Reading Order
+
+Before editing anything, read these files in order:
+
+1. `{gi_ref}`
+2. `{req_ref}`
+3. `{arch_ref}`
+4. `{scope_ref}`
+5. `sprint_orchestrator_state.json`
+
+If a sprint handoff exists, also read:
+- `{handoff_ref}`
+
+---
+
+## Non-Negotiable Rules
+
+- Do not restart from scratch.
+- Do not ignore `{gi_ref}`.
+- Do not change the approved architecture unless explicitly instructed by the user.
+- Do not broaden the sprint scope beyond what is listed in `{scope_ref}`.
+- Do not touch `.env`, secrets, credentials, `node_modules`, `venv`, generated output folders, or unrelated files.
+- Do not commit or push unless the user explicitly asks.
+- If token/session limits are reached, stop after summarizing current progress and ask the user to generate a new handoff.
+- If the sprint is too broad, stop and request decomposition instead of improvising.
+
+---
+
+## Active Sprint
+
+- **Sprint number:** {sprint_num}
+- **Sprint title:** {title}
+- **Sprint goal:** {goal}
+- **Sprint quality:** {quality_line}
+{note_block}
+## Likely Files
+
+{likely_block}
+
+## Sprint Scope
+
+{scope_excerpt}
+
+---
+
+## Current Orchestrator State
+
+- **Current phase:** {phase}
+- **Last completed step:** {last_step}
+- **Next action:** {next_action}
+- **Blocking reason:** {blocking}
+
+---
+
+## Required Build Task
+
+Implement only the selected sprint scope from `{scope_ref}`.
+Do not implement features from future sprints.
+Do not rebuild already-completed sprint work.
+
+---
+
+## Expected Output Back to User
+
+After building, report:
+
+1. Files changed (created / modified / deleted)
+2. What was implemented
+3. What was intentionally not changed
+4. How `{gi_ref}` was followed
+5. Any blockers encountered
+6. Suggested smoke checks to run
+7. Whether a handoff should be generated before the session ends
+"""
+
+
+# ── Sprint fix prompt ──────────────────────────────────────────────────────────
+
+_FAILURE_PHASE_MAP = {
+    PHASE_SMOKE_FAILED: "smoke",
+    PHASE_REVIEW_FAILED: "review",
+    PHASE_GOV_FAILED: "governance",
+    PHASE_BUILD_ATTEMPTED: "build",
+}
+
+
+def generate_sprint_fix_prompt(
+    run_dir: Path,
+    failure_type: Optional[str] = None,
+) -> dict:
+    """
+    Generate sprint_<n>_fix_prompt.md targeting the current failure.
+
+    failure_type: smoke | review | governance | build | None (auto-detected).
+    Returns {"success": bool, "artifact": str|None, "error": str|None}.
+    """
+    run_dir = Path(run_dir)
+    state = load_orchestrator_state(run_dir)
+    if state is None:
+        return {"success": False, "artifact": None, "error": "Orchestrator not initialized."}
+
+    # Auto-detect failure type from phase if not provided
+    if failure_type is None:
+        phase = state.get("current_phase", "")
+        failure_type = _FAILURE_PHASE_MAP.get(phase, "unknown")
+
+        # Refine build: check last attempt status
+        if failure_type == "build":
+            attempts = state.get("attempts") or []
+            if attempts and attempts[-1].get("status") == "interrupted":
+                failure_type = "interrupted"
+
+    sprint_num = state.get("active_sprint", 0)
+    artifact_name = f"sprint_{sprint_num}_fix_prompt.md"
+    content = _build_sprint_fix_prompt_md(state, run_dir, failure_type)
+    _write_text(run_dir / artifact_name, content)
+
+    state["fix_prompt_artifact"] = artifact_name
+    state["last_completed_step"] = "Sprint fix prompt generated."
+    state["next_action"] = (
+        "Copy sprint fix prompt into Claude Code, apply fix, "
+        "then record updated check result."
+    )
+    save_orchestrator_state(run_dir, state)
+
+    return {"success": True, "artifact": artifact_name, "error": None}
+
+
+def _get_latest_failed_check(state: dict, failure_type: str) -> dict:
+    """Return the latest check record for the given failure type."""
+    mapping = {
+        "smoke": state.get("smoke_checks") or [],
+        "review": state.get("review_checks") or [],
+        "governance": state.get("governance_checks") or [],
+        "build": state.get("attempts") or [],
+        "interrupted": state.get("attempts") or [],
+    }
+    records = mapping.get(failure_type, [])
+    return records[-1] if records else {}
+
+
+def _build_sprint_fix_prompt_md(state: dict, run_dir: Path, failure_type: str) -> str:
+    sprint_num = state.get("active_sprint", 0)
+    title = state.get("sprint_title") or f"Sprint {sprint_num}"
+    phase = state.get("current_phase", "unknown")
+
+    req_ref = state.get("requirements_artifact", _REQUIREMENTS_MD)
+    arch_ref = state.get("approved_architecture_artifact", _APPROVED_ARCH_MD)
+    gi_ref = state.get("global_instructions_artifact", _GLOBAL_INSTRUCTIONS_MD)
+    scope_ref = state.get("selected_sprint_artifact") or _SPRINT_SCOPE_MD
+    handoff_ref = state.get("handoff_artifact") or f"sprint_{sprint_num}_handoff.md"
+    handoff_note = f"- `{handoff_ref}` (if it exists)" if (run_dir / handoff_ref).exists() else f"- `{handoff_ref}` (generate one if missing)"
+
+    latest = _get_latest_failed_check(state, failure_type)
+    check_summary = latest.get("summary") or "(no summary recorded)"
+    check_artifact = latest.get("artifact") or "(none)"
+    check_status = latest.get("status") or "unknown"
+
+    failure_label = {
+        "smoke": "Smoke check failure",
+        "review": "Code review failure",
+        "governance": "Governance check failure",
+        "build": "Build failure",
+        "interrupted": "Build interrupted / session cutoff",
+        "unknown": "Unknown failure",
+    }.get(failure_type, failure_type.title() + " failure")
+
+    rerun_instruction = {
+        "smoke": "After fixing, re-run smoke checks and record the result.",
+        "review": "After fixing, request another code review and record the result.",
+        "governance": "After fixing, re-run governance check and record the result.",
+        "build": "After fixing, record a new build attempt result.",
+        "interrupted": "Continue the build from where it stopped. Generate a new handoff when done.",
+        "unknown": "After fixing, record the appropriate check result.",
+    }.get(failure_type, "After fixing, record the appropriate check result.")
+
+    return f"""# Sprint {sprint_num} Fix Prompt
+
+> **Generated at:** {_now()}
+> **These prompts do not run Claude Code automatically. Copy this prompt into Claude Code manually.**
+
+You are Claude Code fixing Sprint {sprint_num} — {title}.
+
+---
+
+## Mandatory Reading Order
+
+Before making any change, read these files in order:
+
+1. `{gi_ref}`
+2. `{req_ref}`
+3. `{arch_ref}`
+4. `{scope_ref}`
+5. `sprint_orchestrator_state.json`
+{handoff_note}
+
+---
+
+## Failure Context
+
+- **Failure type:** {failure_label}
+- **Current phase:** {phase}
+- **Latest check status:** {check_status}
+- **Summary:** {check_summary}
+- **Artifact:** {check_artifact}
+
+---
+
+## Fix Rules
+
+- Fix only the failing issue identified above.
+- Do not redesign the sprint scope.
+- Do not restart the build from scratch.
+- Do not broaden scope to include features from other sprints.
+- Preserve all working changes from the previous build attempt.
+- Do not commit or push unless explicitly asked.
+- Do not touch `.env`, secrets, credentials, `node_modules`, `venv`, or unrelated files.
+- If the fix requires changing multiple files, explain why each file needs changing.
+- If the root cause is unclear, explain what you found and ask before proceeding.
+
+---
+
+## {rerun_instruction}
+
+---
+
+## Expected Output Back to User
+
+After applying the fix, report:
+
+1. Failure understood — root cause identified
+2. Files changed (minimal fix only)
+3. Fix applied — what was changed and why
+4. Checks to rerun — which smoke/review/governance checks apply
+5. Whether smoke/review/governance should be recorded again
+6. Whether a new handoff should be generated
+"""
+
+
+# ── Sprint continuation prompt ─────────────────────────────────────────────────
+
+def generate_sprint_continuation_prompt(run_dir: Path) -> dict:
+    """
+    Generate sprint_<n>_continuation_prompt.md optimised for direct copy/paste
+    into a new Claude Code session.
+
+    Returns {"success": bool, "artifact": str|None, "error": str|None}.
+    """
+    run_dir = Path(run_dir)
+    state = load_orchestrator_state(run_dir)
+    if state is None:
+        return {"success": False, "artifact": None, "error": "Orchestrator not initialized."}
+
+    sprint_num = state.get("active_sprint", 0)
+    artifact_name = f"sprint_{sprint_num}_continuation_prompt.md"
+    content = _build_continuation_prompt_md(state, run_dir)
+    _write_text(run_dir / artifact_name, content)
+
+    state["continuation_prompt_artifact"] = artifact_name
+    state["last_completed_step"] = "Sprint continuation prompt generated."
+    save_orchestrator_state(run_dir, state)
+
+    return {"success": True, "artifact": artifact_name, "error": None}
+
+
+def _build_continuation_prompt_md(state: dict, run_dir: Path) -> str:
+    sprint_num = state.get("active_sprint", 0)
+    title = state.get("sprint_title") or f"Sprint {sprint_num}"
+    phase = state.get("current_phase", "unknown")
+    last_step = state.get("last_completed_step") or "None"
+    next_action = state.get("next_action") or "Review orchestrator state and continue."
+    blocking = state.get("blocking_reason") or "None"
+
+    req_ref = state.get("requirements_artifact", _REQUIREMENTS_MD)
+    arch_ref = state.get("approved_architecture_artifact", _APPROVED_ARCH_MD)
+    gi_ref = state.get("global_instructions_artifact", _GLOBAL_INSTRUCTIONS_MD)
+    scope_ref = state.get("selected_sprint_artifact") or _SPRINT_SCOPE_MD
+    handoff_ref = state.get("handoff_artifact") or f"sprint_{sprint_num}_handoff.md"
+    handoff_exists = (run_dir / handoff_ref).exists()
+
+    return f"""# Sprint {sprint_num} Continuation Prompt
+
+> **Generated at:** {_now()}
+> **These prompts do not run Claude Code automatically. Copy this prompt into Claude Code manually.**
+
+You are Claude Code continuing Sprint {sprint_num} — {title}.
+
+---
+
+## Before editing anything, read in order:
+
+1. `{gi_ref}`
+2. `{req_ref}`
+3. `{arch_ref}`
+4. `{scope_ref}`
+5. `sprint_orchestrator_state.json`
+{"6. `" + handoff_ref + "` (handoff exists — read this to resume)" if handoff_exists else "6. `" + handoff_ref + "` (generate a handoff if the session ends)"}
+
+---
+
+## Do not restart from scratch.
+
+Pick up from the current orchestrator state and perform only the next action.
+
+---
+
+## Current State
+
+- **Current phase:** {phase}
+- **Last completed step:** {last_step}
+- **Next action:** {next_action}
+- **Blocking reason:** {blocking}
+
+---
+
+After completing the next action, report what changed and whether any checks need to be recorded.
+If the session may end soon, ask the user to generate a new handoff before stopping.
+"""
+
+
+# ── Sprint completion approval ─────────────────────────────────────────────────
+
+def approve_sprint_completion(
+    run_dir: Path,
+    user_approved: bool = False,
+    approval_note: Optional[str] = None,
+) -> dict:
+    """
+    Approve sprint completion. Requires explicit user_approved=True and all
+    checks passed or validly waived.
+
+    Returns {"success": bool, "state": dict|None, "error": str|None}.
+    """
+    run_dir = Path(run_dir)
+    state = load_orchestrator_state(run_dir)
+    if state is None:
+        return {"success": False, "state": None, "error": "Orchestrator not initialized."}
+
+    if not user_approved:
+        return {
+            "success": False,
+            "state": state,
+            "error": "Sprint completion requires explicit user approval (user_approved=True).",
+        }
+
+    ok, reason = can_complete_sprint(state)
+    if not ok:
+        return {"success": False, "state": state, "error": reason}
+
+    now = _now()
+    sprint_num = state.get("active_sprint", 0)
+
+    state["status"] = STATUS_COMPLETED
+    state["current_phase"] = PHASE_COMPLETED
+    state["last_completed_step"] = "User approved sprint completion."
+    state["next_action"] = (
+        "Sprint complete. Select the next sprint or generate final delivery artifacts."
+    )
+    state["blocking_reason"] = None
+    state["completion_approval_artifact"] = f"sprint_{sprint_num}_completion_approval.md"
+
+    # Write completion approval artifact
+    approval_content = _build_completion_approval_md(state, sprint_num, approval_note, now)
+    _write_text(run_dir / state["completion_approval_artifact"], approval_content)
+
+    save_orchestrator_state(run_dir, state)
+    return {"success": True, "state": state, "error": None}
+
+
+def _check_status_label(checks: list) -> str:
+    if not checks:
+        return "Not recorded"
+    last = checks[-1]
+    status = last.get("status", "unknown").upper()
+    waiver = last.get("waiver_reason") or ""
+    return f"{status}" + (f" (waived: {waiver})" if waiver else "")
+
+
+def _build_completion_approval_md(
+    state: dict, sprint_num: int, approval_note: Optional[str], now: str
+) -> str:
+    title = state.get("sprint_title") or f"Sprint {sprint_num}"
+    note = approval_note or "(none)"
+    smoke_label = _check_status_label(state.get("smoke_checks") or [])
+    review_label = _check_status_label(state.get("review_checks") or [])
+    gov_label = _check_status_label(state.get("governance_checks") or [])
+
+    artifacts = []
+    for key in ("requirements_artifact", "global_instructions_artifact",
+                "approved_architecture_artifact", "selected_sprint_artifact",
+                "handoff_artifact", "build_prompt_artifact", "fix_prompt_artifact",
+                "continuation_prompt_artifact"):
+        val = state.get(key)
+        if val:
+            artifacts.append(f"- {val}")
+
+    return f"""# Sprint {sprint_num} Completion Approval
+
+> **Status:** Completed
+> **Sprint:** Sprint {sprint_num} — {title}
+> **Approved by:** User
+> **Completed at:** {now}
+
+## Approval Note
+
+{note}
+
+## Final Check Status
+
+| Check | Status |
+|---|---|
+| Smoke | {smoke_label} |
+| Review | {review_label} |
+| Governance | {gov_label} |
+
+## Sprint Artifacts
+
+{chr(10).join(artifacts) if artifacts else "(none recorded)"}
+"""

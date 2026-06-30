@@ -443,6 +443,10 @@ export interface SprintOrchestratorState {
   approved_architecture_artifact?: string;
   selected_sprint_artifact?: string | null;
   handoff_artifact?: string | null;
+  build_prompt_artifact?: string | null;
+  fix_prompt_artifact?: string | null;
+  continuation_prompt_artifact?: string | null;
+  completion_approval_artifact?: string | null;
   user_note?: string | null;
   attempts?: SprintBuildAttempt[];
   smoke_checks?: SprintCheckRecord[];
@@ -573,6 +577,65 @@ export async function generateSprintHandoff(runId: string): Promise<SprintOrches
   if (!r.ok) {
     const msg = await r.text().catch(() => "");
     throw new Error(`Failed to generate sprint handoff: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function generateSprintBuildPrompt(runId: string): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator/generate-build-prompt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to generate sprint build prompt: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function generateSprintFixPrompt(
+  runId: string,
+  failureType?: string,
+): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator/generate-fix-prompt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ failure_type: failureType ?? null }),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to generate sprint fix prompt: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function generateSprintContinuationPrompt(runId: string): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator/generate-continuation-prompt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to generate sprint continuation prompt: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function approveSprintCompletion(
+  runId: string,
+  userApproved: boolean,
+  approvalNote?: string,
+): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator/approve-completion`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_approved: userApproved, approval_note: approvalNote ?? null }),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Sprint completion approval failed: ${msg}`);
   }
   return r.json();
 }

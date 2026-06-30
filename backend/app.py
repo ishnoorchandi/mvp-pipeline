@@ -333,15 +333,20 @@ def build_operator_run_summary(run_dir: Path, run_state: dict, artifacts: list[s
 
     primary_artifacts = [a for a in PRIMARY_ARTIFACT_PRIORITY if a in artifact_set][:6]
 
-    # Sprint orchestrator — overlay next_safe_action and inject handoff artifact if present.
+    # Sprint orchestrator — overlay next_safe_action and surface orchestrator artifacts.
     orchestrator_state = _read_json_artifact(run_dir, "sprint_orchestrator_state.json")
-    if orchestrator_state and orchestrator_state.get("status") == "active":
+    if orchestrator_state and orchestrator_state.get("status") in ("active", "ready_for_completion"):
         orchestrator_next = orchestrator_state.get("next_action")
         if orchestrator_next and next_safe_action in (None, "Review outputs", "Review run details"):
             next_safe_action = orchestrator_next
-        handoff_artifact = orchestrator_state.get("handoff_artifact")
-        if handoff_artifact and handoff_artifact in artifact_set and handoff_artifact not in primary_artifacts:
-            primary_artifacts = ([handoff_artifact] + primary_artifacts)[:6]
+        # Prepend orchestrator prompt artifacts that exist in the run
+        for orch_art_key in (
+            "build_prompt_artifact", "fix_prompt_artifact",
+            "continuation_prompt_artifact", "handoff_artifact",
+        ):
+            orch_art = orchestrator_state.get(orch_art_key)
+            if orch_art and orch_art in artifact_set and orch_art not in primary_artifacts:
+                primary_artifacts = ([orch_art] + primary_artifacts)[:6]
 
     # Planning gate — infer from run_state; safe for older runs (falls back to unknown)
     planning_gate = planning_gate_mod.build_planning_gate_from_run_state(
@@ -1207,6 +1212,64 @@ def record_sprint_governance_result(run_id: str):
     except ValueError as exc:
         abort(400, str(exc))
     return jsonify({"run_id": run_id, "state": state})
+
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator/generate-build-prompt", methods=["POST"])
+def generate_sprint_build_prompt(run_id: str):
+    """Generate sprint_<n>_build_prompt.md and advance phase to build_prompt_ready."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    result = so_mod.generate_sprint_build_prompt(run_dir)
+    if not result["success"]:
+        abort(400, result.get("error") or "Build prompt generation failed")
+    state = so_mod.load_orchestrator_state(run_dir)
+    return jsonify({"run_id": run_id, "artifact": result["artifact"], "state": state})
+
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator/generate-fix-prompt", methods=["POST"])
+def generate_sprint_fix_prompt(run_id: str):
+    """Generate sprint_<n>_fix_prompt.md targeting the current failure type."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    body = request.get_json(force=True, silent=True) or {}
+    failure_type = body.get("failure_type") or None
+    result = so_mod.generate_sprint_fix_prompt(run_dir, failure_type=failure_type)
+    if not result["success"]:
+        abort(400, result.get("error") or "Fix prompt generation failed")
+    state = so_mod.load_orchestrator_state(run_dir)
+    return jsonify({"run_id": run_id, "artifact": result["artifact"], "state": state})
+
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator/generate-continuation-prompt", methods=["POST"])
+def generate_sprint_continuation_prompt(run_id: str):
+    """Generate sprint_<n>_continuation_prompt.md for resuming in a new Claude session."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    result = so_mod.generate_sprint_continuation_prompt(run_dir)
+    if not result["success"]:
+        abort(400, result.get("error") or "Continuation prompt generation failed")
+    state = so_mod.load_orchestrator_state(run_dir)
+    return jsonify({"run_id": run_id, "artifact": result["artifact"], "state": state})
+
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator/approve-completion", methods=["POST"])
+def approve_sprint_completion(run_id: str):
+    """Approve sprint completion. Requires user_approved=true and all checks passed/waived."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    body = request.get_json(force=True, silent=True) or {}
+    user_approved = bool(body.get("user_approved", False))
+    approval_note = body.get("approval_note") or None
+    result = so_mod.approve_sprint_completion(
+        run_dir, user_approved=user_approved, approval_note=approval_note,
+    )
+    if not result["success"]:
+        abort(400, result.get("error") or "Sprint completion approval failed")
+    return jsonify({"run_id": run_id, "state": result["state"]})
 
 
 @app.route("/api/runs/<run_id>/sprint-orchestrator/generate-handoff", methods=["POST"])
