@@ -5,11 +5,14 @@ Serves run data from the runs/ folder.
 Runs are file-based (no DB yet).
 
 Routes:
-  POST /api/runs                         → start a new pipeline run (async)
-  GET  /api/runs                         → list all runs + status
-  GET  /api/runs/<run_id>                → full run state + artifact list
-  GET  /api/runs/<run_id>/artifacts/<filename> → get raw artifact content
-  GET  /health                           → health check
+  POST /api/runs                                                    → start a new pipeline run (async)
+  GET  /api/runs                                                    → list all runs + status
+  GET  /api/runs/<run_id>                                           → full run state + artifact list
+  GET  /api/runs/<run_id>/artifacts/<filename>                      → get raw artifact content
+  GET  /api/runs/<run_id>/requirements-conversation                 → load (or lazily init) requirements conversation
+  POST /api/runs/<run_id>/requirements-conversation/answer          → save one question answer
+  POST /api/runs/<run_id>/requirements-conversation/approve         → approve requirements
+  GET  /health                                                      → health check
 """
 
 import json
@@ -32,6 +35,7 @@ PIPELINE_SCRIPT = BASE_DIR / "pipeline_mvp_builder.py"
 sys.path.insert(0, str(BASE_DIR))
 import delivery as delivery_mod  # noqa: E402 — needs BASE_DIR on sys.path first
 import planning_gate as planning_gate_mod  # noqa: E402
+import requirements_conversation as req_conv_mod  # noqa: E402
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -788,6 +792,97 @@ def get_artifact(run_id: str, filename: str):
         abort(404, f"{filename} not found in {run_id}")
     content = p.read_text(encoding="utf-8", errors="replace")
     return jsonify({"run_id": run_id, "filename": filename, "content": content})
+
+
+# ── Requirements Conversation ─────────────────────────────────────────────────
+
+@app.route("/api/runs/<run_id>/requirements-conversation", methods=["GET"])
+def get_requirements_conversation(run_id: str):
+    """Return (or lazily initialize) the requirements conversation for a run.
+
+    Safe for older runs — if the run predates this system, init_requirements_conversation
+    lazily creates draft + questions from whatever context is available, or returns a
+    not_applicable state for read-only workflows (bugfix, inventory, etc.).
+    """
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    state = load_state(run_id)
+    if state is None:
+        abort(404, f"Run {run_id} state not found")
+
+    conversation = req_conv_mod.lazy_init_from_run_state(run_dir, state)
+    planning_gate = planning_gate_mod.build_planning_gate_from_run_state(state, run_dir=run_dir)
+    unanswered = req_conv_mod.get_unanswered_required(conversation)
+    return jsonify({
+        "run_id": run_id,
+        "conversation": conversation,
+        "planning_gate": planning_gate,
+        "can_approve": len(unanswered) == 0 and not conversation.get("requirements_approved"),
+        "unanswered_required": unanswered,
+    })
+
+
+@app.route("/api/runs/<run_id>/requirements-conversation/answer", methods=["POST"])
+def save_requirements_answer(run_id: str):
+    """Save one question answer in requirements_questions.json and conversation transcript."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    body = request.get_json(silent=True) or {}
+    question_id = (body.get("question_id") or "").strip()
+    if not question_id:
+        abort(400, "question_id is required")
+    answer = body.get("answer")
+    freeform_answer = (body.get("freeform_answer") or "").strip()
+
+    # Lazy-init if needed so the endpoint works even when the client calls it
+    # before explicitly opening the conversation view.
+    state = load_state(run_id)
+    if state is None:
+        abort(404, f"Run {run_id} state not found")
+    req_conv_mod.lazy_init_from_run_state(run_dir, state)
+
+    try:
+        updated = req_conv_mod.save_answer(run_dir, question_id, answer, freeform_answer)
+    except ValueError as exc:
+        abort(400, str(exc))
+
+    unanswered = req_conv_mod.get_unanswered_required(updated)
+    return jsonify({
+        "run_id": run_id,
+        "conversation": updated,
+        "can_approve": len(unanswered) == 0 and not updated.get("requirements_approved"),
+        "unanswered_required": unanswered,
+    })
+
+
+@app.route("/api/runs/<run_id>/requirements-conversation/approve", methods=["POST"])
+def approve_requirements(run_id: str):
+    """Approve requirements: merge draft + answers → approved_requirements.md + signoff.
+
+    Does NOT automatically start architecture conversation or build. Returns the
+    updated planning_gate so the UI can refresh the Planning Gate card.
+    """
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    state = load_state(run_id)
+    if state is None:
+        abort(404, f"Run {run_id} state not found")
+
+    result = req_conv_mod.approve_requirements(run_dir)
+    if not result["approved"]:
+        abort(400, result.get("error") or "Approval failed")
+
+    # Re-read planning gate from updated artifacts
+    planning_gate = planning_gate_mod.build_planning_gate_from_run_state(state, run_dir=run_dir)
+    return jsonify({
+        "run_id": run_id,
+        "approved": True,
+        "conversation": result["state"],
+        "planning_gate": planning_gate,
+    })
 
 
 # ── Local Delivery + Optional Sandbox Push ──────────────────────────────────

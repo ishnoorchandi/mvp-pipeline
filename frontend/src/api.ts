@@ -207,6 +207,79 @@ export interface Artifact {
   content: string;
 }
 
+// ── Requirements Conversation ─────────────────────────────────────────────────
+
+export type QuestionType = "single_choice" | "multi_choice" | "short_text" | "long_text" | "yes_no";
+
+export interface RequirementsQuestion {
+  id: string;
+  label: string;
+  question: string;
+  type: QuestionType;
+  options: string[];
+  recommended?: string;
+  answer?: string | null;
+  freeform_answer?: string;
+  why?: string;
+  required?: boolean;
+}
+
+export interface RequirementsConversationState {
+  entry_point?: "raw_idea" | "written_requirements" | "existing_app_upgrade" | string;
+  requirements_status?: "not_started" | "draft" | "questions_pending" | "review" | "approved" | "not_applicable" | string;
+  questions: RequirementsQuestion[];
+  answers: Record<string, string | null>;
+  draft_requirements_artifact?: string | null;
+  approved_requirements_artifact?: string | null;
+  requirements_approved?: boolean;
+  updated_at?: string;
+}
+
+export interface RequirementsConversationResponse {
+  run_id: string;
+  conversation: RequirementsConversationState;
+  planning_gate?: PlanningGateState;
+  can_approve?: boolean;
+  unanswered_required?: string[];
+}
+
+export async function getRequirementsConversation(runId: string): Promise<RequirementsConversationResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/requirements-conversation`);
+  if (!r.ok) throw new Error(`Failed to fetch requirements conversation for ${runId}`);
+  return r.json();
+}
+
+export async function saveRequirementsAnswer(
+  runId: string,
+  questionId: string,
+  answer: string | null,
+  freeformAnswer?: string,
+): Promise<RequirementsConversationResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/requirements-conversation/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question_id: questionId, answer, freeform_answer: freeformAnswer ?? "" }),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to save answer: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function approveRequirements(runId: string): Promise<RequirementsConversationResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/requirements-conversation/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Approval failed: ${msg}`);
+  }
+  return r.json();
+}
+
 export async function getRuns(): Promise<RunSummary[]> {
   const r = await fetch(`${BASE}/api/runs`);
   if (!r.ok) throw new Error("Failed to fetch runs");
