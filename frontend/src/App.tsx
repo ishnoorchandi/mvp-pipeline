@@ -11,12 +11,13 @@ import {
   getSprintOrchestrator, initSprintOrchestrator, generateSprintHandoff,
   generateSprintBuildPrompt, generateSprintFixPrompt, generateSprintContinuationPrompt,
   approveSprintCompletion,
+  recordSprintBuildAttempt, recordSprintSmokeResult, recordSprintReviewResult, recordSprintGovernanceResult,
 } from "./api";
 import type {
   RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState,
   PrDeliveryPlanState, PrBranchPrepState, PrRemoteDeliveryState, RepoHygieneSummary,
   PlanningGateState, RequirementsQuestion, ArchitectureQuestion, GlobalInstructionsStatus,
-  SprintOrchestratorState,
+  SprintOrchestratorState, SprintCheckRecord,
 } from "./api";
 import "./App.css";
 
@@ -2524,6 +2525,278 @@ function OperatorBadge({ value }: { value?: string | null }) {
   return <span className={`delivery-badge delivery-badge-${severity}`}>{label}</span>;
 }
 
+// ── Guided Workflow ────────────────────────────────────────────────────────────
+
+type WFStepStatus = "locked" | "current" | "ready" | "complete" | "blocked";
+
+interface WFStep {
+  id: string;
+  label: string;
+  status: WFStepStatus;
+  description: string;
+  action?: string;
+  anchorId?: string;
+  artifactHint?: string;
+}
+
+function _lastCheckOk(checks?: SprintCheckRecord[]): boolean {
+  if (!checks || checks.length === 0) return false;
+  const last = checks[checks.length - 1];
+  return last.status === "passed" || (last.status === "waived" && !!last.waiver_reason);
+}
+
+function deriveGuidedWorkflowSteps(
+  gate: PlanningGateState | null | undefined,
+  artifacts: string[],
+  orchData: { state: SprintOrchestratorState | null; can_initialize: boolean } | null,
+): WFStep[] {
+  const has = (f: string) => artifacts.includes(f);
+
+  const reqDone = gate?.requirements_approved === true
+    || gate?.requirements_status === "approved"
+    || has("requirements.md");
+
+  const archDone = gate?.architecture_approved === true
+    || gate?.architecture_status === "approved"
+    || has("approved_architecture.md");
+
+  const giDone = gate?.global_instructions_created === true || has("GLOBAL_INSTRUCTIONS.md");
+
+  const orch = orchData?.state ?? null;
+  const orchActive = !!orch && orch.status !== "not_started";
+  const orchCompleted = orch?.status === "completed";
+  const orchCanInit = orchData?.can_initialize ?? false;
+
+  const buildPromptDone = !!(orch?.build_prompt_artifact)
+    || artifacts.some(f => /sprint_\d+_build_prompt\.md/.test(f));
+
+  const lastAttempt = orch?.attempts && orch.attempts.length > 0
+    ? orch.attempts[orch.attempts.length - 1] : null;
+  const buildAttemptDone = lastAttempt?.status === "completed";
+
+  const smokeOk = _lastCheckOk(orch?.smoke_checks);
+  const reviewOk = _lastCheckOk(orch?.review_checks);
+  const govOk = _lastCheckOk(orch?.governance_checks);
+  const allChecksOk = smokeOk && reviewOk && govOk;
+
+  const failPhases = new Set(["smoke_failed", "review_failed", "governance_failed"]);
+  const isFailed = orch ? failPhases.has(orch.current_phase ?? "") : false;
+
+  const steps: WFStep[] = [];
+
+  steps.push({
+    id: "requirements",
+    label: "Clarify Requirements",
+    status: reqDone ? "complete" : "current",
+    description: reqDone ? "requirements.md is ready." : "Answer requirement questions and approve scope.",
+    action: reqDone ? undefined : "Answer and approve requirements.",
+    anchorId: "requirements-conversation-card",
+    artifactHint: reqDone ? "requirements.md" : undefined,
+  });
+
+  steps.push({
+    id: "architecture",
+    label: "Approve Architecture",
+    status: archDone ? "complete" : !reqDone ? "locked" : "current",
+    description: archDone ? "approved_architecture.md is ready."
+      : !reqDone ? "Complete requirements first."
+      : "Answer architecture questions and approve the tech stack.",
+    action: !archDone && reqDone ? "Answer and approve architecture." : undefined,
+    anchorId: "architecture-conversation-card",
+    artifactHint: archDone ? "approved_architecture.md" : undefined,
+  });
+
+  steps.push({
+    id: "global_instructions",
+    label: "Generate Global Instructions",
+    status: giDone ? "complete" : !archDone ? "locked" : "ready",
+    description: giDone ? "GLOBAL_INSTRUCTIONS.md is ready."
+      : !archDone ? "Approve architecture first."
+      : "Generate GLOBAL_INSTRUCTIONS.md to unlock the build.",
+    action: !giDone && archDone ? "Generate GLOBAL_INSTRUCTIONS.md." : undefined,
+    anchorId: "global-instructions-card",
+    artifactHint: giDone ? "GLOBAL_INSTRUCTIONS.md" : undefined,
+  });
+
+  steps.push({
+    id: "sprint_orchestrator",
+    label: "Initialize Sprint Orchestrator",
+    status: orchCompleted ? "complete"
+      : orchActive ? "current"
+      : !giDone ? "locked"
+      : orchCanInit ? "ready"
+      : "locked",
+    description: orchCompleted ? `Sprint ${orch?.active_sprint ?? ""} completed.`
+      : orchActive ? `Sprint ${orch?.active_sprint ?? ""} active — ${(orch?.current_phase ?? "").replace(/_/g, " ")}.`
+      : !giDone ? "Generate GLOBAL_INSTRUCTIONS.md first."
+      : "Initialize a sprint to track build progress.",
+    action: !orchActive && orchCanInit ? "Initialize Sprint Orchestrator." : undefined,
+    anchorId: "sprint-orchestrator-card",
+  });
+
+  steps.push({
+    id: "build_prompt",
+    label: "Generate Build Prompt",
+    status: buildPromptDone ? "complete" : !orchActive ? "locked" : "current",
+    description: buildPromptDone ? "Build prompt is ready to copy."
+      : !orchActive ? "Initialize sprint orchestrator first."
+      : "Generate the build prompt, then copy it into Claude Code.",
+    action: !buildPromptDone && orchActive ? "Generate Build Prompt." : undefined,
+    anchorId: "sprint-orchestrator-card",
+    artifactHint: orch?.build_prompt_artifact ?? undefined,
+  });
+
+  steps.push({
+    id: "manual_build",
+    label: "Copy Prompt into Claude Code",
+    status: buildAttemptDone ? "complete" : !buildPromptDone ? "locked" : "current",
+    description: buildAttemptDone ? "Build attempt completed."
+      : !buildPromptDone ? "Generate build prompt first."
+      : "Copy the build prompt into Claude Code, then record the build result here.",
+    action: !buildAttemptDone && buildPromptDone
+      ? "Copy prompt into Claude Code, then record build result." : undefined,
+    anchorId: "sprint-orchestrator-card",
+  });
+
+  steps.push({
+    id: "record_checks",
+    label: "Record Smoke / Review / Governance",
+    status: allChecksOk ? "complete"
+      : !buildAttemptDone ? "locked"
+      : isFailed ? "blocked"
+      : "current",
+    description: allChecksOk ? "All checks passed or waived."
+      : !buildAttemptDone ? "Complete build attempt first."
+      : isFailed ? `${(orch?.current_phase ?? "check").replace(/_/g, " ")} — record a fix and retry.`
+      : "Record smoke, review, and governance results.",
+    action: !allChecksOk && buildAttemptDone ? "Record smoke, review, and governance results." : undefined,
+    anchorId: "sprint-orchestrator-card",
+  });
+
+  const finalStatus: WFStepStatus = orchCompleted ? "complete"
+    : !buildAttemptDone ? "locked"
+    : orch?.status === "ready_for_completion" ? "ready"
+    : orchActive ? "current"
+    : "locked";
+
+  steps.push({
+    id: "handoff_or_completion",
+    label: orchCompleted ? "Sprint Completed"
+      : orch?.status === "ready_for_completion" ? "Approve Completion"
+      : "Handoff or Fix",
+    status: finalStatus,
+    description: orchCompleted ? "Sprint completion approved."
+      : !buildAttemptDone ? "Record build and checks first."
+      : orch?.status === "ready_for_completion" ? "All checks passed — approve sprint completion."
+      : isFailed ? "Generate a fix or continuation prompt to continue work."
+      : orchActive ? "Generate handoff or continuation prompt."
+      : "Complete earlier steps first.",
+    action: orchCompleted ? undefined
+      : orch?.status === "ready_for_completion" ? "Approve Sprint Completion."
+      : orchActive ? "Generate Handoff, Fix, or Continuation Prompt." : undefined,
+    anchorId: "sprint-orchestrator-card",
+    artifactHint: orch?.completion_approval_artifact ?? orch?.handoff_artifact ?? undefined,
+  });
+
+  return steps;
+}
+
+function getGuidedWorkflowNextAction(
+  steps: WFStep[],
+  orchNextAction?: string | null,
+  operatorNextAction?: string | null,
+): string {
+  if (orchNextAction) return orchNextAction;
+  const active = steps.find(s => (s.status === "current" || s.status === "ready") && s.action);
+  if (active?.action) return active.action;
+  if (operatorNextAction) return operatorNextAction;
+  const first = steps.find(s => s.action);
+  return first?.action ?? "All steps complete.";
+}
+
+const WF_STATUS_BADGE: Record<WFStepStatus, { label: string; cls: string }> = {
+  complete: { label: "Complete", cls: "delivery-badge-ok" },
+  current:  { label: "Current",  cls: "delivery-badge-plan" },
+  ready:    { label: "Ready",    cls: "delivery-badge-warn" },
+  locked:   { label: "Locked",   cls: "delivery-badge-idle" },
+  blocked:  { label: "Blocked",  cls: "delivery-badge-fail" },
+};
+
+function GuidedWorkflowCard({ runId, run, onSelectArtifact }: {
+  runId: string;
+  run: RunDetail | null;
+  onSelectArtifact?: (artifact: string) => void;
+}) {
+  const [orchData, setOrchData] = useState<{
+    state: SprintOrchestratorState | null;
+    can_initialize: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    getSprintOrchestrator(runId)
+      .then(r => setOrchData({ state: r.state, can_initialize: r.can_initialize ?? false }))
+      .catch(() => {});
+  }, [runId]);
+
+  const gate = run?.operator_summary?.planning_gate;
+  if (gate?.planning_stage === "build_not_applicable") return null;
+
+  const artifacts = run?.artifacts ?? [];
+  const steps = deriveGuidedWorkflowSteps(gate, artifacts, orchData);
+  const nextAction = getGuidedWorkflowNextAction(
+    steps,
+    orchData?.state?.next_action,
+    run?.operator_summary?.next_safe_action,
+  );
+
+  const scrollTo = (id: string) => {
+    document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  return (
+    <div className="delivery-card gwf-card">
+      <div className="delivery-card-header">
+        <div className="delivery-card-title">Guided Workflow</div>
+      </div>
+      <div className="gwf-next-action">
+        <span className="gwf-next-action-label">Next safe action</span>
+        <span className="gwf-next-action-text">{nextAction}</span>
+      </div>
+      <ol className="gwf-step-list">
+        {steps.map((step, i) => {
+          const badge = WF_STATUS_BADGE[step.status];
+          return (
+            <li key={step.id} className={`gwf-step gwf-step-${step.status}`}>
+              <span className="gwf-step-num">{i + 1}</span>
+              <div className="gwf-step-body">
+                <div className="gwf-step-header">
+                  <span className="gwf-step-label">{step.label}</span>
+                  <span className={`delivery-badge ${badge.cls}`}>{badge.label}</span>
+                </div>
+                <div className="gwf-step-desc">{step.description}</div>
+                {(step.anchorId || step.artifactHint) && (
+                  <div className="gwf-step-actions">
+                    {step.anchorId && (
+                      <button className="gwf-go-btn" onClick={() => scrollTo(step.anchorId!)}>
+                        Go to {step.label}
+                      </button>
+                    )}
+                    {step.artifactHint && (
+                      <button className="gwf-go-btn" onClick={() => onSelectArtifact?.(step.artifactHint!)}>
+                        View artifact
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
+}
+
 function OperatorSummaryCard({ run }: { run: RunDetail | null }) {
   if (!run) return null;
   const s = run.operator_summary;
@@ -2750,7 +3023,7 @@ function RequirementsConversationCard({
   const canApprove = (convResp?.can_approve ?? false) && !isApproved;
 
   return (
-    <div className="delivery-card operator-summary-card" style={{ marginTop: "0.75rem" }}>
+    <div id="requirements-conversation-card" className="delivery-card operator-summary-card" style={{ marginTop: "0.75rem" }}>
       <div className="delivery-card-header">
         <div className="delivery-card-title">Requirements Conversation</div>
         <span className={`delivery-badge ${isApproved ? "delivery-badge-ok" : statusBadge === "questions_pending" ? "delivery-badge-warn" : "delivery-badge-info"}`} style={{ marginLeft: "auto" }}>
@@ -3009,7 +3282,7 @@ function ArchitectureConversationCard({
   const canApprove = (archResp?.can_approve ?? false) && !isApproved;
 
   return (
-    <div className="delivery-card operator-summary-card" style={{ marginTop: "0.75rem" }}>
+    <div id="architecture-conversation-card" className="delivery-card operator-summary-card" style={{ marginTop: "0.75rem" }}>
       <div className="delivery-card-header">
         <div className="delivery-card-title">Architecture Conversation</div>
         <span className={`delivery-badge ${isApproved ? "delivery-badge-ok" : !canStart ? "delivery-badge-info" : "delivery-badge-warn"}`} style={{ marginLeft: "auto" }}>
@@ -3246,7 +3519,7 @@ function GlobalInstructionsCard({
   const blockingReason = status?.blocking_reason;
 
   return (
-    <div className="delivery-card">
+    <div id="global-instructions-card" className="delivery-card">
       <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}>
         <strong>Global Instructions</strong>
         {giExists ? (
@@ -3344,6 +3617,13 @@ function SprintOrchestratorCard({
   const [sprintInput, setSprintInput] = useState("1");
   const [approvalNote, setApprovalNote] = useState("");
   const [showApproval, setShowApproval] = useState(false);
+  const [recType, setRecType] = useState<"build" | "smoke" | "review" | "governance">("build");
+  const [recStatus, setRecStatus] = useState("completed");
+  const [recSummary, setRecSummary] = useState("");
+  const [recArtifact, setRecArtifact] = useState("");
+  const [recWaiverReason, setRecWaiverReason] = useState("");
+  const [recBusy, setRecBusy] = useState(false);
+  const [recError, setRecError] = useState<string | null>(null);
 
   const load = () => {
     setLoading(true);
@@ -3401,8 +3681,37 @@ function SprintOrchestratorCard({
     </button>
   );
 
+  const handleRecord = async () => {
+    if (!isActive) return;
+    setRecBusy(true); setRecError(null);
+    try {
+      const sum = recSummary || undefined;
+      const art = recArtifact || undefined;
+      let r;
+      if (recType === "build") {
+        r = await recordSprintBuildAttempt(runId, recStatus, sum, [], art);
+      } else if (recType === "smoke") {
+        const waived = recStatus === "waived";
+        r = await recordSprintSmokeResult(runId, recStatus, sum, art, waived, waived ? recWaiverReason : undefined);
+      } else if (recType === "review") {
+        const waived = recStatus === "waived";
+        r = await recordSprintReviewResult(runId, recStatus, sum, art, waived, waived ? recWaiverReason : undefined);
+      } else {
+        const waived = recStatus === "waived";
+        r = await recordSprintGovernanceResult(runId, recStatus, sum, art, waived, waived ? recWaiverReason : undefined);
+      }
+      updateState(r);
+      setRecSummary(""); setRecArtifact(""); setRecWaiverReason("");
+    } catch (e: unknown) { setRecError(e instanceof Error ? e.message : String(e)); }
+    finally { setRecBusy(false); }
+  };
+
+  const buildStatuses = ["completed", "failed", "interrupted"];
+  const checkStatuses = ["passed", "failed", "waived"];
+  const recStatuses = recType === "build" ? buildStatuses : checkStatuses;
+
   return (
-    <div className="delivery-card">
+    <div id="sprint-orchestrator-card" className="delivery-card">
       <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}>
         <strong>Sprint Orchestrator</strong>
         <span className="delivery-badge" style={statusBadgeStyle(state?.status ?? "not_started")}>
@@ -3522,6 +3831,46 @@ function SprintOrchestratorCard({
           <button className="delivery-card-action" onClick={() => onSelectArtifact?.("sprint_orchestrator_state.json")}>View Orchestrator State</button>
         )}
       </div>
+
+      {/* Manual result recording — collapsed by default */}
+      {isActive && !isCompleted && (
+        <details className="gwf-record-details">
+          <summary>Record result manually</summary>
+          <div className="gwf-record-body">
+            <div className="gwf-record-row">
+              <label>Type</label>
+              <select value={recType} onChange={e => { setRecType(e.target.value as typeof recType); setRecStatus(e.target.value === "build" ? "completed" : "passed"); }}>
+                <option value="build">Build attempt</option>
+                <option value="smoke">Smoke check</option>
+                <option value="review">Review</option>
+                <option value="governance">Governance</option>
+              </select>
+              <label>Status</label>
+              <select value={recStatus} onChange={e => setRecStatus(e.target.value)}>
+                {recStatuses.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+            <div className="gwf-record-row">
+              <label>Summary (optional)</label>
+              <input type="text" value={recSummary} onChange={e => setRecSummary(e.target.value)} placeholder="Brief summary of the result" />
+            </div>
+            <div className="gwf-record-row">
+              <label>Artifact filename (optional)</label>
+              <input type="text" value={recArtifact} onChange={e => setRecArtifact(e.target.value)} placeholder="e.g. smoke_log.txt" />
+            </div>
+            {recType !== "build" && recStatus === "waived" && (
+              <div className="gwf-record-row">
+                <label>Waiver reason (required for waived)</label>
+                <input type="text" value={recWaiverReason} onChange={e => setRecWaiverReason(e.target.value)} placeholder="Why this check is waived" />
+              </div>
+            )}
+            {recError && <div className="delivery-warning-panel" style={{ marginTop: "0.4rem" }}>{recError}</div>}
+            <button className="delivery-card-action" style={{ marginTop: "0.5rem" }} disabled={recBusy || !!busy} onClick={handleRecord}>
+              {recBusy ? "Saving…" : "Save result"}
+            </button>
+          </div>
+        </details>
+      )}
     </div>
   );
 }
@@ -4493,6 +4842,8 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
 
             {/* 1. Operator Summary — decision-focused, always first. */}
             <OperatorSummaryCard run={run} />
+            {/* 1a. Guided Workflow — stepper showing where we are and what comes next. */}
+            <GuidedWorkflowCard runId={runId} run={run} onSelectArtifact={setSelected} />
             {/* 1b. Requirements Conversation — interactive sign-off before architecture. */}
             <RequirementsConversationCard runId={runId} onSelectArtifact={setSelected} />
             {/* 1c. Architecture Conversation — stack/data/workflow decisions before build. */}
