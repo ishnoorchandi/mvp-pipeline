@@ -2756,7 +2756,10 @@ function GuidedWorkflowCard({ runId, run, onSelectArtifact }: {
   return (
     <div className="delivery-card gwf-card">
       <div className="delivery-card-header">
-        <div className="delivery-card-title">Guided Workflow</div>
+        <div>
+          <div className="delivery-card-title">Guided Workflow</div>
+          <div className="delivery-card-sub">Prepares safe prompts and records results. Does not execute Claude Code directly.</div>
+        </div>
       </div>
       <div className="gwf-next-action">
         <span className="gwf-next-action-label">Next safe action</span>
@@ -2910,9 +2913,19 @@ function PlanningGateCard({ gate }: { gate?: PlanningGateState | null }): ReactE
               : <span className="delivery-badge delivery-badge-fail">Blocked</span>}
         </div>
       </div>
-      {gateBlocked && (
+      {gateBlocked && gate.planning_gate_reason && (
         <div className="delivery-warning-panel delivery-warning-panel-severe">
-          Build blocked until architecture is approved and global instructions are created.
+          {gate.planning_gate_reason}
+        </div>
+      )}
+      {gateBlocked && !gate.planning_gate_reason && (
+        <div className="delivery-warning-panel delivery-warning-panel-severe">
+          Build blocked — requirements, architecture, and GLOBAL_INSTRUCTIONS.md must all be approved.
+        </div>
+      )}
+      {!gateBlocked && gateAllowed && (
+        <div style={{ fontSize: "11.5px", color: "var(--text3)", marginTop: "0.5rem", padding: "4px 2px" }}>
+          Planning approval granted. Other safety gates (sandbox mode, company repo, sprint quality) may still apply.
         </div>
       )}
     </div>
@@ -3712,12 +3725,15 @@ function SprintOrchestratorCard({
 
   return (
     <div id="sprint-orchestrator-card" className="delivery-card">
-      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.25rem" }}>
         <strong>Sprint Orchestrator</strong>
         <span className="delivery-badge" style={statusBadgeStyle(state?.status ?? "not_started")}>
           {state?.status ? state.status.replace(/_/g, " ") : "Not started"}
         </span>
       </div>
+      <p style={{ fontSize: "0.78rem", color: "var(--text3)", margin: "0 0 0.5rem" }}>
+        Tracks sprint state and generates prompts. Does not edit code or run checks.
+      </p>
 
       {error && <div className="delivery-warning-panel" style={{ marginBottom: "0.5rem" }}>{error}</div>}
 
