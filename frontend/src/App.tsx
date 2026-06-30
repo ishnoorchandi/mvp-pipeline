@@ -6,11 +6,12 @@ import {
   getGitSyncState, getGitPullState, getPrDeliveryPlanState, getPrBranchPrepState,
   getPrRemoteDeliveryState, getRepoHygieneState,
   getRequirementsConversation, saveRequirementsAnswer, approveRequirements,
+  getArchitectureConversation, saveArchitectureAnswer, approveArchitecture,
 } from "./api";
 import type {
   RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState,
   PrDeliveryPlanState, PrBranchPrepState, PrRemoteDeliveryState, RepoHygieneSummary,
-  PlanningGateState, RequirementsQuestion,
+  PlanningGateState, RequirementsQuestion, ArchitectureQuestion,
 } from "./api";
 import "./App.css";
 
@@ -2906,6 +2907,278 @@ function RequirementsConversationCard({
   );
 }
 
+// Architecture Conversation — interactive Q&A for stack, data model, and build
+// workflow decisions. Gated behind requirements approval. Universal across all
+// build-capable entry points (raw_idea, written_requirements, existing_app_upgrade).
+function ArchitectureConversationCard({
+  runId, onSelectArtifact, onPlanningGateUpdated,
+}: {
+  runId: string;
+  onSelectArtifact?: (artifact: string) => void;
+  onPlanningGateUpdated?: () => void;
+}): ReactElement | null {
+  const [archResp, setArchResp] = useState<import("./api").ArchitectureConversationResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState<string | null>(null);
+  const [approving, setApproving] = useState(false);
+  const [draftAnswers, setDraftAnswers] = useState<Record<string, { answer: string; freeform: string }>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  const reload = () => {
+    setLoading(true);
+    getArchitectureConversation(runId)
+      .then(r => {
+        setArchResp(r);
+        const synced: Record<string, { answer: string; freeform: string }> = {};
+        for (const q of r.conversation.questions) {
+          synced[q.id] = { answer: q.answer ?? "", freeform: q.freeform_answer ?? "" };
+        }
+        setDraftAnswers(synced);
+        setError(null);
+      })
+      .catch(() => setError("Failed to load architecture conversation."))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { reload(); }, [runId]);
+
+  if (loading) return (
+    <div className="delivery-card operator-summary-card" style={{ marginTop: "0.75rem" }}>
+      <div className="delivery-card-header"><div className="delivery-card-title">Architecture Conversation</div></div>
+      <div style={{ padding: "0.75rem", color: "var(--text-secondary, #888)" }}>Loading…</div>
+    </div>
+  );
+
+  const conv = archResp?.conversation;
+  if (!conv) return null;
+
+  // Hide for read-only or not-applicable workflows
+  if (conv.architecture_status === "not_applicable") return null;
+
+  const isApproved = conv.architecture_approved === true;
+  const canStart = archResp?.can_start !== false;
+  const blockingReason = archResp?.blocking_reason;
+
+  const statusLabel: Record<string, string> = {
+    not_started: "Not started", draft: "Draft", questions_pending: "Questions pending",
+    review: "In review", approved: "Approved", unknown: "Unknown",
+  };
+  const statusBadge = conv.architecture_status ?? "not_started";
+
+  const handleDraftChange = (qid: string, field: "answer" | "freeform", value: string) => {
+    setDraftAnswers(prev => ({
+      ...prev,
+      [qid]: { ...(prev[qid] ?? { answer: "", freeform: "" }), [field]: value },
+    }));
+  };
+
+  const handleSave = async (qid: string) => {
+    const draft = draftAnswers[qid] ?? { answer: "", freeform: "" };
+    setSaving(qid);
+    setError(null);
+    try {
+      const updated = await saveArchitectureAnswer(runId, qid, draft.answer || null, draft.freeform);
+      setArchResp(updated);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to save.");
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  const handleApprove = async () => {
+    setApproving(true);
+    setError(null);
+    try {
+      const result = await approveArchitecture(runId);
+      setArchResp(result);
+      onPlanningGateUpdated?.();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Approval failed.");
+    } finally {
+      setApproving(false);
+    }
+  };
+
+  const unanswered = archResp?.unanswered_required ?? [];
+  const canApprove = (archResp?.can_approve ?? false) && !isApproved;
+
+  return (
+    <div className="delivery-card operator-summary-card" style={{ marginTop: "0.75rem" }}>
+      <div className="delivery-card-header">
+        <div className="delivery-card-title">Architecture Conversation</div>
+        <span className={`delivery-badge ${isApproved ? "delivery-badge-ok" : !canStart ? "delivery-badge-info" : "delivery-badge-warn"}`} style={{ marginLeft: "auto" }}>
+          {isApproved ? "Approved" : (statusLabel[statusBadge] ?? statusBadge.replace(/_/g, " "))}
+        </span>
+      </div>
+      <div style={{ padding: "0 0.75rem 0.25rem", color: "var(--text-secondary, #888)", fontSize: "0.82rem" }}>
+        Choose the stack, data model, and build workflow before final sign-off.
+      </div>
+
+      {/* Locked state — requirements not yet approved */}
+      {!canStart && blockingReason && (
+        <div className="delivery-warning-panel" style={{ margin: "0 0.75rem 0.75rem", background: "var(--bg-subtle, #f5f8ff)" }}>
+          {blockingReason}
+        </div>
+      )}
+
+      {/* Draft + approved artifact buttons */}
+      {canStart && (
+        <div style={{ display: "flex", gap: "0.5rem", padding: "0 0.75rem 0.5rem", flexWrap: "wrap" }}>
+          {conv.draft_architecture_artifact && (
+            <button className="delivery-badge delivery-badge-info" style={{ cursor: "pointer", border: "none", fontSize: "0.78rem" }}
+              onClick={() => onSelectArtifact?.(conv.draft_architecture_artifact!)}>
+              View Architecture Draft
+            </button>
+          )}
+          {conv.approved_architecture_artifact && (
+            <button className="delivery-badge delivery-badge-ok" style={{ cursor: "pointer", border: "none", fontSize: "0.78rem" }}
+              onClick={() => onSelectArtifact?.(conv.approved_architecture_artifact!)}>
+              View Approved Architecture
+            </button>
+          )}
+        </div>
+      )}
+
+      {error && (
+        <div className="delivery-warning-panel delivery-warning-panel-severe" style={{ margin: "0 0.75rem 0.5rem" }}>
+          {error}
+        </div>
+      )}
+
+      {/* Questions — only when can_start */}
+      {canStart && (
+        <div style={{ padding: "0 0.75rem" }}>
+          {conv.questions.map((q: ArchitectureQuestion) => {
+            const draft = draftAnswers[q.id] ?? { answer: q.answer ?? "", freeform: q.freeform_answer ?? "" };
+            const isSaved = !!q.answer || !!q.freeform_answer;
+            return (
+              <div key={q.id} style={{ marginBottom: "1rem", paddingBottom: "0.75rem", borderBottom: "1px solid var(--border, #eee)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", marginBottom: "0.25rem" }}>
+                  <span style={{ fontWeight: 600, fontSize: "0.85rem" }}>{q.label}</span>
+                  {q.required !== false && <span style={{ color: "var(--text-secondary, #888)", fontSize: "0.75rem" }}>*</span>}
+                  {isSaved && !isApproved && <span className="delivery-badge delivery-badge-ok" style={{ fontSize: "0.72rem" }}>Saved</span>}
+                </div>
+                <div style={{ fontSize: "0.82rem", marginBottom: "0.3rem", color: "var(--text-body, #333)" }}>{q.question}</div>
+                {q.why && <div style={{ fontSize: "0.77rem", color: "var(--text-secondary, #888)", marginBottom: "0.4rem" }}>{q.why}</div>}
+                {q.recommended && <div style={{ fontSize: "0.77rem", color: "var(--text-secondary, #888)", marginBottom: "0.4rem" }}>Recommended: <em>{q.recommended}</em></div>}
+
+                {!isApproved && q.type === "single_choice" && (
+                  <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginBottom: "0.3rem" }}>
+                    {q.options.map(opt => (
+                      <button key={opt}
+                        className={`delivery-badge ${draft.answer === opt ? "delivery-badge-ok" : "delivery-badge-info"}`}
+                        style={{ cursor: "pointer", border: "none", fontSize: "0.8rem" }}
+                        onClick={() => handleDraftChange(q.id, "answer", opt)}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {!isApproved && q.type === "multi_choice" && (
+                  <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginBottom: "0.3rem" }}>
+                    {q.options.map(opt => {
+                      const selected = (draft.answer ?? "").split("|").map(s => s.trim()).filter(Boolean);
+                      const isSel = selected.includes(opt);
+                      return (
+                        <button key={opt}
+                          className={`delivery-badge ${isSel ? "delivery-badge-ok" : "delivery-badge-info"}`}
+                          style={{ cursor: "pointer", border: "none", fontSize: "0.8rem" }}
+                          onClick={() => {
+                            const next = isSel ? selected.filter(s => s !== opt) : [...selected, opt];
+                            handleDraftChange(q.id, "answer", next.join(" | "));
+                          }}>
+                          {opt}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {!isApproved && q.type === "yes_no" && (
+                  <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.3rem" }}>
+                    {["Yes", "No"].map(opt => (
+                      <button key={opt}
+                        className={`delivery-badge ${draft.answer === opt ? "delivery-badge-ok" : "delivery-badge-info"}`}
+                        style={{ cursor: "pointer", border: "none", fontSize: "0.8rem", minWidth: "3.5rem" }}
+                        onClick={() => handleDraftChange(q.id, "answer", opt)}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {!isApproved && q.type === "short_text" && (
+                  <input type="text" value={draft.answer} placeholder="Your answer…"
+                    style={{ width: "100%", fontSize: "0.82rem", padding: "0.35rem 0.5rem", borderRadius: 4, border: "1px solid var(--border, #ccc)", boxSizing: "border-box" }}
+                    onChange={e => handleDraftChange(q.id, "answer", e.target.value)} />
+                )}
+
+                {!isApproved && q.type === "long_text" && (
+                  <textarea value={draft.answer} placeholder="Your answer…" rows={3}
+                    style={{ width: "100%", fontSize: "0.82rem", padding: "0.35rem 0.5rem", borderRadius: 4, border: "1px solid var(--border, #ccc)", resize: "vertical", boxSizing: "border-box" }}
+                    onChange={e => handleDraftChange(q.id, "answer", e.target.value)} />
+                )}
+
+                {!isApproved && (q.type === "single_choice" || q.type === "yes_no") && (
+                  <input type="text" value={draft.freeform} placeholder="Add notes (optional)…"
+                    style={{ width: "100%", fontSize: "0.8rem", padding: "0.3rem 0.5rem", marginTop: "0.3rem", borderRadius: 4, border: "1px solid var(--border, #ccc)", boxSizing: "border-box" }}
+                    onChange={e => handleDraftChange(q.id, "freeform", e.target.value)} />
+                )}
+
+                {isApproved && (
+                  <div style={{ fontSize: "0.82rem", background: "var(--bg-subtle, #f5f5f5)", padding: "0.4rem 0.6rem", borderRadius: 4 }}>
+                    {q.answer || q.freeform_answer || <em style={{ color: "var(--text-secondary, #888)" }}>No answer recorded</em>}
+                  </div>
+                )}
+
+                {!isApproved && (
+                  <button
+                    disabled={saving === q.id}
+                    style={{ marginTop: "0.4rem", fontSize: "0.78rem", padding: "0.3rem 0.8rem", borderRadius: 4, border: "1px solid var(--border, #ccc)", cursor: "pointer", background: "var(--bg-btn, #fff)" }}
+                    onClick={() => handleSave(q.id)}>
+                    {saving === q.id ? "Saving…" : "Save Answer"}
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Approve section */}
+      {canStart && !isApproved && (
+        <div style={{ padding: "0.5rem 0.75rem 0.75rem", borderTop: "1px solid var(--border, #eee)", display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+          <button
+            disabled={!canApprove || approving}
+            style={{
+              fontSize: "0.85rem", padding: "0.4rem 1.2rem", borderRadius: 4,
+              border: canApprove ? "1px solid #22863a" : "1px solid var(--border, #ccc)",
+              background: canApprove ? "#22863a" : "var(--bg-btn, #f5f5f5)",
+              color: canApprove ? "#fff" : "var(--text-secondary, #888)",
+              cursor: canApprove ? "pointer" : "not-allowed",
+            }}
+            onClick={handleApprove}>
+            {approving ? "Approving…" : "Approve Architecture"}
+          </button>
+          {unanswered.length > 0 && (
+            <span style={{ fontSize: "0.78rem", color: "var(--text-secondary, #888)" }}>
+              {unanswered.length} required question{unanswered.length > 1 ? "s" : ""} remaining
+            </span>
+          )}
+        </div>
+      )}
+
+      {isApproved && (
+        <div className="delivery-warning-panel" style={{ margin: "0.5rem 0.75rem 0.75rem", background: "var(--bg-success, #eafbea)", borderColor: "#22863a" }}>
+          Architecture approved. Global instructions still need to be created before build.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Primary Outputs — the handful of artifacts that actually matter for this
 // run, in priority order, reusing the existing artifact viewer (no new viewer
 // component). Only ever shows artifacts that exist; renders nothing if none do.
@@ -3875,6 +4148,8 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             <OperatorSummaryCard run={run} />
             {/* 1b. Requirements Conversation — interactive sign-off before architecture. */}
             <RequirementsConversationCard runId={runId} onSelectArtifact={setSelected} />
+            {/* 1c. Architecture Conversation — stack/data/workflow decisions before build. */}
+            <ArchitectureConversationCard runId={runId} onSelectArtifact={setSelected} />
             {/* 2. Primary Outputs — the handful of artifacts that matter. */}
             <PrimaryOutputsCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             {/* 3. Planning Progress / Build Workspace. */}

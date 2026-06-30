@@ -12,6 +12,9 @@ Routes:
   GET  /api/runs/<run_id>/requirements-conversation                 → load (or lazily init) requirements conversation
   POST /api/runs/<run_id>/requirements-conversation/answer          → save one question answer
   POST /api/runs/<run_id>/requirements-conversation/approve         → approve requirements
+  GET  /api/runs/<run_id>/architecture-conversation                 → load (or lazily init) architecture conversation
+  POST /api/runs/<run_id>/architecture-conversation/answer          → save one architecture answer
+  POST /api/runs/<run_id>/architecture-conversation/approve         → approve architecture
   GET  /health                                                      → health check
 """
 
@@ -36,6 +39,7 @@ sys.path.insert(0, str(BASE_DIR))
 import delivery as delivery_mod  # noqa: E402 — needs BASE_DIR on sys.path first
 import planning_gate as planning_gate_mod  # noqa: E402
 import requirements_conversation as req_conv_mod  # noqa: E402
+import architecture_conversation as arch_conv_mod  # noqa: E402
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -876,6 +880,106 @@ def approve_requirements(run_id: str):
         abort(400, result.get("error") or "Approval failed")
 
     # Re-read planning gate from updated artifacts
+    planning_gate = planning_gate_mod.build_planning_gate_from_run_state(state, run_dir=run_dir)
+    return jsonify({
+        "run_id": run_id,
+        "approved": True,
+        "conversation": result["state"],
+        "planning_gate": planning_gate,
+    })
+
+
+# ── Architecture Conversation ─────────────────────────────────────────────────
+
+@app.route("/api/runs/<run_id>/architecture-conversation", methods=["GET"])
+def get_architecture_conversation(run_id: str):
+    """Return (or lazily initialize) the architecture conversation for a run.
+
+    Returns can_start=False with a blocking_reason when requirements are not yet
+    approved. Safe for older runs — gracefully degrades to a not_started state.
+    """
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    state = load_state(run_id)
+    if state is None:
+        abort(404, f"Run {run_id} state not found")
+
+    conversation = arch_conv_mod.lazy_init_from_run_state(run_dir, state)
+    can_start = conversation.get("can_start", True)
+    blocking_reason = conversation.get("blocking_reason")
+
+    # can_start defaults to True for initialized conversations
+    if "can_start" not in conversation:
+        ok, br = arch_conv_mod.can_start_architecture(run_dir)
+        can_start = ok
+        blocking_reason = br
+
+    planning_gate = planning_gate_mod.build_planning_gate_from_run_state(state, run_dir=run_dir)
+    unanswered = arch_conv_mod.get_unanswered_required(conversation)
+    return jsonify({
+        "run_id": run_id,
+        "conversation": conversation,
+        "planning_gate": planning_gate,
+        "can_start": can_start,
+        "blocking_reason": blocking_reason,
+        "can_approve": len(unanswered) == 0 and not conversation.get("architecture_approved"),
+        "unanswered_required": unanswered,
+    })
+
+
+@app.route("/api/runs/<run_id>/architecture-conversation/answer", methods=["POST"])
+def save_architecture_answer(run_id: str):
+    """Save one architecture question answer."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    body = request.get_json(silent=True) or {}
+    question_id = (body.get("question_id") or "").strip()
+    if not question_id:
+        abort(400, "question_id is required")
+    answer = body.get("answer")
+    freeform_answer = (body.get("freeform_answer") or "").strip()
+
+    state = load_state(run_id)
+    if state is None:
+        abort(404, f"Run {run_id} state not found")
+
+    # Lazy-init if needed
+    arch_conv_mod.lazy_init_from_run_state(run_dir, state)
+
+    try:
+        updated = arch_conv_mod.save_answer(run_dir, question_id, answer, freeform_answer)
+    except ValueError as exc:
+        abort(400, str(exc))
+
+    unanswered = arch_conv_mod.get_unanswered_required(updated)
+    return jsonify({
+        "run_id": run_id,
+        "conversation": updated,
+        "can_approve": len(unanswered) == 0 and not updated.get("architecture_approved"),
+        "unanswered_required": unanswered,
+    })
+
+
+@app.route("/api/runs/<run_id>/architecture-conversation/approve", methods=["POST"])
+def approve_architecture(run_id: str):
+    """Approve architecture: merge draft + answers → approved_architecture.md + signoff.
+
+    Does NOT generate GLOBAL_INSTRUCTIONS.md or start build. Returns updated
+    planning_gate so the UI can refresh the Planning Gate card.
+    """
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    state = load_state(run_id)
+    if state is None:
+        abort(404, f"Run {run_id} state not found")
+
+    result = arch_conv_mod.approve_architecture(run_dir)
+    if not result["approved"]:
+        abort(400, result.get("error") or "Architecture approval failed")
+
     planning_gate = planning_gate_mod.build_planning_gate_from_run_state(state, run_dir=run_dir)
     return jsonify({
         "run_id": run_id,

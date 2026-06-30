@@ -280,6 +280,82 @@ export async function approveRequirements(runId: string): Promise<RequirementsCo
   return r.json();
 }
 
+// ── Architecture Conversation ─────────────────────────────────────────────────
+
+export interface ArchitectureQuestion {
+  id: string;
+  label: string;
+  question: string;
+  type: QuestionType;
+  options: string[];
+  recommended?: string;
+  answer?: string | null;
+  freeform_answer?: string;
+  why?: string;
+  required?: boolean;
+}
+
+export interface ArchitectureConversationState {
+  entry_point?: string;
+  architecture_status?: "not_started" | "draft" | "questions_pending" | "review" | "approved" | "not_applicable" | string;
+  requirements_approved?: boolean;
+  questions: ArchitectureQuestion[];
+  answers: Record<string, string | null>;
+  draft_architecture_artifact?: string | null;
+  approved_architecture_artifact?: string | null;
+  architecture_approved?: boolean;
+  can_start?: boolean;
+  blocking_reason?: string | null;
+  updated_at?: string;
+}
+
+export interface ArchitectureConversationResponse {
+  run_id: string;
+  conversation: ArchitectureConversationState;
+  planning_gate?: PlanningGateState;
+  can_start?: boolean;
+  blocking_reason?: string | null;
+  can_approve?: boolean;
+  unanswered_required?: string[];
+}
+
+export async function getArchitectureConversation(runId: string): Promise<ArchitectureConversationResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/architecture-conversation`);
+  if (!r.ok) throw new Error(`Failed to fetch architecture conversation for ${runId}`);
+  return r.json();
+}
+
+export async function saveArchitectureAnswer(
+  runId: string,
+  questionId: string,
+  answer: string | null,
+  freeformAnswer?: string,
+): Promise<ArchitectureConversationResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/architecture-conversation/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question_id: questionId, answer, freeform_answer: freeformAnswer ?? "" }),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to save answer: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function approveArchitecture(runId: string): Promise<ArchitectureConversationResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/architecture-conversation/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Architecture approval failed: ${msg}`);
+  }
+  return r.json();
+}
+
 export async function getRuns(): Promise<RunSummary[]> {
   const r = await fetch(`${BASE}/api/runs`);
   if (!r.ok) throw new Error("Failed to fetch runs");

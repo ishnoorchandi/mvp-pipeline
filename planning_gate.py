@@ -279,25 +279,40 @@ def build_planning_gate_state(
             "planning_gate_reason": "Planning approval is not required for this workflow.",
         }
 
-    # Approval required — check what is missing
-    if not arch_approved and not gi_created:
+    # Approval required — check what is missing in order (req → arch → GI)
+    missing = []
+    if not req_approved:
+        missing.append("requirements")
+    if not arch_approved:
+        missing.append("architecture sign-off")
+    if not gi_created:
+        missing.append("global instructions")
+
+    if not missing:
+        allowed = True
+        reason = "All planning approvals satisfied; build allowed."
+    elif missing == ["requirements"]:
+        # Requirements not yet done; architecture and GI not yet applicable
+        allowed = False
+        reason = "Requirements approval is required before architecture planning."
+    elif missing == ["architecture sign-off"]:
+        allowed = False
+        reason = "Architecture approval is required before build."
+    elif missing == ["global instructions"]:
+        allowed = False
+        reason = "GLOBAL_INSTRUCTIONS.md is required before build."
+    elif "requirements" not in missing:
+        # Requirements approved; only arch and/or GI remain
         allowed = False
         reason = (
             "Claude Code build blocked: architecture sign-off and global instructions "
             "are required before build."
         )
-    elif not arch_approved:
-        allowed = False
-        reason = "Architecture approval is required before build."
-    elif not gi_created:
-        allowed = False
-        reason = "GLOBAL_INSTRUCTIONS.md is required before build."
-    elif not req_approved:
-        allowed = False
-        reason = "Requirements approval is required before build."
     else:
-        allowed = True
-        reason = "All planning approvals satisfied; build allowed."
+        # Requirements + others missing
+        parts = ", ".join(missing)
+        allowed = False
+        reason = f"Claude Code build blocked: {parts} are required before build."
 
     return {
         "entry_point": entry_point,
@@ -415,8 +430,8 @@ def build_planning_gate_from_run_state(
             "planning_gate_reason": run_state.get("planning_gate_reason", ""),
         }
 
-    # Infer for older runs
-    entry_point = infer_entry_point_from_run_state(run_state)
+    # Prefer explicit entry_point if present; fall back to inference for older runs
+    entry_point = run_state.get("entry_point") or infer_entry_point_from_run_state(run_state)
     execution_mode = run_state.get("execution_mode", "")
     build_requested = execution_mode not in ("plan_only", "build_blocked")
 
