@@ -16,6 +16,8 @@ frontend/dist/
 
 # generated runs / outputs
 runs/
+pr_branch_runs/
+pr_remote_runs/
 *.log
 
 # mac
