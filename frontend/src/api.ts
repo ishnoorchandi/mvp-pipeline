@@ -408,6 +408,175 @@ export async function generateGlobalInstructions(runId: string): Promise<GlobalI
   return r.json();
 }
 
+// ── Sprint Orchestrator ───────────────────────────────────────────────────────
+
+export interface SprintCheckRecord {
+  status: "passed" | "failed" | "waived" | string;
+  summary?: string | null;
+  artifact?: string | null;
+  waived?: boolean;
+  waiver_reason?: string | null;
+  recorded_at?: string;
+}
+
+export interface SprintBuildAttempt {
+  attempt_number: number;
+  status: "started" | "completed" | "failed" | "interrupted" | string;
+  summary?: string | null;
+  changed_files?: string[];
+  artifact?: string | null;
+  recorded_at?: string;
+}
+
+export interface SprintOrchestratorState {
+  status?: "not_started" | "active" | "blocked" | "ready_for_completion" | "completed" | string;
+  active_sprint?: number | null;
+  sprint_title?: string | null;
+  sprint_goal?: string | null;
+  sprint_quality?: { build_ready?: boolean; risk_level?: string; quality_score?: number | null } | null;
+  current_phase?: string;
+  last_completed_step?: string | null;
+  next_action?: string | null;
+  blocking_reason?: string | null;
+  requirements_artifact?: string;
+  global_instructions_artifact?: string;
+  approved_architecture_artifact?: string;
+  selected_sprint_artifact?: string | null;
+  handoff_artifact?: string | null;
+  user_note?: string | null;
+  attempts?: SprintBuildAttempt[];
+  smoke_checks?: SprintCheckRecord[];
+  review_checks?: SprintCheckRecord[];
+  governance_checks?: SprintCheckRecord[];
+  waivers?: { type?: string; reason?: string; recorded_at?: string }[];
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface SprintOrchestratorResponse {
+  run_id?: string;
+  state: SprintOrchestratorState | null;
+  can_initialize?: boolean;
+  blocking_reason?: string | null;
+  planning_gate?: PlanningGateState;
+  artifact?: string;
+}
+
+export async function getSprintOrchestrator(runId: string): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator`);
+  if (!r.ok) throw new Error(`Failed to fetch sprint orchestrator for ${runId}`);
+  return r.json();
+}
+
+export async function initSprintOrchestrator(
+  runId: string,
+  sprintNumber: number,
+  userNote?: string,
+): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator/init`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sprint_number: sprintNumber, user_note: userNote ?? null }),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to initialize sprint orchestrator: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function recordSprintBuildAttempt(
+  runId: string,
+  status: string,
+  summary?: string,
+  changedFiles?: string[],
+  artifact?: string,
+): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator/record-build-attempt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status, summary: summary ?? null, changed_files: changedFiles ?? [], artifact: artifact ?? null }),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to record build attempt: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function recordSprintSmokeResult(
+  runId: string,
+  status: string,
+  summary?: string,
+  artifact?: string,
+  waived?: boolean,
+  waiverReason?: string,
+): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator/record-smoke-result`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status, summary: summary ?? null, artifact: artifact ?? null, waived: !!waived, waiver_reason: waiverReason ?? null }),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to record smoke result: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function recordSprintReviewResult(
+  runId: string,
+  status: string,
+  summary?: string,
+  artifact?: string,
+  waived?: boolean,
+  waiverReason?: string,
+): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator/record-review-result`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status, summary: summary ?? null, artifact: artifact ?? null, waived: !!waived, waiver_reason: waiverReason ?? null }),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to record review result: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function recordSprintGovernanceResult(
+  runId: string,
+  status: string,
+  summary?: string,
+  artifact?: string,
+  waived?: boolean,
+  waiverReason?: string,
+): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator/record-governance-result`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status, summary: summary ?? null, artifact: artifact ?? null, waived: !!waived, waiver_reason: waiverReason ?? null }),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to record governance result: ${msg}`);
+  }
+  return r.json();
+}
+
+export async function generateSprintHandoff(runId: string): Promise<SprintOrchestratorResponse> {
+  const r = await fetch(`${BASE}/api/runs/${runId}/sprint-orchestrator/generate-handoff`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Failed to generate sprint handoff: ${msg}`);
+  }
+  return r.json();
+}
+
 export async function getRuns(): Promise<RunSummary[]> {
   const r = await fetch(`${BASE}/api/runs`);
   if (!r.ok) throw new Error("Failed to fetch runs");

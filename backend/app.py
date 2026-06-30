@@ -41,6 +41,7 @@ import planning_gate as planning_gate_mod  # noqa: E402
 import requirements_conversation as req_conv_mod  # noqa: E402
 import architecture_conversation as arch_conv_mod  # noqa: E402
 import global_instructions as gi_mod  # noqa: E402
+import sprint_orchestrator as so_mod  # noqa: E402
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -105,6 +106,7 @@ REPO_HEALTHS = (
 PRIMARY_ARTIFACT_PRIORITY = [
     "feature_sprint_plan.md", "sprint_quality_gate.md", "existing_feature_overlap_check.md",
     "feature_gap_matrix.md", "additive_architecture.md", "selected_feature_sprint_scope.md",
+    "sprint_orchestrator_state.json", "GLOBAL_INSTRUCTIONS.md", "requirements.md",
     "repo_hygiene_summary.md", "sandbox_patch_summary.md", "sandbox_changed_files.md",
     "sandbox_patch.diff", "apply_patch_instructions.md", "minimal_fix_plan.md",
     "backend_route_map.md", "backend_boundary_summary.md", "git_sync_report.md",
@@ -330,6 +332,16 @@ def build_operator_run_summary(run_dir: Path, run_state: dict, artifacts: list[s
         )
 
     primary_artifacts = [a for a in PRIMARY_ARTIFACT_PRIORITY if a in artifact_set][:6]
+
+    # Sprint orchestrator — overlay next_safe_action and inject handoff artifact if present.
+    orchestrator_state = _read_json_artifact(run_dir, "sprint_orchestrator_state.json")
+    if orchestrator_state and orchestrator_state.get("status") == "active":
+        orchestrator_next = orchestrator_state.get("next_action")
+        if orchestrator_next and next_safe_action in (None, "Review outputs", "Review run details"):
+            next_safe_action = orchestrator_next
+        handoff_artifact = orchestrator_state.get("handoff_artifact")
+        if handoff_artifact and handoff_artifact in artifact_set and handoff_artifact not in primary_artifacts:
+            primary_artifacts = ([handoff_artifact] + primary_artifacts)[:6]
 
     # Planning gate — infer from run_state; safe for older runs (falls back to unknown)
     planning_gate = planning_gate_mod.build_planning_gate_from_run_state(
@@ -1049,6 +1061,165 @@ def generate_global_instructions(run_id: str):
         "planning_gate": planning_gate,
         **gi_status,
     })
+
+
+# ── Sprint Orchestrator ────────────────────────────────────────────────────────
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator", methods=["GET"])
+def get_sprint_orchestrator(run_id: str):
+    """Return orchestrator state + can_initialize gate check."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    run_state = load_state(run_id) or {}
+    state = so_mod.load_orchestrator_state(run_dir)
+    can_init, blocking_reason = so_mod.can_initialize_orchestration(run_dir, run_state=run_state)
+    planning_gate = planning_gate_mod.build_planning_gate_from_run_state(run_state, run_dir=run_dir)
+    return jsonify({
+        "run_id": run_id,
+        "state": state,
+        "can_initialize": can_init,
+        "blocking_reason": blocking_reason,
+        "planning_gate": planning_gate,
+    })
+
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator/init", methods=["POST"])
+def init_sprint_orchestrator(run_id: str):
+    """Initialize (or idempotently return) orchestrator state for a sprint."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    body = request.get_json(force=True, silent=True) or {}
+    sprint_number = body.get("sprint_number")
+    if sprint_number is None:
+        abort(400, "sprint_number is required")
+    try:
+        sprint_number = int(sprint_number)
+    except (ValueError, TypeError):
+        abort(400, "sprint_number must be an integer")
+    user_note = body.get("user_note") or None
+    run_state = load_state(run_id) or {}
+    try:
+        state = so_mod.initialize_orchestrator(
+            run_dir, sprint_number, user_note=user_note, run_state=run_state,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        # Conflict: different sprint already active
+        if "already active" in msg:
+            return jsonify({"error": msg}), 409
+        abort(400, msg)
+    planning_gate = planning_gate_mod.build_planning_gate_from_run_state(run_state, run_dir=run_dir)
+    return jsonify({"run_id": run_id, "state": state, "planning_gate": planning_gate})
+
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator/record-build-attempt", methods=["POST"])
+def record_sprint_build_attempt(run_id: str):
+    """Record a build attempt result (started/completed/failed/interrupted)."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    body = request.get_json(force=True, silent=True) or {}
+    status = body.get("status")
+    if not status:
+        abort(400, "status is required (started|completed|failed|interrupted)")
+    try:
+        state = so_mod.record_build_attempt(
+            run_dir,
+            status=status,
+            summary=body.get("summary"),
+            changed_files=body.get("changed_files"),
+            artifact=body.get("artifact"),
+        )
+    except ValueError as exc:
+        abort(400, str(exc))
+    return jsonify({"run_id": run_id, "state": state})
+
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator/record-smoke-result", methods=["POST"])
+def record_sprint_smoke_result(run_id: str):
+    """Record smoke check result (passed/failed/waived)."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    body = request.get_json(force=True, silent=True) or {}
+    status = body.get("status")
+    if not status:
+        abort(400, "status is required (passed|failed|waived)")
+    try:
+        state = so_mod.record_smoke_result(
+            run_dir,
+            status=status,
+            summary=body.get("summary"),
+            artifact=body.get("artifact"),
+            waived=bool(body.get("waived", False)),
+            waiver_reason=body.get("waiver_reason"),
+        )
+    except ValueError as exc:
+        abort(400, str(exc))
+    return jsonify({"run_id": run_id, "state": state})
+
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator/record-review-result", methods=["POST"])
+def record_sprint_review_result(run_id: str):
+    """Record code review result (passed/failed/waived)."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    body = request.get_json(force=True, silent=True) or {}
+    status = body.get("status")
+    if not status:
+        abort(400, "status is required (passed|failed|waived)")
+    try:
+        state = so_mod.record_review_result(
+            run_dir,
+            status=status,
+            summary=body.get("summary"),
+            artifact=body.get("artifact"),
+            waived=bool(body.get("waived", False)),
+            waiver_reason=body.get("waiver_reason"),
+        )
+    except ValueError as exc:
+        abort(400, str(exc))
+    return jsonify({"run_id": run_id, "state": state})
+
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator/record-governance-result", methods=["POST"])
+def record_sprint_governance_result(run_id: str):
+    """Record governance check result (passed/failed/waived)."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    body = request.get_json(force=True, silent=True) or {}
+    status = body.get("status")
+    if not status:
+        abort(400, "status is required (passed|failed|waived)")
+    try:
+        state = so_mod.record_governance_result(
+            run_dir,
+            status=status,
+            summary=body.get("summary"),
+            artifact=body.get("artifact"),
+            waived=bool(body.get("waived", False)),
+            waiver_reason=body.get("waiver_reason"),
+        )
+    except ValueError as exc:
+        abort(400, str(exc))
+    return jsonify({"run_id": run_id, "state": state})
+
+
+@app.route("/api/runs/<run_id>/sprint-orchestrator/generate-handoff", methods=["POST"])
+def generate_sprint_handoff(run_id: str):
+    """Generate sprint_<n>_handoff.md from current orchestrator state."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        abort(404, f"Run {run_id} not found")
+    result = so_mod.generate_handoff(run_dir)
+    if not result["success"]:
+        abort(400, result.get("error") or "Handoff generation failed")
+    state = so_mod.load_orchestrator_state(run_dir)
+    return jsonify({"run_id": run_id, "artifact": result["artifact"], "state": state})
 
 
 # ── Local Delivery + Optional Sandbox Push ──────────────────────────────────

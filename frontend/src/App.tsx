@@ -8,11 +8,13 @@ import {
   getRequirementsConversation, saveRequirementsAnswer, approveRequirements,
   getArchitectureConversation, saveArchitectureAnswer, approveArchitecture,
   getGlobalInstructions, generateRequirementsMd, generateGlobalInstructions,
+  getSprintOrchestrator, initSprintOrchestrator, generateSprintHandoff,
 } from "./api";
 import type {
   RunSummary, RunDetail, DeliveryInfo, DeliveryPrecheck, GitSyncState, GitPullState,
   PrDeliveryPlanState, PrBranchPrepState, PrRemoteDeliveryState, RepoHygieneSummary,
   PlanningGateState, RequirementsQuestion, ArchitectureQuestion, GlobalInstructionsStatus,
+  SprintOrchestratorState,
 } from "./api";
 import "./App.css";
 
@@ -3320,6 +3322,143 @@ function GlobalInstructionsCard({
   );
 }
 
+// Sprint Orchestrator — persistent project manager for one sprint. Records build
+// attempts, smoke/review/governance results, computes next_action, and generates
+// handoff prompts for session continuations. Gated behind planning gate.
+function SprintOrchestratorCard({
+  runId, onSelectArtifact,
+}: {
+  runId: string;
+  onSelectArtifact?: (artifact: string) => void;
+}) {
+  const [data, setData] = useState<{
+    state: SprintOrchestratorState | null;
+    can_initialize: boolean;
+    blocking_reason: string | null;
+  } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [sprintInput, setSprintInput] = useState("1");
+
+  const load = () => {
+    setLoading(true);
+    getSprintOrchestrator(runId)
+      .then((r) => { setData({ state: r.state, can_initialize: r.can_initialize ?? false, blocking_reason: r.blocking_reason ?? null }); setError(null); })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { load(); }, [runId]);
+
+  const handleInit = async () => {
+    setBusy(true); setError(null);
+    try {
+      const n = parseInt(sprintInput, 10);
+      if (isNaN(n) || n < 1) { setError("Enter a valid sprint number (≥ 1)."); setBusy(false); return; }
+      const r = await initSprintOrchestrator(runId, n);
+      setData((prev) => prev ? { ...prev, state: r.state } : { state: r.state, can_initialize: false, blocking_reason: null });
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const handleHandoff = async () => {
+    setBusy(true); setError(null);
+    try {
+      const r = await generateSprintHandoff(runId);
+      setData((prev) => prev ? { ...prev, state: r.state } : { state: r.state, can_initialize: false, blocking_reason: null });
+      if (r.artifact) onSelectArtifact?.(r.artifact);
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+
+  if (loading && !data) return null;
+
+  const state = data?.state;
+  const canInit = data?.can_initialize ?? false;
+  const blocking = data?.blocking_reason;
+  const isActive = !!state && state.status !== "not_started";
+  const phase = state?.current_phase;
+  const sprintNum = state?.active_sprint;
+  const title = state?.sprint_title;
+  const nextAction = state?.next_action;
+  const lastStep = state?.last_completed_step;
+  const blockingReason = state?.blocking_reason;
+
+  const statusBadgeStyle = (s: string | undefined) => {
+    if (s === "active") return { background: "#0550ae", color: "#fff" };
+    if (s === "ready_for_completion") return { background: "#22863a", color: "#fff" };
+    if (s === "completed") return { background: "#22863a", color: "#fff" };
+    if (s === "blocked") return { background: "#cf222e", color: "#fff" };
+    return { background: "#6e7781", color: "#fff" };
+  };
+
+  return (
+    <div className="delivery-card">
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}>
+        <strong>Sprint Orchestrator</strong>
+        <span className="delivery-badge" style={statusBadgeStyle(state?.status ?? (isActive ? "active" : "not_started"))}>
+          {state?.status ? state.status.replace(/_/g, " ") : "Not started"}
+        </span>
+      </div>
+
+      {error && <div className="delivery-warning-panel" style={{ marginBottom: "0.5rem" }}>{error}</div>}
+
+      {!canInit && !isActive && (
+        <p style={{ color: "#6e7781", fontSize: "0.85rem", margin: "0 0 0.5rem" }}>
+          {blocking ?? "Sprint orchestration is locked until requirements, architecture, and GLOBAL_INSTRUCTIONS.md are approved."}
+        </p>
+      )}
+
+      {isActive && (
+        <div style={{ fontSize: "0.85rem", lineHeight: 1.6, marginBottom: "0.5rem" }}>
+          {sprintNum != null && <div><strong>Active sprint:</strong> Sprint {sprintNum}{title ? ` — ${title}` : ""}</div>}
+          {phase && <div><strong>Current phase:</strong> {phase.replace(/_/g, " ")}</div>}
+          {lastStep && <div><strong>Last completed step:</strong> {lastStep}</div>}
+          {nextAction && <div><strong>Next action:</strong> {nextAction}</div>}
+          {blockingReason && <div style={{ color: "#cf222e" }}><strong>Blocking reason:</strong> {blockingReason}</div>}
+        </div>
+      )}
+
+      {!isActive && canInit && (
+        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "0.5rem" }}>
+          <label style={{ fontSize: "0.82rem", color: "#24292f" }}>Sprint #</label>
+          <input
+            type="number"
+            min={1}
+            value={sprintInput}
+            onChange={(e) => setSprintInput(e.target.value)}
+            style={{ width: "4rem", padding: "2px 6px", fontSize: "0.85rem", border: "1px solid #d0d7de", borderRadius: 4 }}
+          />
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+        {!isActive && canInit && (
+          <button className="delivery-card-action" disabled={busy} onClick={handleInit}>
+            {busy ? "Initializing…" : "Initialize Sprint Orchestrator"}
+          </button>
+        )}
+        {isActive && (
+          <button className="delivery-card-action" disabled={busy} onClick={handleHandoff}>
+            {busy ? "Generating…" : "Generate Handoff Prompt"}
+          </button>
+        )}
+        {state?.handoff_artifact && (
+          <button className="delivery-card-action" onClick={() => onSelectArtifact?.(state.handoff_artifact!)}>
+            View Handoff
+          </button>
+        )}
+        {isActive && (
+          <button className="delivery-card-action" onClick={() => onSelectArtifact?.("sprint_orchestrator_state.json")}>
+            View Orchestrator State
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // Primary Outputs — the handful of artifacts that actually matter for this
 // run, in priority order, reusing the existing artifact viewer (no new viewer
 // component). Only ever shows artifacts that exist; renders nothing if none do.
@@ -4293,6 +4432,8 @@ function ExistingAppUpgradeView({ runId, run, onBack, onNewRun }: {
             <ArchitectureConversationCard runId={runId} onSelectArtifact={setSelected} />
             {/* 1d. Global Instructions — generates requirements.md + GLOBAL_INSTRUCTIONS.md. */}
             <GlobalInstructionsCard runId={runId} onSelectArtifact={setSelected} />
+            {/* 1e. Sprint Orchestrator — manages one sprint at a time, generates handoff prompts. */}
+            <SprintOrchestratorCard runId={runId} onSelectArtifact={setSelected} />
             {/* 2. Primary Outputs — the handful of artifacts that matter. */}
             <PrimaryOutputsCard run={run} selectedArtifact={selected} onSelectArtifact={setSelected} />
             {/* 3. Planning Progress / Build Workspace. */}
