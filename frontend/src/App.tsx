@@ -3113,6 +3113,14 @@ function RequirementsConversationCard({
   const statusBadge = conv.requirements_status ?? "unknown";
   const isApproved = conv.requirements_approved === true;
 
+  const isAiGenerated = conv.question_source === "ai";
+  const isFallbackQuestions = conv.question_fallback_used === true || conv.question_source === "template_fallback";
+  const interviewerSubtitle = isAiGenerated
+    ? "These questions were generated from your specific idea and planning context."
+    : isFallbackQuestions
+    ? "Using safe fallback questions because AI question generation was unavailable."
+    : null;
+
   const handleDraftChange = (qid: string, field: "answer" | "freeform", value: string) => {
     setDraftAnswers(prev => ({
       ...prev,
@@ -3155,11 +3163,20 @@ function RequirementsConversationCard({
     <div id="requirements-conversation-card" className="delivery-card operator-summary-card" style={{ marginTop: "0.75rem" }}>
       <div className="delivery-card-header">
         <div className="delivery-card-title">Requirements Conversation</div>
-        <span className={`delivery-badge ${isApproved ? "delivery-badge-ok" : statusBadge === "questions_pending" ? "delivery-badge-warn" : "delivery-badge-info"}`} style={{ marginLeft: "auto" }}>
+        {isAiGenerated && (
+          <span className="delivery-badge delivery-badge-info" style={{ marginLeft: "auto" }}>AI-generated interview</span>
+        )}
+        {!isAiGenerated && isFallbackQuestions && (
+          <span className="delivery-badge delivery-badge-warn" style={{ marginLeft: "auto" }}>Template fallback questions</span>
+        )}
+        <span className={`delivery-badge ${isApproved ? "delivery-badge-ok" : statusBadge === "questions_pending" ? "delivery-badge-warn" : "delivery-badge-info"}`} style={{ marginLeft: isAiGenerated || isFallbackQuestions ? "0.4rem" : "auto" }}>
           {isApproved ? "Approved" : (statusLabel[statusBadge] ?? statusBadge.replace(/_/g, " "))}
         </span>
       </div>
       <div style={{ padding: "0 0.75rem 0.25rem", color: "var(--text-secondary, #888)", fontSize: "0.82rem" }}>{subtitle}</div>
+      {interviewerSubtitle && (
+        <div style={{ padding: "0 0.75rem 0.25rem", color: "var(--text-secondary, #888)", fontSize: "0.78rem", fontStyle: "italic" }}>{interviewerSubtitle}</div>
+      )}
 
       {/* Draft + approved artifact buttons */}
       <div style={{ display: "flex", gap: "0.5rem", padding: "0 0.75rem 0.5rem", flexWrap: "wrap" }}>

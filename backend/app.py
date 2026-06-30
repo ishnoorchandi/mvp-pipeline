@@ -826,6 +826,11 @@ def get_requirements_conversation(run_id: str):
     Safe for older runs — if the run predates this system, init_requirements_conversation
     lazily creates draft + questions from whatever context is available, or returns a
     not_applicable state for read-only workflows (bugfix, inventory, etc.).
+
+    By default the AI interviewer generates questions specific to the run's idea/
+    requirements; it falls back to deterministic template questions automatically
+    on any failure. Pass ?question_mode=template to force template questions
+    (useful for tests/debugging); any other value (or omission) uses AI-first.
     """
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
@@ -834,7 +839,9 @@ def get_requirements_conversation(run_id: str):
     if state is None:
         abort(404, f"Run {run_id} state not found")
 
-    conversation = req_conv_mod.lazy_init_from_run_state(run_dir, state)
+    question_mode = (request.args.get("question_mode") or "").strip().lower()
+    use_ai = question_mode != "template"
+    conversation = req_conv_mod.lazy_init_from_run_state(run_dir, state, use_ai=use_ai)
     planning_gate = planning_gate_mod.build_planning_gate_from_run_state(state, run_dir=run_dir)
     unanswered = req_conv_mod.get_unanswered_required(conversation)
     return jsonify({

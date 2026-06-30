@@ -20,6 +20,7 @@ yet exist — existing runs and plan-only flows are never touched automatically.
 
 import json
 import datetime
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,11 @@ QUESTIONS_ARTIFACT = "requirements_questions.json"
 CONVERSATION_ARTIFACT = "requirements_conversation.md"
 APPROVED_ARTIFACT = "approved_requirements.md"
 SIGNOFF_ARTIFACT = "requirements_signoff_state.json"
+
+# AI interviewer debug artifacts (written only when use_ai=True and run_dir given)
+INTERVIEWER_PROMPT_ARTIFACT = "requirements_interviewer_prompt.md"
+INTERVIEWER_RESPONSE_ARTIFACT = "requirements_interviewer_response.json"
+INTERVIEWER_STATE_ARTIFACT = "requirements_interviewer_state.json"
 
 # Entry points that have full conversation support
 SUPPORTED_ENTRY_POINTS = frozenset({
@@ -202,11 +208,46 @@ def generate_requirements_questions(
     entry_point: str,
     draft_text: str = "",
     context: Optional[dict] = None,
+    use_ai: bool = True,
+    run_dir: Optional[Path] = None,
 ) -> list[dict]:
     """
     Return a list of structured question dicts for the given entry point.
     Each dict has: id, label, question, type, options, recommended, answer,
     freeform_answer, why, required.
+
+    When use_ai is True (default), the AI interviewer is tried first — it reads
+    the run's actual idea/requirements/planning context and produces questions
+    specific to that app and domain. On any failure (LLM error, malformed JSON,
+    invalid schema), it transparently falls back to generate_template_requirements_questions().
+
+    When run_dir is given, debug artifacts are written recording which path was
+    used (requirements_interviewer_prompt.md / _response.json / _state.json).
+    """
+    ctx = context or {}
+    if use_ai:
+        ai_questions, debug = _try_generate_ai_requirements_questions(entry_point, draft_text, ctx)
+        if ai_questions is not None:
+            if run_dir is not None:
+                debug["question_count"] = len(ai_questions)
+                _write_interviewer_artifacts(run_dir, debug, success=True)
+            return ai_questions
+        if run_dir is not None:
+            template_questions = generate_template_requirements_questions(entry_point, ctx)
+            debug["question_count"] = len(template_questions)
+            _write_interviewer_artifacts(run_dir, debug, success=False)
+            return template_questions
+
+    return generate_template_requirements_questions(entry_point, ctx)
+
+
+def generate_template_requirements_questions(
+    entry_point: str,
+    context: Optional[dict] = None,
+) -> list[dict]:
+    """
+    Hardcoded, deterministic fallback question templates — used when the AI
+    interviewer is disabled (use_ai=False) or fails validation.
     """
     if entry_point == "raw_idea":
         return _questions_raw_idea(context or {})
@@ -216,6 +257,251 @@ def generate_requirements_questions(
         return _questions_existing_app_upgrade(context or {})
     # default fallback
     return _questions_raw_idea(context or {})
+
+
+# ── AI Interviewer ─────────────────────────────────────────────────────────────
+
+_AI_INTERVIEWER_SYSTEM_PROMPT = """You are an expert product analyst conducting a structured requirements interview before an MVP gets built. You read the user's raw idea/requirements and existing planning context, then produce a short list of sharp, domain-specific clarifying questions that determine the real scope, data model, and architecture of the build.
+
+Rules:
+- Output ONLY valid JSON. No markdown, no commentary, no code fences.
+- Output shape: {"questions": [ ... ]}
+- Ask between 5 and 9 questions.
+- Each question must be specific to the actual app/domain described in the input — not generic boilerplate like "who is the primary user" or "what is out of scope".
+- Prefer questions that affect architecture, data model, sprint scope, or the core user workflow.
+- Do not ask about something already answered clearly by the input.
+- Do not ask about deployment or hosting unless the user mentioned it.
+- Do not force auth, a database, or an external API unless the domain clearly needs it.
+- Include a "recommended" default answer when it helps move the conversation forward; use "" if there is no sensible default.
+- Mark required: true only for decisions that block implementation; required: false for nice-to-have clarifications.
+- Every question needs a concise, practical "why" explaining what the answer affects.
+
+Each question object must have exactly these fields:
+  id          — short lowercase snake_case slug, unique within the list
+  label       — short label (2-5 words)
+  question    — the actual question to ask the user
+  type        — one of: single_choice, multi_choice, short_text, long_text, yes_no
+  options     — array of strings; required (2+) for single_choice/multi_choice, empty array otherwise
+  recommended — a recommended answer string, or "" if none
+  required    — boolean
+  why         — one sentence explaining why this question matters
+"""
+
+
+def _build_ai_interviewer_prompt(entry_point: str, draft_text: str, context: dict) -> str:
+    """Assemble the user-turn prompt from run context. Only includes sections
+    that actually have content — keeps the prompt focused."""
+    parts = [f"## Entry point\n{entry_point}\n"]
+
+    raw_input = (
+        context.get("raw_input")
+        or context.get("requirements_text")
+        or context.get("feature_request")
+        or ""
+    )
+    if raw_input.strip():
+        parts.append(f"## User's raw idea / requirements\n{raw_input.strip()}\n")
+
+    if context.get("existing_app_path"):
+        parts.append(f"## Existing app path\n{context['existing_app_path']}\n")
+    if (context.get("existing_app_summary") or "").strip():
+        parts.append(f"## Existing app summary\n{context['existing_app_summary'].strip()}\n")
+
+    if (context.get("mvp_scope") or "").strip():
+        parts.append(f"## MVP scope (planning artifact)\n{context['mvp_scope'].strip()}\n")
+    if (context.get("clean_requirements") or "").strip():
+        parts.append(f"## Clean requirements (planning artifact)\n{context['clean_requirements'].strip()}\n")
+    if (context.get("mvp_spec") or "").strip():
+        parts.append(f"## MVP spec (planning artifact)\n{context['mvp_spec'].strip()}\n")
+
+    if (draft_text or "").strip():
+        parts.append(f"## Draft requirements (auto-generated, awaiting your interview questions)\n{draft_text.strip()}\n")
+
+    parts.append(
+        "## Task\n"
+        "Read everything above and produce 5-9 sharp, domain-specific clarifying "
+        "questions that determine the real scope, data model, and core workflow "
+        "of this specific MVP. Follow the system instructions exactly. Output JSON only."
+    )
+    return "\n".join(parts)
+
+
+def _call_ai_interviewer_llm(messages: list[dict]) -> str:
+    """
+    Call the LLM using the same client/model pattern as pipeline_mvp_builder.gpt()
+    (OpenAI chat completions, GPT_MODEL from config). Imports openai/config lazily
+    so a missing OPENAI_API_KEY never breaks module import — only AI question
+    generation, which the caller catches and falls back to templates for.
+    """
+    from openai import OpenAI
+    import config as config_mod
+    client = OpenAI(api_key=config_mod.OPENAI_API_KEY)
+    resp = client.chat.completions.create(model=config_mod.GPT_MODEL, messages=messages)
+    return resp.choices[0].message.content.strip()
+
+
+def _parse_ai_json_response(raw_response: str) -> object:
+    """Parse the LLM's JSON response, defensively stripping markdown code fences
+    if the model wrapped its output despite instructions not to."""
+    text = (raw_response or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return json.loads(text)
+
+
+_SLUG_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_MAX_AI_QUESTIONS = 10
+
+
+def _validate_ai_questions(raw: object) -> list[dict]:
+    """
+    Validate and normalize raw AI JSON into the canonical question dict shape
+    (same shape produced by _q()). Raises ValueError with a human-readable
+    reason on any structural problem — callers must catch and fall back.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("AI response is not a JSON object")
+    questions = raw.get("questions")
+    if not isinstance(questions, list) or len(questions) == 0:
+        raise ValueError("AI response missing a non-empty 'questions' list")
+
+    normalized: list[dict] = []
+    seen_ids: set[str] = set()
+    for idx, item in enumerate(questions):
+        if not isinstance(item, dict):
+            raise ValueError(f"question[{idx}] is not an object")
+
+        qid = item.get("id")
+        label = item.get("label")
+        question_text = item.get("question")
+        qtype = item.get("type")
+        why = item.get("why")
+        required = item.get("required")
+
+        if not isinstance(qid, str) or not _SLUG_RE.match(qid):
+            raise ValueError(f"question[{idx}] has an invalid id: {qid!r}")
+        if qid in seen_ids:
+            raise ValueError(f"duplicate question id: {qid}")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"question[{idx}] is missing a label")
+        if not isinstance(question_text, str) or not question_text.strip():
+            raise ValueError(f"question[{idx}] is missing question text")
+        if qtype not in QUESTION_TYPES:
+            raise ValueError(f"question[{idx}] has an invalid type: {qtype!r}")
+        if not isinstance(why, str) or not why.strip():
+            raise ValueError(f"question[{idx}] is missing 'why'")
+        if not isinstance(required, bool):
+            raise ValueError(f"question[{idx}] is missing a boolean 'required'")
+
+        options = item.get("options") or []
+        if not isinstance(options, list):
+            raise ValueError(f"question[{idx}] options must be a list")
+        options = [str(o) for o in options]
+        if qtype in ("single_choice", "multi_choice") and len(options) < 2:
+            raise ValueError(f"question[{idx}] type {qtype} requires at least 2 options")
+
+        recommended = item.get("recommended") or ""
+        if not isinstance(recommended, str):
+            recommended = str(recommended)
+
+        seen_ids.add(qid)
+        normalized.append(_q(
+            qid, label.strip(), question_text.strip(), qtype,
+            options=options, recommended=recommended, why=why.strip(), required=required,
+        ))
+
+    # Defensive cap — the prompt asks for 5-9, but never trust the model fully.
+    if len(normalized) > _MAX_AI_QUESTIONS:
+        normalized = normalized[:_MAX_AI_QUESTIONS]
+
+    return normalized
+
+
+def generate_ai_requirements_questions(
+    entry_point: str,
+    draft_text: str = "",
+    context: Optional[dict] = None,
+    _debug: Optional[dict] = None,
+) -> list[dict]:
+    """
+    Call the AI interviewer and return validated, structured question dicts.
+
+    Raises (ValueError / json.JSONDecodeError / any LLM client exception) on
+    failure — callers must catch and fall back to
+    generate_template_requirements_questions(). The optional _debug dict is
+    populated with the prompt and raw LLM response as they become available,
+    used internally by generate_requirements_questions() to write debug
+    artifacts regardless of success or failure.
+    """
+    ctx = context or {}
+    prompt = _build_ai_interviewer_prompt(entry_point, draft_text, ctx)
+    if _debug is not None:
+        _debug["prompt"] = prompt
+    messages = [
+        {"role": "system", "content": _AI_INTERVIEWER_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    raw_response = _call_ai_interviewer_llm(messages)
+    if _debug is not None:
+        _debug["raw_response"] = raw_response
+    parsed = _parse_ai_json_response(raw_response)
+    return _validate_ai_questions(parsed)
+
+
+def _try_generate_ai_requirements_questions(
+    entry_point: str,
+    draft_text: str,
+    context: dict,
+) -> tuple[Optional[list[dict]], dict]:
+    """
+    Attempt AI question generation, catching every failure mode (LLM error,
+    invalid JSON, schema violation) so the caller can safely fall back.
+    Returns (questions, debug). questions is None on any failure; debug
+    always has 'prompt' and 'reason' (None on success).
+    """
+    debug: dict = {"prompt": "", "raw_response": None, "reason": None}
+    try:
+        questions = generate_ai_requirements_questions(entry_point, draft_text, context, _debug=debug)
+        return questions, debug
+    except Exception as exc:
+        debug["reason"] = str(exc)
+        return None, debug
+
+
+def _write_interviewer_artifacts(run_dir: Path, debug: dict, success: bool) -> None:
+    """Write requirements_interviewer_{prompt.md,response.json,state.json}.
+    Never raises — debug-artifact failures must not break question generation.
+    Never writes API keys or secrets (only prompt text and model output)."""
+    try:
+        run_dir = Path(run_dir)
+        (run_dir / INTERVIEWER_PROMPT_ARTIFACT).write_text(debug.get("prompt") or "", encoding="utf-8")
+        _write_json(run_dir / INTERVIEWER_RESPONSE_ARTIFACT, {"raw_response": debug.get("raw_response")})
+
+        if success:
+            state = {
+                "mode": "ai",
+                "status": "success",
+                "fallback_used": False,
+                "question_count": debug.get("question_count", 0),
+                "generated_at": _now_iso(),
+            }
+        else:
+            state = {
+                "mode": "template_fallback",
+                "status": "fallback",
+                "fallback_used": True,
+                "reason": debug.get("reason") or "AI question generation unavailable",
+                "question_count": debug.get("question_count", 0),
+                "generated_at": _now_iso(),
+            }
+        _write_json(run_dir / INTERVIEWER_STATE_ARTIFACT, state)
+    except Exception:
+        pass
 
 
 def _q(
@@ -455,6 +741,7 @@ def init_requirements_conversation(
     run_dir: Path,
     entry_point: str,
     context: Optional[dict] = None,
+    use_ai: bool = True,
 ) -> dict:
     """
     Initialize and persist a fresh requirements conversation for a run.
@@ -470,10 +757,24 @@ def init_requirements_conversation(
 
     ctx = context or {}
     draft = generate_requirements_draft(entry_point, ctx)
-    questions = generate_requirements_questions(entry_point, draft, ctx)
+    questions = generate_requirements_questions(entry_point, draft, ctx, use_ai=use_ai, run_dir=run_dir)
 
     # Write draft artifact
     (run_dir / DRAFT_ARTIFACT).write_text(draft, encoding="utf-8")
+
+    # Surface AI-vs-template provenance in the persisted state so the frontend
+    # can render the interviewer badge from the normal conversation response,
+    # without a second fetch. Read back the interviewer state artifact that
+    # generate_requirements_questions() just wrote (only happens when use_ai=True).
+    question_source = "template"
+    question_fallback_used = False
+    question_fallback_reason = None
+    if use_ai:
+        interviewer_state = _safe_read_json(run_dir / INTERVIEWER_STATE_ARTIFACT)
+        if interviewer_state is not None:
+            question_source = interviewer_state.get("mode", "template")
+            question_fallback_used = bool(interviewer_state.get("fallback_used", False))
+            question_fallback_reason = interviewer_state.get("reason")
 
     state = {
         "entry_point": entry_point,
@@ -483,6 +784,9 @@ def init_requirements_conversation(
         "draft_requirements_artifact": DRAFT_ARTIFACT,
         "approved_requirements_artifact": None,
         "requirements_approved": False,
+        "question_source": question_source,
+        "question_fallback_used": question_fallback_used,
+        "question_fallback_reason": question_fallback_reason,
         "updated_at": _now_iso(),
     }
     _write_json(run_dir / QUESTIONS_ARTIFACT, state)
@@ -490,11 +794,14 @@ def init_requirements_conversation(
     return state
 
 
-def lazy_init_from_run_state(run_dir: Path, run_state: dict) -> dict:
+def lazy_init_from_run_state(run_dir: Path, run_state: dict, use_ai: bool = True) -> dict:
     """
     Lazily initialize a requirements conversation from an existing run's state.
     Called when the frontend opens the requirements conversation for a run that
     predates the conversation system.
+
+    use_ai controls whether the AI interviewer is attempted (default True);
+    pass False to force the deterministic template questions (e.g. ?question_mode=template).
     """
     run_dir = Path(run_dir)
     existing = load_requirements_conversation(run_dir)
@@ -528,6 +835,9 @@ def lazy_init_from_run_state(run_dir: Path, run_state: dict) -> dict:
             "draft_requirements_artifact": None,
             "approved_requirements_artifact": None,
             "requirements_approved": False,
+            "question_source": "template",
+            "question_fallback_used": False,
+            "question_fallback_reason": None,
             "updated_at": _now_iso(),
         }
 
@@ -555,8 +865,19 @@ def lazy_init_from_run_state(run_dir: Path, run_state: dict) -> dict:
         if raw_input_path.exists():
             ctx["raw_input"] = raw_input_path.read_text(encoding="utf-8")
 
+    # Universal planning context, if the pipeline has produced it by this point —
+    # used only by the AI interviewer to ask sharper, more specific questions.
+    for ctx_key, filename in (
+        ("mvp_scope", "mvp_scope.md"),
+        ("clean_requirements", "clean_requirements.md"),
+        ("mvp_spec", "mvp_spec.md"),
+    ):
+        artifact_path = run_dir / filename
+        if artifact_path.exists():
+            ctx[ctx_key] = artifact_path.read_text(encoding="utf-8")
+
     _persist_entry_point(run_dir, entry_point)
-    return init_requirements_conversation(run_dir, entry_point, ctx)
+    return init_requirements_conversation(run_dir, entry_point, ctx, use_ai=use_ai)
 
 
 def save_answer(

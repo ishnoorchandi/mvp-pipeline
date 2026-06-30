@@ -233,6 +233,9 @@ export interface RequirementsConversationState {
   draft_requirements_artifact?: string | null;
   approved_requirements_artifact?: string | null;
   requirements_approved?: boolean;
+  question_source?: "ai" | "template" | "template_fallback" | string;
+  question_fallback_used?: boolean;
+  question_fallback_reason?: string | null;
   updated_at?: string;
 }
 

@@ -27,10 +27,27 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import requirements_conversation as rc
 import planning_gate as pg
 import backend.app as app_mod
+
+
+@pytest.fixture(autouse=True)
+def _block_live_llm_calls(monkeypatch):
+    """Safety net for the whole file: no test here may reach a live LLM API.
+
+    By default the AI interviewer's single LLM call point raises, so every
+    call to generate_requirements_questions()/init_requirements_conversation()
+    transparently falls back to template questions unless a test overrides
+    this monkeypatch with its own mocked response (see the AI interviewer
+    tests below).
+    """
+    def _blocked(messages):
+        raise RuntimeError("Live LLM calls are blocked in tests")
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", _blocked)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -544,6 +561,297 @@ def test_backend_approve_for_idea_run_planning_gate_has_correct_entry_point(monk
         assert "architecture" in gate["planning_gate_reason"].lower()
 
 
+# ── AI Requirements Interviewer ─────────────────────────────────────────────────
+#
+# All LLM calls are mocked via monkeypatch.setattr(rc, "_call_ai_interviewer_llm", ...).
+# No test in this section makes a live API call.
+
+def _valid_ai_questions_json(n=6) -> str:
+    questions = [
+        {
+            "id": f"q_{i}",
+            "label": f"Question {i}",
+            "question": f"What about aspect {i} of this product?",
+            "type": "short_text",
+            "options": [],
+            "recommended": "",
+            "required": True,
+            "why": f"Determines aspect {i} of the build.",
+        }
+        for i in range(n)
+    ]
+    return json.dumps({"questions": questions})
+
+
+_ATS_AI_RESPONSE = json.dumps({
+    "questions": [
+        {
+            "id": "candidate_stages",
+            "label": "Candidate stages",
+            "question": "What stages should a candidate move through (e.g. Applied, Interviewing, Offer, Hired, Rejected)?",
+            "type": "long_text",
+            "options": [],
+            "recommended": "Applied, Interviewing, Offer, Hired, Rejected",
+            "required": True,
+            "why": "Defines the pipeline data model and the status values the UI must support.",
+        },
+        {
+            "id": "resume_upload",
+            "label": "Resume / file uploads",
+            "question": "Do hiring managers need to upload and view candidate resumes or other files?",
+            "type": "yes_no",
+            "options": [],
+            "recommended": "Yes",
+            "required": True,
+            "why": "Determines whether file storage and a file viewer are part of the MVP scope.",
+        },
+        {
+            "id": "hiring_notes",
+            "label": "Hiring notes",
+            "question": "Should hiring managers be able to leave notes or feedback on a candidate?",
+            "type": "yes_no",
+            "options": [],
+            "recommended": "Yes",
+            "required": True,
+            "why": "Notes affect the data model and whether a comment thread UI is needed.",
+        },
+        {
+            "id": "dashboard_metrics",
+            "label": "Dashboard metrics",
+            "question": "What metrics should the dashboard show (e.g. open roles, candidates per stage, time-to-hire)?",
+            "type": "long_text",
+            "options": [],
+            "recommended": "",
+            "required": False,
+            "why": "Determines what aggregate queries and dashboard widgets are needed.",
+        },
+        {
+            "id": "status_view_style",
+            "label": "Status view style",
+            "question": "Should candidate status be shown as a Kanban board or a simple dropdown/list view?",
+            "type": "single_choice",
+            "options": ["Kanban board", "Dropdown/list view"],
+            "recommended": "Dropdown/list view",
+            "required": True,
+            "why": "Kanban boards are significantly more complex to build than a simple status dropdown.",
+        },
+        {
+            "id": "multi_job_support",
+            "label": "Multiple job postings",
+            "question": "Does the MVP need to support multiple simultaneous job postings, or just one?",
+            "type": "yes_no",
+            "options": [],
+            "recommended": "Yes",
+            "required": True,
+            "why": "Affects whether jobs are a first-class entity or hardcoded.",
+        },
+    ]
+})
+
+
+# 1. Template fallback when AI is unavailable
+
+def test_template_fallback_when_ai_unavailable():
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        questions = rc.generate_requirements_questions(
+            "raw_idea", "", {"raw_input": "Test app"}, use_ai=True, run_dir=run_dir,
+        )
+        ids = {q["id"] for q in questions}
+        assert "primary_user" in ids
+        state = json.loads((run_dir / rc.INTERVIEWER_STATE_ARTIFACT).read_text())
+        assert state["fallback_used"] is True
+        assert state["mode"] == "template_fallback"
+
+
+# 2. AI valid JSON is accepted as-is
+
+def test_ai_valid_json_accepted(monkeypatch):
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", lambda messages: _valid_ai_questions_json(6))
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        questions = rc.generate_requirements_questions(
+            "raw_idea", "", {"raw_input": "Test app"}, use_ai=True, run_dir=run_dir,
+        )
+        ids = {q["id"] for q in questions}
+        assert ids == {f"q_{i}" for i in range(6)}
+        assert "primary_user" not in ids
+
+
+# 3. AI questions are persisted into requirements_questions.json
+
+def test_ai_questions_persisted_in_conversation_state(monkeypatch):
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", lambda messages: _valid_ai_questions_json(6))
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        rc.init_requirements_conversation(run_dir, "raw_idea", {"raw_input": "Test app"}, use_ai=True)
+        saved = json.loads((run_dir / rc.QUESTIONS_ARTIFACT).read_text())
+        ids = {q["id"] for q in saved["questions"]}
+        assert ids == {f"q_{i}" for i in range(6)}
+        assert saved["question_source"] == "ai"
+        assert saved["question_fallback_used"] is False
+
+
+# 4. ATS-specific mocked questions are domain-specific, not generic
+
+def test_ats_specific_questions_from_mocked_ai(monkeypatch):
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", lambda messages: _ATS_AI_RESPONSE)
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        conv = rc.init_requirements_conversation(run_dir, "raw_idea", {
+            "raw_input": "Simple ATS for small businesses to track job applicants.",
+        }, use_ai=True)
+        ids = {q["id"] for q in conv["questions"]}
+        assert "candidate_stages" in ids
+        assert "resume_upload" in ids
+        assert "status_view_style" in ids
+        assert "primary_user" not in ids  # generic template question must not leak through
+
+
+# 5. Invalid JSON falls back to template
+
+def test_invalid_json_falls_back_to_template(monkeypatch):
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", lambda messages: "not valid json {{{")
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        questions = rc.generate_requirements_questions(
+            "raw_idea", "", {"raw_input": "Test"}, use_ai=True, run_dir=run_dir,
+        )
+        ids = {q["id"] for q in questions}
+        assert "primary_user" in ids
+        state = json.loads((run_dir / rc.INTERVIEWER_STATE_ARTIFACT).read_text())
+        assert state["fallback_used"] is True
+
+
+# 6. Invalid question type falls back and sanitizes
+
+def test_invalid_question_type_falls_back_and_sanitizes(monkeypatch):
+    bad = json.dumps({"questions": [
+        {"id": "bad_q", "label": "Bad", "question": "?", "type": "essay",
+         "options": [], "recommended": "", "required": True, "why": "test"},
+    ]})
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", lambda messages: bad)
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        questions = rc.generate_requirements_questions(
+            "raw_idea", "", {"raw_input": "Test"}, use_ai=True, run_dir=run_dir,
+        )
+        ids = {q["id"] for q in questions}
+        assert "bad_q" not in ids
+        assert "primary_user" in ids
+        state = json.loads((run_dir / rc.INTERVIEWER_STATE_ARTIFACT).read_text())
+        assert state["fallback_used"] is True
+
+
+# 7. Missing required field falls back
+
+def test_missing_required_field_falls_back(monkeypatch):
+    bad = json.dumps({"questions": [
+        {"id": "no_why", "label": "Label", "question": "Q?", "type": "short_text",
+         "options": [], "recommended": "", "required": True},  # missing "why"
+    ]})
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", lambda messages: bad)
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        questions = rc.generate_requirements_questions(
+            "raw_idea", "", {"raw_input": "Test"}, use_ai=True, run_dir=run_dir,
+        )
+        ids = {q["id"] for q in questions}
+        assert "no_why" not in ids
+        assert "primary_user" in ids
+
+
+# 8. More than 10 questions is trimmed, not rejected
+
+def test_more_than_ten_questions_trimmed(monkeypatch):
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", lambda messages: _valid_ai_questions_json(13))
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        questions = rc.generate_requirements_questions(
+            "raw_idea", "", {"raw_input": "Test"}, use_ai=True, run_dir=run_dir,
+        )
+        assert len(questions) == rc._MAX_AI_QUESTIONS == 10
+        state = json.loads((run_dir / rc.INTERVIEWER_STATE_ARTIFACT).read_text())
+        assert state["fallback_used"] is False
+        assert state["question_count"] == 10
+
+
+# 9. state.json records success
+
+def test_interviewer_state_records_success(monkeypatch):
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", lambda messages: _valid_ai_questions_json(6))
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        rc.generate_requirements_questions("raw_idea", "", {"raw_input": "Test"}, use_ai=True, run_dir=run_dir)
+        state = json.loads((run_dir / rc.INTERVIEWER_STATE_ARTIFACT).read_text())
+        assert state["mode"] == "ai"
+        assert state["status"] == "success"
+        assert state["fallback_used"] is False
+        assert state["question_count"] == 6
+        assert "generated_at" in state
+        # No secrets leak into debug artifacts
+        prompt_text = (run_dir / rc.INTERVIEWER_PROMPT_ARTIFACT).read_text()
+        assert "sk-" not in prompt_text
+
+
+# 10. state.json records fallback with a reason
+
+def test_interviewer_state_records_fallback_with_reason():
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        rc.generate_requirements_questions("raw_idea", "", {"raw_input": "Test"}, use_ai=True, run_dir=run_dir)
+        state = json.loads((run_dir / rc.INTERVIEWER_STATE_ARTIFACT).read_text())
+        assert state["mode"] == "template_fallback"
+        assert state["status"] == "fallback"
+        assert state["fallback_used"] is True
+        assert state["reason"]
+        assert "generated_at" in state
+
+
+# 11. Approval flow works with AI-generated questions
+
+def test_approval_flow_works_with_ai_generated_questions(monkeypatch):
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", lambda messages: _valid_ai_questions_json(5))
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        conv = rc.init_requirements_conversation(run_dir, "raw_idea", {"raw_input": "Test app"}, use_ai=True)
+        answer_all_required(run_dir, conv)
+        result = rc.approve_requirements(run_dir)
+        assert result["approved"] is True
+        assert (run_dir / rc.APPROVED_ARTIFACT).exists()
+
+
+# 12. ?question_mode=template forces template questions and skips the AI call entirely
+
+def test_backend_question_mode_template_forces_fallback(monkeypatch):
+    call_count = {"n": 0}
+
+    def _tracking(messages):
+        call_count["n"] += 1
+        return _valid_ai_questions_json(6)
+
+    monkeypatch.setattr(rc, "_call_ai_interviewer_llm", _tracking)
+
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td) / "run_001"
+        run_dir.mkdir()
+        run_state = {"run_id": "run_001", "status": "done", "input_mode": "idea"}
+        (run_dir / "run_state.json").write_text(json.dumps(run_state))
+
+        monkeypatch.setattr(app_mod, "RUNS_DIR", Path(td))
+        client = app_mod.app.test_client()
+        resp = client.get("/api/runs/run_001/requirements-conversation?question_mode=template")
+        assert resp.status_code == 200, f"Expected 200: {resp.data}"
+        data = resp.get_json()
+        ids = {q["id"] for q in data["conversation"]["questions"]}
+        assert "primary_user" in ids
+        assert call_count["n"] == 0, "AI must not be called when question_mode=template"
+        assert data["conversation"].get("question_source") == "template"
+        assert not (run_dir / rc.INTERVIEWER_STATE_ARTIFACT).exists()
+
+
+# 13. Frontend TS build succeeds — validated externally via `npm run build` (see report).
+
+
 if __name__ == "__main__":
-    import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
